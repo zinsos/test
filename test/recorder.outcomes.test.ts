@@ -4,10 +4,12 @@ import { decodeLogs } from "../src/chain/events.js";
 import { defaultStrategyConfig } from "../src/config/strategy.js";
 import { SOL_QUOTE } from "../src/core/constants.js";
 import type { LaunchCreatedEvent } from "../src/core/types.js";
+import { createRng } from "../src/core/rng.js";
 import { MarketState } from "../src/market/state.js";
 import {
   computeOutcome,
   findInsiders,
+  findRug,
   mcapAt,
   normalizedTimes,
   outcomeParamsFrom,
@@ -305,6 +307,125 @@ describe("rug labelling", () => {
     expect(outcome.status).toBe("migrated");
     expect(outcome.rugged).toBe(false);
     expect(outcome.rugAtMs).toBeNull();
+  });
+
+  it("does not call a dev exit after the pump already faded a rug", () => {
+    const trades = [
+      trade({ sec: 0, slot: S0, wallet: DEV, buy: true, tokens: 100n, mcap: 1_100n }),
+      trade({ sec: 20, wallet: RETAIL_A, buy: true, tokens: 500n, mcap: 5_000n }),
+      trade({ sec: 200, wallet: RETAIL_A, buy: false, tokens: 450n, mcap: 1_400n }),
+      trade({ sec: 900, wallet: DEV, buy: false, tokens: 100n, mcap: 1_150n }),
+      trade({ sec: 905, wallet: RETAIL_B, buy: true, tokens: 5n, mcap: 1_160n })
+    ];
+    const outcome = computeOutcome({ launch: launch(), trades, nowMs: T0 + 6_000_000, params });
+    expect(outcome.rugged).toBe(false);
+    expect(outcome.status).toBe("died");
+    expect(outcome.details.peakMultiple).toBe(5);
+  });
+
+  it("measures the collapse against the price insiders sold into, not the all-time peak", () => {
+    const trades = [
+      trade({ sec: 0, slot: S0, wallet: DEV, buy: true, tokens: 400n, mcap: 1_100n }),
+      trade({ sec: 20, wallet: RETAIL_A, buy: true, tokens: 500n, mcap: 8_000n }),
+      trade({ sec: 200, wallet: RETAIL_A, buy: false, tokens: 200n, mcap: 4_000n }),
+      trade({ sec: 600, wallet: RETAIL_B, buy: true, tokens: 50n, mcap: 4_200n }),
+      trade({ sec: 650, wallet: DEV, buy: false, tokens: 400n, mcap: 1_000n })
+    ];
+    const outcome = computeOutcome({ launch: launch(), trades, nowMs: T0 + 6_000_000, params });
+    expect(outcome.rugged).toBe(true);
+    expect(outcome.rugAtMs).toBe(T0 + 650_000);
+  });
+});
+
+interface BruteRugParams {
+  windowMs: number;
+  lookaheadMs: number;
+  sellFraction: number;
+  dropFraction: number;
+}
+
+function bruteForceRug(trades: OutcomeTrade[], times: number[], insiders: Set<string>, initial: bigint, rug: BruteRugParams): number | null {
+  for (let index = 0; index < trades.length; index += 1) {
+    const tau = times[index] ?? 0;
+    const groupStart = times.findIndex((time) => time === tau);
+    let maxHoldings = 0n;
+    let holdings = 0n;
+    const balances = new Map<string, bigint>();
+    let windowSold = 0n;
+    for (let j = 0; j <= index; j += 1) {
+      const trade = trades[j];
+      if (!trade || !insiders.has(trade.wallet)) {
+        continue;
+      }
+      const before = balances.get(trade.wallet) ?? 0n;
+      const after = before + (trade.isBuy ? trade.tokenAmount : -trade.tokenAmount);
+      balances.set(trade.wallet, after);
+      holdings += (after > 0n ? after : 0n) - (before > 0n ? before : 0n);
+      maxHoldings = holdings > maxHoldings ? holdings : maxHoldings;
+      if (!trade.isBuy && (times[j] ?? 0) >= tau - rug.windowMs) {
+        windowSold += trade.tokenAmount;
+      }
+    }
+    let level = initial;
+    for (let j = 0; j < groupStart; j += 1) {
+      const mcap = trades[j]?.mcapQuote ?? 0n;
+      const time = times[j] ?? 0;
+      if (time < tau - rug.windowMs) {
+        level = mcap;
+      }
+    }
+    for (let j = 0; j < groupStart; j += 1) {
+      const mcap = trades[j]?.mcapQuote ?? 0n;
+      if ((times[j] ?? 0) >= tau - rug.windowMs && mcap > level) {
+        level = mcap;
+      }
+    }
+    let low: bigint | null = null;
+    for (let j = groupStart; j < trades.length; j += 1) {
+      if ((times[j] ?? 0) <= tau + rug.lookaheadMs) {
+        const mcap = trades[j]?.mcapQuote ?? 0n;
+        low = low === null || mcap < low ? mcap : low;
+      }
+    }
+    const dumped = maxHoldings > 0n && Number(windowSold) >= rug.sellFraction * Number(maxHoldings);
+    const collapsed = low !== null && Number(low) <= (1 - rug.dropFraction) * Number(level);
+    if (dumped && collapsed) {
+      return tau;
+    }
+  }
+  return null;
+}
+
+describe("rug detection against a brute force reference", () => {
+  it("agrees with an O(n^2) implementation of the same rule on random launches", () => {
+    const rng = createRng("rug-property");
+    const wallets = [DEV, BUNDLER, RETAIL_A, RETAIL_B, RETAIL_C];
+    const insiders = new Set([DEV, BUNDLER]);
+    const rug = { windowMs: 120_000, lookaheadMs: 300_000, sellFraction: 0.5, dropFraction: 0.7 };
+    let rugs = 0;
+    for (let round = 0; round < 400; round += 1) {
+      const trades: OutcomeTrade[] = [];
+      let sec = 0;
+      const count = 2 + Math.floor(rng() * 25);
+      for (let index = 0; index < count; index += 1) {
+        sec += Math.floor(rng() * 90);
+        trades.push(
+          trade({
+            sec,
+            wallet: wallets[Math.floor(rng() * wallets.length)] ?? DEV,
+            buy: rng() < 0.55,
+            tokens: BigInt(1 + Math.floor(rng() * 100)),
+            mcap: BigInt(200 + Math.floor(rng() * 5_000))
+          })
+        );
+      }
+      const times = normalizedTimes(trades, T0);
+      const expected = bruteForceRug(trades, times, insiders, INITIAL, rug);
+      const actual = findRug(trades, times, insiders, INITIAL, rug).rugAtMs;
+      expect(actual, `round ${round}`).toBe(expected);
+      rugs += expected === null ? 0 : 1;
+    }
+    expect(rugs).toBeGreaterThan(20);
   });
 });
 

@@ -74,13 +74,16 @@ export class BatchWriter {
   }
 
   async flush(): Promise<void> {
-    if (this.flushing) {
-      await this.flushing;
+    const previous = this.flushing ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(() => this.flushAll());
+    this.flushing = current;
+    try {
+      await current;
+    } finally {
+      if (this.flushing === current) {
+        this.flushing = null;
+      }
     }
-    this.flushing = this.flushAll().finally(() => {
-      this.flushing = null;
-    });
-    await this.flushing;
   }
 
   private async flushAll(): Promise<void> {

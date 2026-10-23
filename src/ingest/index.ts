@@ -8,7 +8,14 @@ import { LogsWebsocketSource, type LogsWebsocketSourceOptions } from "./wsSource
 
 export { BoundedSet } from "./lru.js";
 export { TransactionDecoder, type DecodedTransaction, type LogNotification } from "./decoder.js";
-export { IngestPipeline, poolTradeToChain, type IngestPipelineOptions, type PoolLookup } from "./pipeline.js";
+export {
+  IngestPipeline,
+  gapAffectsLaunch,
+  markGapInMemory,
+  poolTradeToChain,
+  type IngestPipelineOptions,
+  type PoolLookup
+} from "./pipeline.js";
 export { ReplayLogSource, type ReplayLogSourceOptions, type ReplayTransaction } from "./replaySource.js";
 export {
   GapListeners,

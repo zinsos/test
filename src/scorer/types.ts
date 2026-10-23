@@ -22,8 +22,12 @@ export interface IntelRequest {
   buySlot: number;
 }
 
+export interface IntelEnsureOptions {
+  fetch?: boolean;
+}
+
 export interface WalletIntelProvider {
-  ensure(entries: readonly IntelRequest[], deadlineMs: number): Promise<Map<Pubkey, WalletIntel>>;
+  ensure(entries: readonly IntelRequest[], deadlineMs: number, options?: IntelEnsureOptions): Promise<Map<Pubkey, WalletIntel>>;
   cached(wallets: Iterable<Pubkey>): Map<Pubkey, WalletIntel>;
 }
 

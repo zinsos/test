@@ -3,7 +3,7 @@ import type { Bus } from "../core/bus.js";
 import type { Clock } from "../core/clock.js";
 import { moduleLogger } from "../core/logger.js";
 import type { ChainEvent, IngestGap, Pubkey, TradeEvent } from "../core/types.js";
-import type { MarketState } from "../market/state.js";
+import type { LaunchState, MarketState } from "../market/state.js";
 import type { BatchHandler, GapHandler, StreamMeta, StreamSource } from "./source.js";
 
 const log = moduleLogger("ingest-pipeline");
@@ -22,6 +22,21 @@ export function poolTradeToChain(event: PoolTradeEvent, mint: Pubkey): TradeEven
   return { ...rest, kind: "trade", mint, venue: "pool", pool: event.pool };
 }
 
+export function gapAffectsLaunch(gap: IngestGap, launch: Pick<LaunchState, "info">): boolean {
+  return gap.fromSlot !== null ? launch.info.createdSlot <= gap.fromSlot : launch.info.createdAtMs <= gap.endedAtMs;
+}
+
+export function markGapInMemory(market: MarketState, gap: IngestGap): number {
+  let marked = 0;
+  for (const launch of market.all()) {
+    if (launch.dataComplete && gapAffectsLaunch(gap, launch)) {
+      launch.dataComplete = false;
+      marked += 1;
+    }
+  }
+  return marked;
+}
+
 export class IngestPipeline {
   private readonly market: MarketState;
   private readonly bus: Bus;
@@ -37,6 +52,7 @@ export class IngestPipeline {
     poolCreated: 0,
     applyErrors: 0,
     gaps: 0,
+    launchesMarkedIncomplete: 0,
     lastSlot: 0,
     processingLagMs: 0
   };
@@ -63,6 +79,7 @@ export class IngestPipeline {
 
   readonly handleGap: GapHandler = (gap: IngestGap): void => {
     this.counters.gaps += 1;
+    this.counters.launchesMarkedIncomplete += markGapInMemory(this.market, gap);
     this.bus.emit("gap", gap);
   };
 

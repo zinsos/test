@@ -7,7 +7,7 @@ import type { Db } from "../db/pool.js";
 import { fundingTransfer, type IncomingTransfer } from "./funding.js";
 import { loadHubFacts, loadIntelRows, markHubs, saveIntelRow, type HubFacts } from "./intelStore.js";
 import { LruCache } from "./lru.js";
-import type { IntelRequest, WalletIntel, WalletIntelProvider } from "./types.js";
+import type { IntelEnsureOptions, IntelRequest, WalletIntel, WalletIntelProvider } from "./types.js";
 
 const log = moduleLogger("wallet-intel");
 const HOUR_MS = 3_600_000;
@@ -121,7 +121,7 @@ export class WalletIntelService implements WalletIntelProvider {
     return (this.fanout.get(address) ?? 0) >= this.deep.hubFanoutThreshold;
   }
 
-  async ensure(entries: readonly IntelRequest[], deadlineMs: number): Promise<Map<Pubkey, WalletIntel>> {
+  async ensure(entries: readonly IntelRequest[], deadlineMs: number, options: IntelEnsureOptions = {}): Promise<Map<Pubkey, WalletIntel>> {
     const requests = this.dedupe(entries);
     const ready = new Map<Pubkey, WalletIntel>();
     let missing: IntelRequest[] = [];
@@ -143,10 +143,12 @@ export class WalletIntelService implements WalletIntelProvider {
       }
       missing = missing.filter((request) => !ready.has(request.wallet));
     }
-    const lookups = missing.flatMap((request) => {
-      const lookup = this.lookup(request);
-      return lookup ? [lookup] : [];
-    });
+    const lookups = (options.fetch ?? true)
+      ? missing.flatMap((request) => {
+          const lookup = this.lookup(request);
+          return lookup ? [lookup] : [];
+        })
+      : [];
     if (lookups.length > 0) {
       await this.untilDeadline(Promise.all(lookups), deadlineMs);
     }
@@ -222,7 +224,7 @@ export class WalletIntelService implements WalletIntelProvider {
     }
     const now = this.clock.nowMs();
     try {
-      return await loadIntelRows(this.db, wallets, now - this.ttlMs, now - this.errorRetryMs);
+      return await loadIntelRows(this.db, wallets, now - this.ttlMs, now - this.errorRetryMs, now);
     } catch (error) {
       log.warn({ err: error }, "wallet intel cache read failed");
       return [];

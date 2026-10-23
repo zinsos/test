@@ -252,6 +252,40 @@ class SlidingMin {
   }
 }
 
+class WindowPeak {
+  private readonly deque: number[] = [];
+  private head = 0;
+  private pushed = 0;
+  private openingIndex = 0;
+
+  constructor(
+    private readonly values: readonly bigint[],
+    private readonly times: readonly number[],
+    private readonly initial: bigint
+  ) {}
+
+  levelBefore(endIndex: number, fromMs: number): bigint {
+    while (this.pushed < endIndex) {
+      const value = this.values[this.pushed] ?? 0n;
+      while (this.deque.length > this.head && (this.values[this.deque[this.deque.length - 1] ?? 0] ?? 0n) <= value) {
+        this.deque.pop();
+      }
+      this.deque.push(this.pushed);
+      this.pushed += 1;
+    }
+    while (this.openingIndex < endIndex && (this.times[this.openingIndex] ?? Number.POSITIVE_INFINITY) < fromMs) {
+      this.openingIndex += 1;
+    }
+    while (this.head < this.deque.length && (this.deque[this.head] ?? 0) < this.openingIndex) {
+      this.head += 1;
+    }
+    const opening = this.openingIndex > 0 ? (this.values[this.openingIndex - 1] ?? this.initial) : this.initial;
+    const index = this.deque[this.head];
+    const inside = index === undefined ? null : (this.values[index] ?? null);
+    return inside !== null && inside > opening ? inside : opening;
+  }
+}
+
 interface RugParams {
   windowMs: number;
   lookaheadMs: number;
@@ -268,16 +302,14 @@ export function findRug(
 ): { rugAtMs: number | null; insiderMaxHoldings: bigint } {
   const balances = new Map<Pubkey, bigint>();
   const sells: Array<{ atMs: number; amount: bigint }> = [];
-  const sliding = new SlidingMin(
-    trades.map((trade) => trade.mcapQuote),
-    times
-  );
+  const mcaps = trades.map((trade) => trade.mcapQuote);
+  const sliding = new SlidingMin(mcaps, times);
+  const peaks = new WindowPeak(mcaps, times, initialMcap);
   let sellHead = 0;
   let windowSold = 0n;
   let holdings = 0n;
   let maxHoldings = 0n;
-  let runningMax = initialMcap;
-  let maxBeforeTau = initialMcap;
+  let levelBeforeTau = initialMcap;
   let firstIndexAtTau = 0;
   let previousTime = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < trades.length; index += 1) {
@@ -287,8 +319,8 @@ export function findRug(
       continue;
     }
     if (tau > previousTime) {
-      maxBeforeTau = runningMax;
       firstIndexAtTau = index;
+      levelBeforeTau = peaks.levelBefore(index, tau - params.windowMs);
       previousTime = tau;
     }
     if (insiders.has(trade.wallet)) {
@@ -304,16 +336,13 @@ export function findRug(
         windowSold += trade.tokenAmount;
       }
     }
-    if (trade.mcapQuote > runningMax) {
-      runningMax = trade.mcapQuote;
-    }
     while (sellHead < sells.length && (sells[sellHead]?.atMs ?? tau) < tau - params.windowMs) {
       windowSold -= sells[sellHead]?.amount ?? 0n;
       sellHead += 1;
     }
     const lowAhead = sliding.minBetween(firstIndexAtTau, tau + params.lookaheadMs);
     const insidersDumped = maxHoldings > 0n && Number(windowSold) >= params.sellFraction * Number(maxHoldings);
-    const priceCollapsed = lowAhead !== null && Number(lowAhead) <= (1 - params.dropFraction) * Number(maxBeforeTau);
+    const priceCollapsed = lowAhead !== null && Number(lowAhead) <= (1 - params.dropFraction) * Number(levelBeforeTau);
     if (insidersDumped && priceCollapsed) {
       return { rugAtMs: tau, insiderMaxHoldings: maxHoldings };
     }

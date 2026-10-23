@@ -179,6 +179,24 @@ describe("ingest pipeline", () => {
     expect(pipeline.stats().gaps).toBe(1);
   });
 
+  it("marks in-memory launches created at or before the gap start as incomplete before emitting the gap", () => {
+    const { market, bus, pipeline } = harness();
+    const template = createTemplate();
+    const early = { ...template, mint: "EarlyMint1111111111111111111111111111111111", tx: { ...template.tx, slot: 100 }, timestampMs: 1_000 };
+    const late = { ...template, mint: "LateMint11111111111111111111111111111111111", tx: { ...template.tx, slot: 300 }, timestampMs: 9_000 };
+    feedCreate(pipeline, early);
+    feedCreate(pipeline, late);
+    const seenOnGap: boolean[] = [];
+    bus.on("gap", () => seenOnGap.push(market.get(early.mint)?.dataComplete ?? true));
+    pipeline.handleGap({ source: "ws", fromSlot: 200, toSlot: 250, startedAtMs: 5_000, endedAtMs: 6_000, reason: "closed 1006" });
+    expect(market.get(early.mint)?.dataComplete).toBe(false);
+    expect(market.get(late.mint)?.dataComplete).toBe(true);
+    expect(seenOnGap).toEqual([false]);
+    pipeline.handleGap({ source: "ws", fromSlot: null, toSlot: null, startedAtMs: 8_000, endedAtMs: 10_000, reason: "restart" });
+    expect(market.get(late.mint)?.dataComplete).toBe(false);
+    expect(pipeline.stats().launchesMarkedIncomplete).toBe(2);
+  });
+
   it("keeps processing later events when one event fails to apply", () => {
     const { market, pipeline, events } = harness();
     const template = createTemplate();

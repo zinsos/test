@@ -36,3 +36,4 @@ Companion service to SNYPRA (the user's pump.fun trading bot on Railway). It rec
 ## Memory log
 
 - 2026-10-23: Project created. Repo previously held only stray assets (cog.png, info.png, fontz.ttf), removed.
+- 2026-10-23: Integration verified end to end (`test/e2e.*.test.ts`): websocket stream to recorder and scorer; synthetic market recorded through the live recorder, scorer and finalizer, then `rank-wallets` and `backtest` via the CLI; the live paper trader service trades the same window identically to the backtest. Rug labels compare the post-dump low with the price inside the rug window, not the all-time peak (a dev exit after a natural fade is not a rug). Scorer checkpoints below `minBuyersForDeep` read stored `wallet_intel` rows (checked at or before now) instead of only process memory, so every service scores a launch the same way. Ingest gaps mark in-memory launches incomplete in every process and the trader skips them.

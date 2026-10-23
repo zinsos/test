@@ -20,6 +20,7 @@ import type {
   CopycatDetector,
   DevHistoryProvider,
   DevHistorySummary,
+  IntelRequest,
   ScoreSink,
   StoredFeatures,
   StoredFeaturesLookup,
@@ -196,8 +197,7 @@ export class ScorerService implements ScoreProvider {
         const devHistory = hasAllKeys(stored, DEV_HISTORY_FEATURES) ? null : await this.lookupDevHistory(launch, nowMs);
         return this.finish(launch, { intel: null, devHistory, stored }, { checkpointSec, reason, publish: false });
       }
-      const wallets = intelRequestsFor(launch, nowMs, this.config).map((request) => request.wallet);
-      const intel = this.intel ? this.intel.cached(wallets) : null;
+      const intel = this.intel ? await this.knownIntel(intelRequestsFor(launch, nowMs, this.config), nowMs) : null;
       const devHistory = await this.lookupDevHistory(launch, nowMs);
       return this.finish(launch, { intel, devHistory, stored: null }, { checkpointSec, reason, publish: false });
     } catch (error) {
@@ -308,9 +308,23 @@ export class ScorerService implements ScoreProvider {
         return await this.intel.ensure(requests, nowMs + deep.timeoutMs);
       } catch (error) {
         log.warn({ err: error, mint: launch.mint }, "wallet intel failed, using cache");
+        return this.intel.cached(requests.map((request) => request.wallet));
       }
     }
-    return this.intel.cached(requests.map((request) => request.wallet));
+    return this.knownIntel(requests, nowMs);
+  }
+
+  private async knownIntel(requests: readonly IntelRequest[], nowMs: number): Promise<ReadonlyMap<Pubkey, WalletIntel>> {
+    const intel = this.intel;
+    if (!intel) {
+      return new Map();
+    }
+    try {
+      return await intel.ensure(requests, nowMs + this.config.deepIntel.timeoutMs, { fetch: false });
+    } catch (error) {
+      log.warn({ err: error }, "stored wallet intel unavailable, using memory cache");
+      return intel.cached(requests.map((request) => request.wallet));
+    }
   }
 
   private async lookupDevHistory(launch: LaunchState, asOfMs: number): Promise<DevHistorySummary | null> {

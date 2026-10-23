@@ -11,6 +11,7 @@ import { overlayStored, ScorerService, type ScorerMode } from "../src/scorer/ser
 import type {
   DevHistoryProvider,
   DevHistorySummary,
+  IntelEnsureOptions,
   IntelRequest,
   ScoreExtras,
   StoredFeatures,
@@ -23,11 +24,12 @@ const config = scorerConfig();
 
 class MockIntel implements WalletIntelProvider {
   readonly ensureCalls: Array<{ entries: IntelRequest[]; deadlineMs: number }> = [];
+  readonly storedOnlyCalls: Array<{ entries: IntelRequest[]; deadlineMs: number }> = [];
   cachedCalls = 0;
   constructor(private readonly data: Map<string, WalletIntel>) {}
 
-  async ensure(entries: readonly IntelRequest[], deadlineMs: number): Promise<Map<string, WalletIntel>> {
-    this.ensureCalls.push({ entries: [...entries], deadlineMs });
+  async ensure(entries: readonly IntelRequest[], deadlineMs: number, options: IntelEnsureOptions = {}): Promise<Map<string, WalletIntel>> {
+    (options.fetch === false ? this.storedOnlyCalls : this.ensureCalls).push({ entries: [...entries], deadlineMs });
     return this.pick(entries.map((entry) => entry.wallet));
   }
 
@@ -173,7 +175,7 @@ describe("ScorerService live mode", () => {
     expect(h.service.latest("SvcMint")?.checkpointSec).toBe(120);
   });
 
-  it("uses cached intel only when there are too few buyers for deep lookups", async () => {
+  it("uses only already stored intel, never new RPC lookups, when there are too few buyers for deep lookups", async () => {
     const intel = new MockIntel(clusterIntel);
     const builder = new LaunchBuilder({ mint: "Thin", createdAtMs: T0 });
     builder.buy("only", SOL, { atMs: T0 + 3_000 });
@@ -181,7 +183,9 @@ describe("ScorerService live mode", () => {
     h.service.scheduleLaunch("Thin", T0);
     await h.clock.advanceTo(T0 + 10_000);
     expect(intel.ensureCalls).toHaveLength(0);
-    expect(intel.cachedCalls).toBe(1);
+    expect(intel.storedOnlyCalls).toHaveLength(1);
+    expect(intel.storedOnlyCalls[0]?.deadlineMs).toBe(T0 + 10_000 + config.deepIntel.timeoutMs);
+    expect(intel.cachedCalls).toBe(0);
     expect(h.scores[0]?.features.intel_coverage).toBe(0);
   });
 
@@ -205,6 +209,7 @@ describe("ScorerService live mode", () => {
     expect(score?.checkpointSec).toBe(25);
     expect(score?.features.largest_cluster_size).toBe(4);
     expect(intel.ensureCalls).toHaveLength(0);
+    expect(intel.storedOnlyCalls).toHaveLength(1);
     expect(h.scores).toHaveLength(0);
     expect(h.stored).toHaveLength(0);
     expect(h.service.latest("SvcMint")).toBe(score);

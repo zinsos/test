@@ -34,7 +34,8 @@ const EnvSchema = z.object({
   DASHBOARD_TOKEN: z.string().optional(),
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.string().default("info"),
-  METADATA_GATEWAY: z.string().optional()
+  METADATA_GATEWAY: z.string().optional(),
+  JITO_BLOCK_ENGINE_URL: z.string().optional()
 });
 
 export type Env = z.infer<typeof EnvSchema>;

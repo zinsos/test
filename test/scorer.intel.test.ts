@@ -319,6 +319,25 @@ describe.skipIf(!hasTestDatabase)("WalletIntelService with a database", () => {
     expect(reader.stats().dbHits).toBe(1);
   });
 
+  it("serves stored rows without rpc when fetching is off and never uses rows checked after now", async () => {
+    await database.db.query(
+      `INSERT INTO wallet_intel (wallet, funder, prior_tx_count, checked_before_signature, checked_at)
+       VALUES ('KnownEarlier', 'EarlyFunder', 30, 'a', $1), ('KnownLater', 'LateFunder', 2, 'b', $2)`,
+      [new Date(T0 - 60_000), new Date(T0 + 60_000)]
+    );
+    const rpc = new FakeRpc();
+    rpc.addHistory("NeverSeen", [fundingTx("n1", "AnyFunder", "NeverSeen", SOL)]);
+    const service = new WalletIntelService({ db: database.db, rpc, clock: new VirtualClock(T0), config });
+    const result = await service.ensure([request("KnownEarlier"), request("KnownLater"), request("NeverSeen")], T0 + 5_000, { fetch: false });
+    expect([...result.keys()]).toEqual(["KnownEarlier"]);
+    expect(result.get("KnownEarlier")?.funder).toBe("EarlyFunder");
+    expect(rpc.signatureCalls).toBe(0);
+    const later = new WalletIntelService({ db: database.db, rpc, clock: new VirtualClock(T0 + 120_000), config });
+    const known = await later.ensure([request("KnownLater")], T0 + 125_000, { fetch: false });
+    expect(known.get("KnownLater")?.funder).toBe("LateFunder");
+    expect(rpc.signatureCalls).toBe(0);
+  });
+
   it("ignores database rows older than the ttl", async () => {
     await database.db.query(
       `INSERT INTO wallet_intel (wallet, funder, prior_tx_count, checked_before_signature, checked_at)

@@ -54,7 +54,8 @@ export async function loadIntelRows(
   db: Db,
   wallets: readonly Pubkey[],
   freshAfterMs: number,
-  errorFreshAfterMs: number
+  errorFreshAfterMs: number,
+  checkedUntilMs: number | null = null
 ): Promise<WalletIntel[]> {
   if (wallets.length === 0) {
     return [];
@@ -65,8 +66,9 @@ export async function loadIntelRows(
        FROM wallet_intel
       WHERE wallet = ANY($1::text[])
         AND checked_before_signature IS NOT NULL
-        AND ((error IS NULL AND checked_at > $2) OR checked_at > $3)`,
-    [wallets, new Date(freshAfterMs), new Date(errorFreshAfterMs)]
+        AND ((error IS NULL AND checked_at > $2) OR checked_at > $3)
+        AND ($4::timestamptz IS NULL OR checked_at <= $4::timestamptz)`,
+    [wallets, new Date(freshAfterMs), new Date(errorFreshAfterMs), checkedUntilMs === null ? null : new Date(checkedUntilMs)]
   );
   return result.rows.map(intelFromRow);
 }
