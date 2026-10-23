@@ -231,6 +231,10 @@ describe.skipIf(!hasTestDatabase)("analytics queries", () => {
     expect(lines).toHaveLength(1 + 12);
     const everything = await collectText(scorerDatasetCsv(database.db, { includeUnknown: true }));
     expect(everything.trim().split("\n")).toHaveLength(1 + 14);
+    const matured = await collectText(scorerDatasetCsv(database.db, { maturedBeforeMs: NOW_MS - 365 * DAY_MS }));
+    expect(matured.trim().split("\n")).toHaveLength(1);
+    const unknownStillIncluded = await collectText(scorerDatasetCsv(database.db, { includeUnknown: true, maturedBeforeMs: NOW_MS - 365 * DAY_MS }));
+    expect(unknownStillIncluded.trim().split("\n")).toHaveLength(1 + 14);
     const atSixty = await collect(iterateScorerDataset(database.db, { checkpointSec: 60 }, 2));
     expect(atSixty).toHaveLength(6);
     expect(new Set(atSixty.map((record) => record.launchId)).size).toBe(6);

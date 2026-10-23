@@ -189,6 +189,32 @@ describe.skipIf(!hasTestDatabase)("scorer persistence", () => {
     expect(chunks.join("")).toBe(exportCsv(rows));
   });
 
+  it("keeps a launch only once every launch of its age has a final label", async () => {
+    const db = database.db;
+    const asOf = T + 3 * 24 * 60 * MINUTE;
+    const young = asOf - 2 * 60 * MINUTE;
+    const old = asOf - 30 * 60 * MINUTE;
+    const ids = new Map<string, number>();
+    for (const [mint, createdAtMs] of [["YoungRug", young], ["YoungAlive", young], ["OldRug", old], ["OldDied", old]] as const) {
+      ids.set(mint, await insertLaunch(db, { mint, createdAtMs }));
+      await db.query(
+        `INSERT INTO launch_scores (launch_id, checkpoint_sec, mint, computed_at, slot, score, features, contributions, weights_version)
+         VALUES ($1, 45, $2, $3, 1, 50, '{}', '{}', 'v')`,
+        [ids.get(mint), mint, new Date(createdAtMs + 45_000)]
+      );
+    }
+    await insertOutcome(db, ids.get("YoungRug") ?? 0, { rugged: true, finalized: true, knownAtMs: young + 10 * MINUTE });
+    await insertOutcome(db, ids.get("YoungAlive") ?? 0, { knownAtMs: null, finalized: false });
+    await insertOutcome(db, ids.get("OldRug") ?? 0, { rugged: true, finalized: true, knownAtMs: old + 10 * MINUTE });
+    await insertOutcome(db, ids.get("OldDied") ?? 0, { died: true, finalized: true, knownAtMs: old + 60 * MINUTE });
+    const mints = async (query: Parameters<typeof buildDataset>[1]): Promise<string[]> =>
+      (await buildDataset(db, { checkpointSec: 45, ...query })).map((row) => row.mint).sort();
+    expect(await mints({ asOf: new Date(asOf) })).toEqual(["OldDied", "OldRug"]);
+    expect(await mints({ asOf: new Date(asOf), labelHorizonHours: 1 })).toEqual(["OldDied", "OldRug", "YoungRug"]);
+    expect(await mints({ asOf: new Date(asOf + 24 * 60 * MINUTE) })).toEqual(["OldDied", "OldRug", "YoungRug"]);
+    expect(await mints({})).toEqual(["OldDied", "OldRug", "YoungRug"]);
+  });
+
   it("saves, activates and loads weights from the database and a file", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "scorer-weights-"));
     try {

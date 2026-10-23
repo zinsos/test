@@ -211,7 +211,9 @@ describe.skipIf(!hasTestDatabase)("analytics server", () => {
     expect(lines).toHaveLength(1 + PAPER_TRADES);
     const dataset = await authed("/api/export/scorer-dataset.csv?checkpoint=60");
     expect(dataset.headers.get("content-type")).toBe("text/csv; charset=utf-8");
-    expect(dataset.text.trim().split("\n")).toHaveLength(1 + 6);
+    expect(dataset.text.trim().split("\n")).toHaveLength(1 + 4);
+    const withYoung = await authed("/api/export/scorer-dataset.csv?checkpoint=60&all=1");
+    expect(withYoung.text.trim().split("\n")).toHaveLength(1 + 7);
     expect(dataset.text.split("\n")[0]).toContain("f_age_sec,f_dev_share,f_mcap_multiple,f_z_extra");
     const head = await fetch(`${base}/api/export/trades.csv`, { method: "HEAD", headers: { Authorization: `Bearer ${TOKEN}` } });
     expect(head.status).toBe(200);

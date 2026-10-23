@@ -37,6 +37,7 @@ class FakeRpc implements BackfillRpc {
   readonly history = new Map<string, ChainEntry[]>();
   readonly fetched: string[] = [];
   readonly failing = new Set<string>();
+  readonly failuresLeft = new Map<string, number>();
   signatureCalls = 0;
 
   setHistory(wallet: string, entries: ChainEntry[]): void {
@@ -69,6 +70,11 @@ class FakeRpc implements BackfillRpc {
     this.fetched.push(signature);
     if (this.failing.has(signature)) {
       throw new Error("rpc unavailable");
+    }
+    const left = this.failuresLeft.get(signature) ?? 0;
+    if (left > 0) {
+      this.failuresLeft.set(signature, left - 1);
+      throw new Error("429 too many requests");
     }
     for (const entries of this.history.values()) {
       const found = entries.find((entry) => entry.info.signature === signature);
@@ -226,6 +232,82 @@ describe.skipIf(!hasTestDatabase)("wallet history backfill", () => {
     expect(aborted.error).toContain("rpc unavailable");
     const state = await database.db.query<{ last_error: string | null }>(`SELECT last_error FROM wallet_backfill_state WHERE wallet = $1`, [MIGRATOR]);
     expect(state.rows[0]?.last_error).toContain("rpc unavailable");
+  });
+
+  it("retries a failed transaction fetch once within the run", async () => {
+    const rpc = new FakeRpc();
+    rpc.setHistory(MIGRATOR, migratorHistory());
+    rpc.failuresLeft.set(OLDER.signature, 1);
+    const result = await backfillWallet(database.db, rpc, MIGRATOR, { ...baseOptions, maxConsecutiveErrors: 5, shouldStop: () => false });
+    expect(result.skipped.fetch_error).toBeUndefined();
+    expect(result.tradesWritten).toBe(2);
+    expect(rpc.fetched.filter((signature) => signature === OLDER.signature)).toHaveLength(2);
+  });
+
+  it("keeps a transaction that failed for a whole run for the next run, then gives up on one that fails again", async () => {
+    const rpc = new FakeRpc();
+    rpc.setHistory(MIGRATOR, migratorHistory());
+    const options = { ...baseOptions, maxConsecutiveErrors: 5, shouldStop: () => false };
+    rpc.failuresLeft.set(OLDER.signature, 2);
+    const first = await backfillWallet(database.db, rpc, MIGRATOR, options);
+    expect(first.skipped.fetch_error).toBe(1);
+    expect(first.tradesWritten).toBe(1);
+    const blocked = await loadBackfillState(database.db, MIGRATOR);
+    expect(blocked?.oldestSignature).toBe("f-mid");
+    expect(blocked?.coveredFromMs).toBeGreaterThan(SINCE_MS);
+    const second = await backfillWallet(database.db, rpc, MIGRATOR, options);
+    expect(second.tradesWritten).toBe(1);
+    expect(second.reachedSince).toBe(true);
+    expect((await loadBackfillState(database.db, MIGRATOR))?.oldestSignature).toBe("f-old-1");
+    const stuck = new FakeRpc();
+    stuck.setHistory(MIGRATOR, migratorHistory());
+    stuck.failing.add(OLDER.signature);
+    await database.db.query("TRUNCATE wallet_history_trades, wallet_backfill_state");
+    await backfillWallet(database.db, stuck, MIGRATOR, options);
+    expect((await loadBackfillState(database.db, MIGRATOR))?.oldestSignature).toBe("f-mid");
+    const givenUp = await backfillWallet(database.db, stuck, MIGRATOR, options);
+    expect(givenUp.skipped.fetch_error).toBe(1);
+    expect(givenUp.reachedSince).toBe(true);
+    const state = await database.db.query<{ last_error: string | null }>(`SELECT last_error FROM wallet_backfill_state WHERE wallet = $1`, [MIGRATOR]);
+    expect(state.rows[0]?.last_error).toBeNull();
+  });
+
+  it("does not move the newest marker past a new transaction whose fetch failed", async () => {
+    const rpc = new FakeRpc();
+    rpc.setHistory(MIGRATOR, [real("4uaZFYCy")]);
+    const options = { ...baseOptions, maxConsecutiveErrors: 5, shouldStop: () => false };
+    await backfillWallet(database.db, rpc, MIGRATOR, options);
+    rpc.prepend(MIGRATOR, [filler("after", NEWER.blockTime + 60), real("GK5Z3vZ6"), filler("before", NEWER.blockTime - 10)]);
+    rpc.failuresLeft.set(NEWER.signature, 2);
+    const first = await backfillWallet(database.db, rpc, MIGRATOR, options);
+    expect(first.tradesWritten).toBe(0);
+    expect((await loadBackfillState(database.db, MIGRATOR))?.newestSignature).toBe("before");
+    const second = await backfillWallet(database.db, rpc, MIGRATOR, options);
+    expect(second.tradesWritten).toBe(1);
+    expect((await loadBackfillState(database.db, MIGRATOR))?.newestSignature).toBe("after");
+  });
+
+  it("stores this wallet's trade even when another wallet's trade from the same transaction is stored", async () => {
+    await insertHistory(database.db, [
+      {
+        wallet: "CoSigner",
+        mint: "OtherMint",
+        signature: NEWER.signature,
+        eventIndex: 7,
+        atMs: NEWER.blockTime * 1000,
+        isBuy: true,
+        tokenAmount: 1_000n,
+        userQuote: 1_000_000n,
+        fetchedAtMs: NEWER.blockTime * 1000
+      }
+    ]);
+    const rpc = new FakeRpc();
+    rpc.setHistory(MIGRATOR, [real("GK5Z3vZ6")]);
+    const result = await backfillWallet(database.db, rpc, MIGRATOR, { ...baseOptions, maxConsecutiveErrors: 5, shouldStop: () => false });
+    expect(result.skipped.already_stored ?? 0).toBe(0);
+    expect(result.tradesWritten).toBe(1);
+    const rows = await database.db.query<{ n: number }>("SELECT count(*)::int AS n FROM wallet_history_trades WHERE wallet = $1", [MIGRATOR]);
+    expect(rows.rows[0]?.n).toBe(1);
   });
 
   it("backfills several wallets concurrently and stops when asked", async () => {

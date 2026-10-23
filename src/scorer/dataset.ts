@@ -33,7 +33,11 @@ export interface DatasetQuery {
   to?: Date | null;
   quoteMint?: string | null;
   limit?: number | null;
+  asOf?: Date | null;
+  labelHorizonHours?: number;
 }
+
+export const DEFAULT_LABEL_HORIZON_HOURS = 24;
 
 interface DatasetDbRow {
   launch_id: unknown;
@@ -59,6 +63,7 @@ SELECT s.launch_id, l.mint, l.created_at, l.quote_mint, s.checkpoint_sec, s.scor
   JOIN launches l ON l.id = s.launch_id
   JOIN launch_outcomes o ON o.launch_id = s.launch_id
  WHERE (o.finalized OR o.outcome_known_at IS NOT NULL)
+   AND l.created_at <= COALESCE($9::timestamptz, now()) - make_interval(secs => $10::float8)
    AND ($1::int IS NULL OR s.checkpoint_sec = $1)
    AND ($2::timestamptz IS NULL OR l.created_at >= $2)
    AND ($3::timestamptz IS NULL OR l.created_at < $3)
@@ -127,7 +132,9 @@ export async function* iterateDataset(db: Db, query: DatasetQuery = {}, pageSize
       cursorTime,
       cursorLaunch,
       cursorCheckpoint,
-      take
+      take,
+      query.asOf ?? null,
+      (query.labelHorizonHours ?? DEFAULT_LABEL_HORIZON_HOURS) * 3_600
     ]);
     if (page.length === 0) {
       return;

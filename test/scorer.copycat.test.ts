@@ -1,10 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Bus } from "../src/core/bus.js";
+import { VirtualClock } from "../src/core/clock.js";
 import { SOL_QUOTE } from "../src/core/constants.js";
 import type { LaunchCreatedEvent, TradeEvent } from "../src/core/types.js";
 import { TrendingTracker } from "../src/scorer/copycat.js";
+import { createScorerModule } from "../src/scorer/index.js";
+import { ScoringModel } from "../src/scorer/model.js";
+import { seedTrending } from "../src/scorer/trendingSeed.js";
 import { jaroWinkler, normalizeText } from "../src/scorer/text.js";
+import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 import { LaunchBuilder, PUMP_QUOTE_MINT, scorerConfig, SOL, T0 } from "./scorer.fixtures.js";
+import { insertTrades, type TradeSpec } from "./tracker.db.js";
 
 const config = scorerConfig();
 const MINUTE = 60_000;
@@ -164,5 +170,101 @@ describe("TrendingTracker with launch state", () => {
     const builder = new LaunchBuilder({ mint: "Copy", name: "Doge Moon", symbol: "dmoon", createdAtMs: T0 });
     const result = t.isCopycat(builder.launch, T0 + 10_000);
     expect(result).toEqual({ copycat: true, similarity: 1, original: "Orig", sameTickerRecent: 1 });
+  });
+});
+
+describe.skipIf(!hasTestDatabase)("TrendingTracker seeding from recorded launches", () => {
+  let database: TestDatabase;
+  const NOW = T0 + 3 * 60 * MINUTE;
+
+  async function launch(mint: string, symbol: string, createdAtMs: number, quoteMint = SOL_QUOTE): Promise<number> {
+    const result = await database.db.query<{ id: bigint }>(
+      `INSERT INTO launches (mint, bonding_curve, dev_wallet, creator, name, symbol, quote_mint, create_signature, create_slot, created_at,
+                             token_total_supply, initial_virtual_token, initial_virtual_quote, initial_real_token)
+       VALUES ($1, $1 || 'Curve', 'Dev', 'Dev', $2 || ' Coin', $2, $3, $1 || 'Sig', 1, $4, 1000000000000000, 1073000000000000, 30000000000, 793100000000000)
+       RETURNING id`,
+      [mint, symbol, quoteMint, new Date(createdAtMs)]
+    );
+    return Number(result.rows[0]?.id ?? 0);
+  }
+
+  function buyAt(launchId: number, atMs: number, lamports: bigint, signature: string): TradeSpec {
+    return { launchId, wallet: "Buyer", atMs, isBuy: true, tokenAmount: 1_000n, userQuote: lamports, signature };
+  }
+
+  beforeAll(async () => {
+    database = await createTestDatabase("scorer_trending_seed");
+    const original = await launch("SeedOriginal", "PEPE", NOW - 30 * MINUTE);
+    const older = await launch("SeedOlder", "DOGE", NOW - 5 * 60 * MINUTE);
+    const future = await launch("SeedFuture", "LATER", NOW + 10 * MINUTE);
+    await launch("SeedQuiet", "QUIET", NOW - 20 * MINUTE);
+    await insertTrades(database.db, [
+      buyAt(original, NOW - 25 * MINUTE, 2n * SOL, "seed-1"),
+      buyAt(original, NOW - 5 * MINUTE, 3n * SOL, "seed-2"),
+      buyAt(original, NOW + 5 * MINUTE, 50n * SOL, "seed-future-trade"),
+      buyAt(older, NOW - 10 * MINUTE, SOL, "seed-3"),
+      buyAt(older, NOW - 3 * 60 * MINUTE, 40n * SOL, "seed-stale"),
+      buyAt(future, NOW + 11 * MINUTE, 9n * SOL, "seed-4")
+    ]);
+  });
+
+  afterAll(async () => {
+    await database.drop();
+  });
+
+  it("rebuilds rolling volume and recent tickers from the window before now only", async () => {
+    const t = tracker();
+    const result = await seedTrending(database.db, t, { nowMs: NOW, windowMinutes: config.copycat.trendingWindowMinutes });
+    expect(result).toEqual({ launches: 2, volumeRows: 3 });
+    expect(t.rollingVolume("SeedOriginal", NOW)).toBe(Number(5n * SOL));
+    expect(t.rollingVolume("SeedOlder", NOW)).toBe(Number(SOL));
+    expect(t.rollingVolume("SeedFuture", NOW)).toBe(0);
+    expect(t.trending(NOW).map((entry) => entry.mint)).toEqual(["SeedOriginal", "SeedOlder"]);
+    const copy = t.isCopycat({ mint: "NewPepe", name: "Pepe Coin", symbol: "PEPE", createdAtMs: NOW }, NOW);
+    expect(copy).toMatchObject({ copycat: true, original: "SeedOriginal", sameTickerRecent: 1 });
+  });
+
+  it("seeds live and replay scorer modules as of their clock at start", async () => {
+    const live = createScorerModule({
+      db: database.db,
+      rpc: null,
+      bus: new Bus(),
+      market: { launch: () => undefined },
+      clock: new VirtualClock(NOW),
+      config,
+      mode: "live",
+      model: ScoringModel.default(),
+      persistScores: false
+    });
+    await live.start();
+    expect(live.trending.rollingVolume("SeedOriginal", NOW)).toBe(Number(5n * SOL));
+    await live.stop();
+    const replay = createScorerModule({
+      db: database.db,
+      rpc: null,
+      bus: new Bus(),
+      market: { launch: () => undefined },
+      clock: new VirtualClock(NOW),
+      config,
+      mode: "replay",
+      model: ScoringModel.default()
+    });
+    await replay.start();
+    expect(replay.trending.rollingVolume("SeedOriginal", NOW)).toBe(Number(5n * SOL));
+    expect(replay.trending.rollingVolume("SeedFuture", NOW + 20 * MINUTE)).toBe(0);
+    await replay.stop();
+    const early = createScorerModule({
+      db: database.db,
+      rpc: null,
+      bus: new Bus(),
+      market: { launch: () => undefined },
+      clock: new VirtualClock(NOW - 6 * MINUTE),
+      config,
+      mode: "replay",
+      model: ScoringModel.default()
+    });
+    await early.start();
+    expect(early.trending.rollingVolume("SeedOriginal", NOW - 6 * MINUTE)).toBe(Number(2n * SOL));
+    await early.stop();
   });
 });

@@ -9,6 +9,7 @@ import { WalletIntelService, type IntelRpc } from "./intel.js";
 import { loadScoringModel, ScoringModel, type WeightsSource } from "./model.js";
 import { LaunchScoreStore } from "./scoreStore.js";
 import { ScorerService, type LaunchSource, type ScorerMode } from "./service.js";
+import { seedTrending } from "./trendingSeed.js";
 import type { StoredFeaturesLookup } from "./types.js";
 
 const log = moduleLogger("scorer-module");
@@ -62,6 +63,20 @@ export function createScorerModule(options: ScorerModuleOptions): ScorerModule {
     storedFeatures: options.storedFeatures ?? null
   });
   let detachTrending: (() => void) | null = null;
+  let seeded = false;
+
+  const seedTrendingFromHistory = async (db: Db): Promise<void> => {
+    seeded = true;
+    try {
+      const result = await seedTrending(db, trending, {
+        nowMs: options.clock.nowMs(),
+        windowMinutes: options.config.copycat.trendingWindowMinutes
+      });
+      log.info(result, "copycat trending seeded from recorded launches");
+    } catch (error) {
+      log.warn({ err: error }, "copycat trending seed failed, starting empty");
+    }
+  };
 
   const reloadWeights = async (): Promise<WeightsSource> => {
     const loaded = await loadScoringModel({ db: options.db, filePath: options.weightsFile ?? options.config.weightsFile });
@@ -79,6 +94,9 @@ export function createScorerModule(options: ScorerModuleOptions): ScorerModule {
     async start() {
       if (!options.model) {
         await reloadWeights();
+      }
+      if (options.db && !seeded) {
+        await seedTrendingFromHistory(options.db);
       }
       if (!detachTrending) {
         detachTrending = trending.attach(options.bus);
@@ -98,6 +116,7 @@ export function createScorerModule(options: ScorerModuleOptions): ScorerModule {
 }
 
 export { TrendingTracker } from "./copycat.js";
+export { seedTrending, type TrendingSeedOptions, type TrendingSeedResult } from "./trendingSeed.js";
 export { DevHistoryService, EMPTY_DEV_HISTORY } from "./devHistory.js";
 export { WalletIntelService, LINKING_ENTITY_KINDS, type IntelRpc } from "./intel.js";
 export { ScoringModel, loadScoringModel, riskAt, hardBlockFlags, exceedsRisk, type ModelScore } from "./model.js";

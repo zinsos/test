@@ -46,6 +46,7 @@ export interface ScorerDatasetQuery {
   toMs?: number | null;
   quoteMint?: string | null;
   includeUnknown?: boolean;
+  maturedBeforeMs?: number | null;
   limit?: number | null;
 }
 
@@ -210,7 +211,8 @@ const DATASET_FILTER = `($1::int IS NULL OR s.checkpoint_sec = $1)
   AND ($2::timestamptz IS NULL OR l.created_at >= $2)
   AND ($3::timestamptz IS NULL OR l.created_at < $3)
   AND ($4::text IS NULL OR l.quote_mint = $4)
-  AND ($5::boolean OR o.finalized OR o.outcome_known_at IS NOT NULL)`;
+  AND ($5::boolean OR ((o.finalized OR o.outcome_known_at IS NOT NULL)
+       AND ($6::timestamptz IS NULL OR l.created_at <= $6::timestamptz)))`;
 
 function datasetParams(query: ScorerDatasetQuery): unknown[] {
   return [
@@ -218,7 +220,8 @@ function datasetParams(query: ScorerDatasetQuery): unknown[] {
     dateParam(query.fromMs),
     dateParam(query.toMs),
     query.quoteMint ?? null,
-    query.includeUnknown === true
+    query.includeUnknown === true,
+    dateParam(query.maturedBeforeMs)
   ];
 }
 
@@ -317,9 +320,9 @@ export async function* iterateScorerDataset(
        JOIN launches l ON l.id = s.launch_id
        JOIN launch_outcomes o ON o.launch_id = s.launch_id
        WHERE ${DATASET_FILTER}
-         AND (s.launch_id, s.checkpoint_sec) > ($6::bigint, $7::int)
+         AND (s.launch_id, s.checkpoint_sec) > ($7::bigint, $8::int)
        ORDER BY s.launch_id, s.checkpoint_sec
-       LIMIT $8`,
+       LIMIT $9`,
       [...datasetParams(query), cursorLaunch, cursorCheckpoint, take]
     );
     const page = result.rows.map(datasetRecord);

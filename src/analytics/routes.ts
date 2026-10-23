@@ -1,6 +1,7 @@
 import type { Clock } from "../core/clock.js";
 import type { LaunchScore, Pubkey, TradingMode } from "../core/types.js";
 import type { Db } from "../db/pool.js";
+import { DEFAULT_LABEL_HORIZON_HOURS } from "../scorer/dataset.js";
 import type { TtlCache } from "./cache.js";
 import { DEFAULT_CALIBRATION_MAX_RISK, DEFAULT_MIN_CALIBRATION_LAUNCHES } from "./calibration.js";
 import { DEFAULT_RISK_BUCKET_WIDTH, isBreakdownDimension } from "./dimensions.js";
@@ -53,6 +54,7 @@ export interface AnalyticsSettings {
   tradeLimit: number;
   minCalibrationLaunches: number;
   defaultCheckpointSec: number;
+  labelHorizonHours: number;
 }
 
 export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
@@ -65,7 +67,8 @@ export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
   seed: DEFAULT_BOOTSTRAP_SEED,
   tradeLimit: DEFAULT_TRADE_LIMIT,
   minCalibrationLaunches: DEFAULT_MIN_CALIBRATION_LAUNCHES,
-  defaultCheckpointSec: 60
+  defaultCheckpointSec: 60,
+  labelHorizonHours: DEFAULT_LABEL_HORIZON_HOURS
 };
 
 export type ScoreLookup = (mint: Pubkey) => LaunchScore | null;
@@ -275,6 +278,7 @@ function scorerDatasetRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStre
       toMs: parseTime(params, "to"),
       quoteMint: optionalText(params, "quote"),
       includeUnknown: parseFlag(params, "all"),
+      maturedBeforeMs: ctx.clock.nowMs() - ctx.settings.labelHorizonHours * 3_600_000,
       limit: parseInteger(params, "limit", { min: 1 })
     })
   };
