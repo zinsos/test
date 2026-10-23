@@ -153,6 +153,7 @@ export interface OrderRequest {
   signalAtMs: number;
   referencePrice: number;
   positionId: string | null;
+  closesPosition: boolean;
 }
 
 export interface FillAttempt {
