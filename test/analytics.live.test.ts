@@ -335,6 +335,36 @@ describe("live event stream over http", () => {
     fourth.close();
   });
 
+  it("serves the same events by polling for proxies that buffer event streams", async () => {
+    const { hub, clock, bus } = setup();
+    const port = await serve(hub, clock);
+    bus.emit("score", score());
+    bus.emit("signal", signal());
+    const unauthorized = await fetch(`http://127.0.0.1:${port}/api/live/events`);
+    expect(unauthorized.status).toBe(401);
+    const first = (await (await fetch(`http://127.0.0.1:${port}/api/live/events?token=${TOKEN}`)).json()) as {
+      hello: { streamId: string };
+      events: Array<{ id: number; kind: string }>;
+      lastId: number;
+    };
+    expect(first.hello.streamId).toBe(hub.streamId);
+    expect(first.events.map((event) => event.kind)).toEqual(["score", "signal"]);
+    expect(first.lastId).toBe(2);
+    bus.emit("signalRejected", { signal: signal({ mint: OTHER_MINT, riskScore: 82 }), reason: "risk_too_high" });
+    const next = (await (
+      await fetch(`http://127.0.0.1:${port}/api/live/events?token=${TOKEN}&stream=${hub.streamId}&after=${first.lastId}`)
+    ).json()) as { events: Array<{ id: number; kind: string; text: string }> };
+    expect(next.events.map((event) => [event.id, event.kind, event.text])).toEqual([[3, "rejected", "Rejected $XYZ: risk 82 above 35"]]);
+    const otherStream = (await (
+      await fetch(`http://127.0.0.1:${port}/api/live/events?token=${TOKEN}&stream=abc123&after=${first.lastId}`)
+    ).json()) as { events: unknown[] };
+    expect(otherStream.events).toHaveLength(3);
+    const malformed = (await (
+      await fetch(`http://127.0.0.1:${port}/api/live/events?token=${TOKEN}&stream=${encodeURIComponent("x' OR 1=1")}&after=2`)
+    ).json()) as { events: unknown[] };
+    expect(malformed.events).toHaveLength(3);
+  });
+
   it("reports status and 404s the stream when this process has no live hub", async () => {
     const clock = new VirtualClock(T0);
     const port = await serve(null, clock);
@@ -345,6 +375,8 @@ describe("live event stream over http", () => {
     expect(await stream.json()).toMatchObject({ error: "live_unavailable" });
     const series = await fetch(`http://127.0.0.1:${port}/api/live/position/${POSITION_ID}/series?token=${TOKEN}`);
     expect(series.status).toBe(404);
+    const events = await fetch(`http://127.0.0.1:${port}/api/live/events?token=${TOKEN}`);
+    expect(events.status).toBe(404);
   });
 });
 

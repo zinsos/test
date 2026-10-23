@@ -5,6 +5,8 @@ export const LIVE_VIEW_SCRIPT = String.raw`
   var LIVE_POINTS_KEEP = 600;
   var LIVE_SERIES_MS = 10000;
   var LIVE_STALL_MS = 45000;
+  var LIVE_FALLBACK_MS = 6000;
+  var LIVE_POLL_MS = 2000;
   var LIVE_RETRY_START_MS = 3000;
   var LIVE_RETRY_MAX_MS = 60000;
   var LIVE_LOOKBACK_MS = 60000;
@@ -23,7 +25,8 @@ export const LIVE_VIEW_SCRIPT = String.raw`
   var live = {
     source: null, status: "idle", detail: "", streamId: "", lastId: 0, feed: [], held: 0, paused: false,
     positions: {}, root: null, chip: null, list: null, cards: null, pauseButton: null, note: null, gapNote: null,
-    retryMs: 0, retryAtMs: 0, lastMessageMs: 0, clockOffsetMs: 0, dropped: 0, tradingActive: false
+    retryMs: 0, retryAtMs: 0, lastMessageMs: 0, clockOffsetMs: 0, dropped: 0, tradingActive: false,
+    mode: "stream", helloSeen: false, openedAtMs: 0, polling: false, lastPollMs: 0
   };
 
   function liveParse(text) {
@@ -316,11 +319,48 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     live.retryAtMs = Date.now() + live.retryMs;
     liveSetStatus(status || "reconnecting");
   }
+  function liveSyncPositions(hello) {
+    live.clockOffsetMs = isNum(hello.serverTimeMs) ? hello.serverTimeMs - Date.now() : live.clockOffsetMs;
+    live.tradingActive = !!hello.tradingActive;
+    var keep = {};
+    (hello.positions || []).forEach(function (view) { keep[view.id] = true; livePositionUpdate(view, hello.serverTimeMs); });
+    Object.keys(live.positions).forEach(function (id) { if (!keep[id]) { liveRemoveCard(id); } });
+  }
+  function livePoll() {
+    if (live.polling) { return; }
+    live.polling = true;
+    live.lastPollMs = Date.now();
+    api("/api/live/events", { stream: live.streamId || "", after: live.lastId || 0 }).then(function (result) {
+      live.polling = false;
+      if (state.tab !== "live" || live.mode !== "poll" || !result) { return; }
+      if (result.hello) {
+        if (result.hello.streamId !== live.streamId) { liveHello(result.hello); } else { liveSyncPositions(result.hello); }
+      }
+      (result.events || []).forEach(liveAdd);
+      live.lastMessageMs = Date.now();
+      liveSetStatus("live", "updates every 2s");
+    }).catch(function (error) {
+      live.polling = false;
+      if (error && error.auth) { liveStop(); render(); return; }
+      if (live.mode === "poll") { liveSetStatus("reconnecting", "polling"); }
+    });
+  }
+  function livePollStart() {
+    liveDisconnect();
+    live.mode = "poll";
+    live.retryAtMs = 0;
+    live.lastPollMs = 0;
+    liveSetStatus("connecting", "polling every 2s");
+    livePoll();
+  }
   function liveOpen() {
     var Source = window.EventSource;
+    if (live.mode === "poll") { livePollStart(); return; }
     liveDisconnect();
     live.retryAtMs = 0;
-    if (typeof Source !== "function") { liveSetStatus("offline", "this browser cannot open a live stream"); return; }
+    live.helloSeen = false;
+    live.openedAtMs = Date.now();
+    if (typeof Source !== "function") { livePollStart(); return; }
     var source = new Source("/api/live/stream" + queryString({ token: token() }));
     live.source = source;
     live.lastMessageMs = Date.now();
@@ -329,7 +369,6 @@ export const LIVE_VIEW_SCRIPT = String.raw`
       if (live.source !== source) { return; }
       live.retryMs = 0;
       live.lastMessageMs = Date.now();
-      liveSetStatus("live");
     };
     source.onmessage = function (message) {
       if (live.source !== source) { return; }
@@ -338,6 +377,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     source.addEventListener("hello", function (message) {
       var hello = live.source === source ? liveParse(message.data) : null;
       if (!hello) { return; }
+      live.helloSeen = true;
       live.lastMessageMs = Date.now();
       liveHello(hello);
       liveSetStatus("live");
@@ -372,6 +412,8 @@ export const LIVE_VIEW_SCRIPT = String.raw`
   function liveTick() {
     if (state.tab !== "live" || document.visibilityState !== "visible" || !live.root) { return; }
     var now = Date.now();
+    if (live.mode === "stream" && live.source && !live.helloSeen && now - live.openedAtMs > LIVE_FALLBACK_MS) { livePollStart(); }
+    if (live.mode === "poll" && !live.polling && now - live.lastPollMs >= LIVE_POLL_MS) { livePoll(); }
     if (live.source && now - live.lastMessageMs > LIVE_STALL_MS) { liveScheduleRetry("reconnecting"); }
     if (!live.source && live.retryAtMs && now >= live.retryAtMs) { live.retryAtMs = 0; liveSetStatus("connecting"); liveReconnect(); }
     else if (live.chip) { live.chip.textContent = liveStatusText(); }

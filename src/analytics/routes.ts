@@ -347,6 +347,17 @@ function liveSeriesRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<un
   return Promise.resolve(series);
 }
 
+const STREAM_ID = /^[0-9a-f]{1,64}$/;
+
+function liveEventsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
+  if (!ctx.live) {
+    throw new HttpError(404, "live_unavailable", "this service has no live event stream; run the dashboard in the trading service");
+  }
+  const stream = request.params.get("stream");
+  const after = parseInteger(request.params, "after", { min: 0 }) ?? 0;
+  return Promise.resolve(ctx.live.poll(stream !== null && STREAM_ID.test(stream) ? stream : null, after));
+}
+
 function liveStreamRoute(ctx: AnalyticsContext, _request: ApiRequest, req: IncomingMessage, res: ServerResponse): void {
   if (!ctx.live) {
     throw new HttpError(404, "live_unavailable", "this service has no live event stream; run the dashboard in the trading service");
@@ -398,6 +409,7 @@ const ROUTES: ReadonlyMap<string, ApiRoute> = new Map<string, ApiRoute>([
   ["lab", { kind: "json", cacheable: true, handle: labRoute }],
   ["live/status", { kind: "json", cacheable: false, handle: (ctx) => liveStatusRoute(ctx) }],
   ["live/stream", { kind: "stream", handle: liveStreamRoute }],
+  ["live/events", { kind: "json", cacheable: false, handle: liveEventsRoute }],
   ["export/scorer-dataset.csv", { kind: "csv", handle: scorerDatasetRoute }],
   ["export/trades.csv", { kind: "csv", handle: tradesCsvRoute }]
 ]);

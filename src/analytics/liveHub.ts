@@ -92,6 +92,12 @@ export interface LiveHello {
   positions: LivePositionView[];
 }
 
+export interface LivePoll {
+  hello: LiveHello;
+  events: LiveEvent[];
+  lastId: number;
+}
+
 interface StreamClient {
   res: ServerResponse;
   congested: boolean;
@@ -252,6 +258,19 @@ export class LiveHub {
       return null;
     }
     return positionSeries(position, this.market.get(position.mint), this.config, this.clock.nowMs());
+  }
+
+  poll(streamId: string | null, afterId: number): LivePoll {
+    const nowMs = this.clock.nowMs();
+    if (this.positions) {
+      this.syncPositions(nowMs);
+    }
+    const after = streamId === this.streamId && Number.isSafeInteger(afterId) && afterId > 0 ? afterId : 0;
+    return {
+      hello: this.hello(nowMs),
+      events: this.recentEvents().filter((event) => event.id > after),
+      lastId: this.nextId - 1
+    };
   }
 
   connect(req: IncomingMessage, res: ServerResponse): void {

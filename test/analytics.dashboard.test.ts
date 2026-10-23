@@ -351,6 +351,17 @@ function liveResponder(status: Record<string, unknown>): Responder {
     if (path === "/api/live/status") {
       return Promise.resolve(jsonResponse(status));
     }
+    if (path.startsWith("/api/live/events")) {
+      const after = Number(new URLSearchParams(path.split("?")[1] ?? "").get("after") ?? "0");
+      const events = [liveEvent(1, "score", "score", "Scored $GEN 60s: 18 (clean)"), liveEvent(2, "opened", "trade", "Bought $GEN 0.075 SOL")];
+      return Promise.resolve(
+        jsonResponse({
+          hello: { streamId: "p1", serverTimeMs: READ_AT_MS, tradingActive: true, maxClients: 10, clients: 0, heartbeatMs: 15_000, positions: [] },
+          events: events.filter((event) => Number(event.id) > after),
+          lastId: 2
+        })
+      );
+    }
     if (path.startsWith("/api/live/position/")) {
       return Promise.resolve(
         jsonResponse({
@@ -464,6 +475,7 @@ describe("live tab", () => {
     expect(dashboard.streams).toHaveLength(2);
     const second = dashboard.streams[1];
     second?.open();
+    second?.send("hello", { streamId: "s2", serverTimeMs: READ_AT_MS + 3_000, tradingActive: true, maxClients: 10, clients: 1, heartbeatMs: 15_000, positions: [] });
     await dashboard.advance(30_000);
     second?.send("heartbeat", { atMs: READ_AT_MS + 33_000, clients: 1, tradingActive: true });
     await dashboard.advance(40_000);
@@ -472,6 +484,25 @@ describe("live tab", () => {
     expect(second?.closed).toBe(true);
     await dashboard.advance(3_000);
     expect(dashboard.streams).toHaveLength(3);
+  });
+
+  it("falls back to polling when a proxy holds back the event stream", async () => {
+    const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder: liveResponder(LIVE_STATUS) });
+    const stream = dashboard.streams[0];
+    stream?.open();
+    await dashboard.advance(5_000);
+    expect(stream?.closed).toBe(false);
+    expect(dashboard.paths.some((path) => path.startsWith("/api/live/events"))).toBe(false);
+    await dashboard.advance(2_000);
+    expect(stream?.closed).toBe(true);
+    expect(dashboard.paths).toContain("/api/live/events?after=0");
+    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Live · updates every 2s");
+    expect(dashboard.find("feed-text").map((node) => node.textContent)).toEqual(["Bought $GEN 0.075 SOL", "Scored $GEN 60s: 18 (clean)"]);
+    await dashboard.advance(2_000);
+    expect(dashboard.paths).toContain("/api/live/events?stream=p1&after=2");
+    expect(dashboard.find("feed-text")).toHaveLength(2);
+    await dashboard.advance(60_000);
+    expect(dashboard.streams).toHaveLength(1);
   });
 
   it("explains when this service has no live stream and opens none", async () => {
