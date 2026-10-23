@@ -4,6 +4,7 @@ import path from "node:path";
 import { z } from "zod";
 
 const Fraction = z.number().min(0).max(1);
+const PositiveFraction = z.number().gt(0).max(1);
 
 export const RecorderConfigSchema = z.object({
   trackMaxAgeHours: z.number().positive().default(24),
@@ -215,8 +216,8 @@ export const RiskConfigSchema = z.object({
   minPositionSol: z.number().nonnegative().default(0.02),
   maxPositionSol: z.number().positive().default(0.5),
   maxConcurrent: z.number().int().positive().default(5),
-  dailyLossLimitFraction: Fraction.default(0.08),
-  killSwitchDrawdownFraction: Fraction.default(0.25),
+  dailyLossLimitFraction: PositiveFraction.default(0.08),
+  killSwitchDrawdownFraction: PositiveFraction.default(0.25),
   dayResetUtcHour: z.number().int().min(0).max(23).default(0),
   flattenOnKill: z.boolean().default(true),
   maxEntriesPerDevPerDay: z.number().int().positive().default(1),

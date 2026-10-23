@@ -198,6 +198,8 @@ describe.skipIf(!hasTestDatabase)("rank run availability and scope", () => {
     expect((await latestRunAsOf(database.db, AS_OF + 2 * DAY))?.runId).toBe(published);
     const live = await TrackedWalletRegistry.loadAsOf(database.db, AS_OF + 2 * DAY);
     expect(live.isTracked("WalkA")).toBe(false);
+    const snypra = await database.db.query<{ wallet: string; run_id: unknown }>("SELECT wallet, run_id FROM snypra_tracked_wallets ORDER BY wallet");
+    expect(snypra.rows.map((row) => [row.wallet, Number(row.run_id)])).toEqual([["LiveA", published]]);
     const backtest = new TrackedWalletRegistry({ db: database.db });
     expect(await backtest.preloadRuns({ fromMs: AS_OF, toMs: AS_OF + 2 * DAY })).toBe(1);
     expect(await backtest.preloadRuns({ fromMs: AS_OF, toMs: AS_OF + 2 * DAY }, [walkForward])).toBe(1);

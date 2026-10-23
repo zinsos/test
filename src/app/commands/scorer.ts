@@ -1,6 +1,7 @@
 import { createWriteStream } from "node:fs";
 import { once } from "node:events";
 import { buildDataset, DATASET_LABELS, streamDatasetCsv, type DatasetLabelName } from "../../scorer/dataset.js";
+import { loadScoringModel } from "../../scorer/model.js";
 import { tune, type TuneResult } from "../../scorer/tune.js";
 import { saveWeights } from "../../scorer/weights.js";
 import { dateOption, flagOption, numberOption, stringOption, UsageError } from "../args.js";
@@ -40,12 +41,13 @@ export async function tuneScorerCommand(ctx: CommandContext): Promise<number> {
   return withDatabase(ctx, "tune-scorer", async (db) => {
     const from = dateOption(ctx.options, "from") ?? null;
     const to = dateOption(ctx.options, "to") ?? null;
-    const rows = await buildDataset(db, { checkpointSec, from, to });
+    const rows = await buildDataset(db, { checkpointSec, from, to, labelHorizonHours: config.recorder.outcome.finalizeAfterHours });
     if (rows.length === 0) {
       ctx.io.err(`no scored launches with known outcomes at checkpoint ${checkpointSec}s; record longer or check --from/--to`);
       return EXIT_FAILURE;
     }
-    const result = tune(rows, label, { version: stringOption(ctx.options, "version") });
+    const current = await loadScoringModel({ db, filePath: config.scorer.weightsFile });
+    const result = tune(rows, label, { version: stringOption(ctx.options, "version"), soloFrom: current.model.weights });
     ctx.io.out(formatTuneReport(result, checkpointSec));
     const activate = flagOption(ctx.options, "activate");
     const filePath = flagOption(ctx.options, "write-file") ? config.scorer.weightsFile : null;
@@ -76,6 +78,7 @@ export async function tuneScorerCommand(ctx: CommandContext): Promise<number> {
 export async function exportDatasetCommand(ctx: CommandContext): Promise<number> {
   const checkpointSec = numberOption(ctx.options, "checkpoint") ?? 0;
   const out = stringOption(ctx.options, "out") ?? "-";
+  const config = await commandConfig(ctx);
   return withDatabase(ctx, "export-dataset", async (db) => {
     const stream = out === "-" ? process.stdout : createWriteStream(out, { encoding: "utf8" });
     let rows = -1;
@@ -83,7 +86,8 @@ export async function exportDatasetCommand(ctx: CommandContext): Promise<number>
       checkpointSec,
       from: dateOption(ctx.options, "from") ?? null,
       to: dateOption(ctx.options, "to") ?? null,
-      quoteMint: stringOption(ctx.options, "quote") ?? null
+      quoteMint: stringOption(ctx.options, "quote") ?? null,
+      labelHorizonHours: config.recorder.outcome.finalizeAfterHours
     })) {
       rows += chunk.split("\n").filter((line) => line.length > 0).length;
       if (!stream.write(chunk)) {

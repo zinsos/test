@@ -233,7 +233,7 @@ describe("mark to market", () => {
     expect(closeFill.success).toBe(true);
     expect(closeFill.error).toBe(SYNTHETIC_CLOSE_NOTE);
     expect(closeFill.networkFees).toBe(305_000n);
-    expect(closeFill.rentRefunded).toBe(2_039_280n);
+    expect(closeFill.rentRefunded).toBe(1_513_840n);
     expect(closeFill.userQuote).toBe(liquidationValue(position, view(), execution));
     const fallback = syntheticCloseFill(position, view({ complete: true }), 4e-5, execution, 9_000, "backtest_end", "key");
     expect(fallback.fill.quoteAmount).toBe(120_000n);

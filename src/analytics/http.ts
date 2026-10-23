@@ -98,9 +98,9 @@ export function bearerToken(req: IncomingMessage): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
-export function isAuthorized(req: IncomingMessage, url: URL, token: string | null): boolean {
+export function isAuthorized(req: IncomingMessage, url: URL, token: string | null, allowOpen = false): boolean {
   if (token === null || token.length === 0) {
-    return true;
+    return allowOpen;
   }
   const provided = bearerToken(req) ?? url.searchParams.get("token");
   return provided !== null && tokensMatch(provided, token);

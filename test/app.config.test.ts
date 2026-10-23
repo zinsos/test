@@ -20,6 +20,7 @@ const ENV_NAMES = [
   "COLD_WALLET_ADDRESS",
   "JITO_BLOCK_ENGINE_URL",
   "DASHBOARD_TOKEN",
+  "DASHBOARD_ALLOW_OPEN",
   "PORT",
   "LOG_LEVEL",
   "METADATA_GATEWAY"
@@ -43,11 +44,8 @@ describe("config/strategy.json", () => {
     expect(parseStrategyConfig(raw)).toEqual(raw);
   });
 
-  it("matches the code defaults except for the measured token account rent", () => {
-    const defaults = defaultStrategyConfig();
-    const parsed = parseStrategyConfig(raw);
-    expect(parsed.execution.ataRentLamports).toBe(1_513_840);
-    expect({ ...parsed, execution: { ...parsed.execution, ataRentLamports: defaults.execution.ataRentLamports } }).toEqual(defaults);
+  it("matches the code defaults", () => {
+    expect(parseStrategyConfig(raw)).toEqual(defaultStrategyConfig());
   });
 });
 

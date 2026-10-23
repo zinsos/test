@@ -30,7 +30,7 @@ import {
 } from "./trader.fixtures.js";
 
 const NETWORK_FEE = 305_000n;
-const RENT = 2_039_280n;
+const RENT = 1_513_840n;
 const FEES = { protocolFeeBps: 95, creatorFeeBps: 30 };
 
 function reservesOf(env: TestEnv, mint: string) {

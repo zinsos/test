@@ -22,7 +22,7 @@ import {
 } from "./trader.fixtures.js";
 
 const NETWORK_FEE = 305_000n;
-const RENT = 2_039_280n;
+const RENT = 1_513_840n;
 
 interface WalletExecutorOptions {
   clock: VirtualClock;

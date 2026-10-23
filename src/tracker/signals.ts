@@ -90,6 +90,10 @@ function featureValue(score: LaunchScore, name: string): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function buyerMeta(buyers: readonly TrackedBuy[]): Array<Record<string, unknown>> {
+  return buyers.map((buyer) => ({ wallet: buyer.wallet, atMs: buyer.atMs, slot: buyer.slot, rank: buyer.rank }));
+}
+
 function scoreMeta(score: LaunchScore | null, nowMs: number): Record<string, unknown> {
   if (!score) {
     return { scoreAvailable: false };
@@ -384,6 +388,7 @@ export class SignalEngine {
         meta: {
           ...draft.meta,
           ...scoreMeta(lookup.score, decidedAtMs),
+          buyers: buyerMeta(holders),
           scoreWaitMs: lookup.waitedMs,
           launchAgeSec: launch.ageMs(decidedAtMs) / 1000,
           mcapMultiple: launch.mcapMultiple(),
@@ -534,7 +539,7 @@ export class SignalEngine {
         mcapMultiple: launch.mcapMultiple(),
         mcapSol: launch.mcapSol(),
         trackedVersion: this.tracked.version(),
-        buyers: buyers.map((buyer) => ({ wallet: buyer.wallet, atMs: buyer.atMs, slot: buyer.slot, rank: buyer.rank }))
+        buyers: buyerMeta(buyers)
       }
     };
   }

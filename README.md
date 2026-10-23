@@ -45,7 +45,8 @@ Deploys and restarts:
 - **Postgres outages.** On start the service waits up to 10 minutes for Postgres, with backoff, before it gives up and lets Railway restart it.
 - **Overlapping deploys.** Railway starts the new container, waits for `/healthz`, then keeps the old one running for 20 more seconds (`overlapSeconds`) before draining it for 50 seconds. A service that records answers `/healthz` with 503 until its stream has delivered data.
 - **Recorder handover.** Every recorder writes its stream position to `recorder_checkpoints`. When a new recorder starts streaming, it checks whether an earlier recorder covered the slots up to its first event. Only a real hole (a crash, or a stop followed by a late start) is recorded as a `restart` gap, and only launches that were being tracked during the hole are marked incomplete, from the time of the hole. Aggregates count each stored trade once, even while two recorders overlap.
-- **Trading lock.** Only one trader per mode can run at a time. The new trader answers `/healthz` straight away but waits on a Postgres advisory lock until the old one has shut down, so the two never trade at the same time.
+- **Trading lock.** Only one trader per mode can run at a time. The new trader answers `/healthz` straight away but waits on a Postgres advisory lock until the old one has shut down, so the two never trade at the same time. A trader that loses the lock's connection stops sending orders at once and shuts down.
+- **Live orders across restarts.** Before a live buy is sent, the trader writes a `positions` row with status `pending` that holds the order. If the process stops before the outcome is known, the next start reads the hot wallet once the transaction's blockhash has surely expired: tokens in the wallet become the position, and an empty wallet releases the entry. Pending entries count against `risk.maxConcurrent` and block the sweeper until they are resolved.
 
 ### Railway step by step
 
@@ -112,8 +113,8 @@ Run commands with `node dist/src/main.js <command>`, or `npx tsx src/main.ts <co
 | `start` | Run the services listed in `MODULES`. Shuts down cleanly on SIGINT and SIGTERM: stops the stream, finishes in-flight orders, flushes writers and closes the database. |
 | `migrate` | Apply database migrations. |
 | `backtest --from 2026-10-01 --to 2026-10-15 [--label x] [--config f] [--weights file-or-version] [--allow-in-sample] [--walk-forward] [--include-incomplete] [--json]` | Replay a date range (UTC, `--to` exclusive). It records a `strategy_runs` row with mode `backtest`, prints the report and stores the summary on the run. |
-| `tune-scorer --checkpoint 30 --label rugged [--from --to] [--activate] [--write-file] [--version name]` | Fit weights against `rugged`, `died`, `survived_15m` or `migrated`. Prints feature AUCs and validation AUC, then stores the new version. |
-| `export-dataset --checkpoint 30 --out scorer.csv [--from --to] [--quote SOL]` | Write one row per launch with every feature and outcome label, for SNYPRA's optimizer. Use `--out -` for stdout. |
+| `tune-scorer --checkpoint 30 --label rugged [--from --to] [--activate] [--write-file] [--version name]` | Fit weights against `rugged`, `died`, `survived_15m` or `migrated`. Prints feature AUCs and validation AUC, then stores the new version. It uses only launches older than `recorder.outcome.finalizeAfterHours`, whose labels are final, and keeps the `solo` weights of the current model. |
+| `export-dataset --checkpoint 30 --out scorer.csv [--from --to] [--quote SOL]` | Write one row per launch with every feature and outcome label, for SNYPRA's optimizer. Use `--out -` for stdout. Launches younger than `recorder.outcome.finalizeAfterHours` are left out because their labels can still change. |
 | `rank-wallets [--as-of 2026-10-15]` | Rank wallets now, or as of a past time using only data before it. |
 | `backfill-wallets [--top 200] [--since-days 90]` | Fetch on-chain history for the latest ranking's top wallets. Needs `RPC_HTTP_URL`. |
 | `report [--run 12 \| --mode paper] [--from --to]` | Expectancy, interval, verdict and breakdowns. In live mode it adds the paper vs live comparison. |
@@ -131,7 +132,8 @@ How a backtest works:
 - **Time.** A virtual clock drives everything, so latency, score checkpoints, time stops and daily limits behave as they would live.
 - **No lookahead.**
   - Deep scorer features (funding clusters, fresh wallets, socials, copycats, dev history) are read from the `launch_scores` rows written live, as of their `computed_at`.
-  - Tracked wallets come from the latest `wallet_rank_runs` row with `as_of` at or before the replay time. `--walk-forward` first creates rankings at each rerank interval inside the window, using only data before each one.
+  - Tracked wallets come from the newest published `wallet_rank_runs` row that was available at the replay time: a point-in-time ranking at its `as_of`, a ranking made live or from the CLI at the later of `as_of` and `ran_at`. `--walk-forward` first creates rankings at each rerank interval inside the window, using only data before each one. Those runs are labelled `walk-forward`, are used only by that backtest and are never shown to live readers or SNYPRA.
+  - The copycat detector starts from the launches and volume recorded in the window before the start time, live and in replay alike.
 - **End of run.** Positions still open at the end are closed at the last quote.
 - **Determinism.** The same data and config give the same trades. The report prints a fingerprint so you can check.
 
@@ -139,13 +141,14 @@ How a backtest works:
 
 **Strategy knobs.** `config/strategy.json` sets every knob explicitly, and `src/config/strategy.ts` validates it.
 
-- It matches the code defaults with one exception: `execution.ataRentLamports` is set to the 1,513,840 lamports measured for pump token accounts on mainnet in October 2026.
+- It matches the code defaults. `execution.ataRentLamports` is the 1,513,840 lamports measured for pump token accounts on mainnet in October 2026.
 - The main knobs:
   - **Entries:** `signals.enabled`, `tracker.convergence` (window, minimum wallets, maximum risk score)
   - **Sizing and limits:** `risk.*`
   - **Exits:** `exits.*`
   - **Paper realism:** `execution.latencySlots`, `failureRate` and the fee defaults
-  - **Scorer:** `scorer.maxRisk` and `scorer.hardBlocks`
+  - **Scorer:** `scorer.maxRisk`, `scorer.hardBlocks`, and `scorer.deepIntel.minClusterCoverage` (below this share of buyers with wallet intel, funding-cluster features count as unknown instead of clean)
+  - **Signal freshness:** `tracker.convergence.maxScoreAgeSec` (an older checkpoint score is recomputed before a signal fires)
 
 **Secrets and infrastructure.** These come from environment variables, documented in `.env.example`.
 
@@ -156,10 +159,10 @@ How a backtest works:
   SELECT score, hard_blocked, flags, checkpoint_sec, computed_at
   FROM analytics_latest_launch_scores WHERE mint = $1;
   ```
-  Block when `hard_blocked` is true, or when `score` is above your threshold (`scorer.maxRisk` is 55 by default). Also block when `flags` contains `dev_dumped` or `serial_rugger`: a dev who dumps alone scores only about 24 under the default weights.
+  Block when `hard_blocked` is true, or when `score` is above your threshold (`scorer.maxRisk` is 55 by default). The score is the larger of the weighted mean of all features and the strongest single red flag (each feature's `solo` weight times its risk), so one strong signal is not diluted by clean ones: under the default weights a dev who has sold a quarter of his tokens scores 60 and a full dump 80. A flag `solo_<feature>` names the feature that set the score. Blocking on the `dev_dumped` and `serial_rugger` flags as well costs nothing.
 - **HTTP.** `GET /api/score/:mint` with `Authorization: Bearer $DASHBOARD_TOKEN` returns the in-memory score when service A has it, otherwise the latest row from the database. It returns 404 `not_scored` when the launch is unknown.
 - **Optimizer dataset.** Both give one row per launch and checkpoint, with every feature and outcome label:
-  - `GET /api/export/scorer-dataset.csv?checkpoint=30` streams it with `f_`-prefixed feature columns and `o_`-prefixed outcome columns, plus flags and the weights version (token required).
+  - `GET /api/export/scorer-dataset.csv?checkpoint=30` streams it with `f_`-prefixed feature columns and `o_`-prefixed outcome columns, plus flags and the weights version (token required). It leaves out launches younger than `recorder.outcome.finalizeAfterHours`, whose labels can still change; `&all=1` returns every row.
   - `export-dataset` writes the scorer's fixed column layout, the same column order the tuner uses, from the command line.
 - **Signals.** The `signals` table and `GET /api/signals/recent`. Read rows by their `run_id`:
 
@@ -170,7 +173,7 @@ How a backtest works:
   | a run id | true | null | Service B traded it |
   | a run id | false | set | Service B skipped it; the reason says why |
 
-- **Tracked wallets.** `GET /api/wallets/tracked`, or `wallet_ranks` joined to the latest `wallet_rank_runs` row.
+- **Tracked wallets.** `GET /api/wallets/tracked`, or the view `snypra_tracked_wallets` (the tracked rows of the latest published ranking). Do not join `wallet_ranks` to the latest `wallet_rank_runs` row yourself: that table also holds private walk-forward backtest runs (`params->>'label' = 'walk-forward'`).
 
 ## Safety notes for live trading
 
@@ -181,8 +184,9 @@ How a backtest works:
   - never sweeps while positions are open
   - records every sweep in `sweeps`
 - **Dry run first.** `LIVE_DRY_RUN` defaults to `true`, so turning on `TRADING_MODE=live` only simulates. Set it to `false` deliberately, after a dry run on both a curve coin and a migrated coin.
-- **Kill switch.** Trips at `risk.killSwitchDrawdownFraction` and flattens everything when `risk.flattenOnKill` is true. Resetting it is manual: `reset-kill --run <id>`. The daily loss halt resets at `risk.dayResetUtcHour`.
-- **Unconfirmed fills.** The live executor never resends a transaction whose fate is unknown. It reconciles the signature later, so a slow confirmation cannot become a double buy. If a fill stays unknown, the log says to check the wallet.
+- **Kill switch.** Trips at `risk.killSwitchDrawdownFraction` (a drawdown from peak equity; it and `risk.dailyLossLimitFraction` must be above 0 and at most 1, and both need an actual loss to trip) and flattens everything when `risk.flattenOnKill` is true. Resetting it is manual: `reset-kill --run <id>`. The daily loss halt resets at `risk.dayResetUtcHour`.
+- **Unconfirmed fills.** The live executor never resends a transaction whose fate is unknown. It reconciles the signature later, so a slow confirmation cannot become a double buy. A buy still unknown after that is settled from the wallet once its blockhash has expired: tokens found become the position (fill note `fill_from_wallet_balance`, cost estimated at the full budget plus rent and fees), an empty wallet releases the entry.
+- **Wallet checks.** When a sell is refused because the wallet holds too few tokens, or its outcome stays unknown, and on every restart, the trader compares the position with the hot wallet. Tokens that left the wallet some other way are booked at the current quote as exit reason `external_or_unknown_exit` (fill note `external_exit_estimated`). Treat those amounts as estimates.
 - **Hot wallet balance.** It is polled every 15 seconds, and sizing never exceeds what the wallet holds minus the fee reserve.
 - **A trader that is down manages nothing.** While the trading process is stopped, open positions get no stop loss, trailing stop or time stop. Railway restarts it after any exit, and on start it waits up to 10 minutes for Postgres and then restores its open positions. If the dashboard or Railway shows the trader down for longer, check the open positions and the hot wallet by hand.
 
@@ -208,7 +212,7 @@ Open the service A domain with `?token=<DASHBOARD_TOKEN>` once. The page stores 
 - **Launches:** tap a mint for its score sheet
 - **Wallets**
 
-`/healthz` needs no token. Every other route needs `DASHBOARD_TOKEN`, and the service will not start the dashboard without a token of at least 24 characters.
+`/healthz` needs no token, and on a service that also records it answers 503 until the stream has delivered data. Every other route needs `DASHBOARD_TOKEN`, and the service will not start the dashboard without a token of at least 24 characters. `DASHBOARD_ALLOW_OPEN=true` serves the API without a token, for a private network only. A token that is set is always required.
 
 ## Development
 

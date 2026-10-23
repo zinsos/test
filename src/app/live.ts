@@ -1,7 +1,7 @@
 import { startAnalyticsServer } from "../analytics/index.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
-import type { ScorerConfig, StrategyConfig } from "../config/strategy.js";
+import type { StrategyConfig } from "../config/strategy.js";
 import { Bus } from "../core/bus.js";
 import { SystemClock, type Clock } from "../core/clock.js";
 import { moduleLogger } from "../core/logger.js";
@@ -52,10 +52,6 @@ export function dashboardTokenProblem(token: string | undefined): string | null 
 
 export function fetchesWalletIntel(modules: ReadonlySet<ModuleName>): boolean {
   return modules.has("recorder") || modules.has("scorer");
-}
-
-export function storedIntelOnly(config: ScorerConfig): ScorerConfig {
-  return { ...config, deepIntel: { ...config.deepIntel, minBuyersForDeep: Number.MAX_SAFE_INTEGER } };
 }
 
 export interface LiveAppOptions {
@@ -170,8 +166,9 @@ function createComponents(
           bus,
           market,
           clock,
-          config: fetchesWalletIntel(modules) ? config.scorer : storedIntelOnly(config.scorer),
+          config: config.scorer,
           mode: "live",
+          intelMode: fetchesWalletIntel(modules) ? "fetch" : "stored",
           persistScores: modules.has("scorer")
         })
       : null;
@@ -219,11 +216,13 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
     return stopping;
   };
   try {
-    if (modules.has("dashboard") && !options.allowOpenDashboard) {
-      const problem = dashboardTokenProblem(env.DASHBOARD_TOKEN);
-      if (problem) {
-        throw new Error(`${problem}: set a long random DASHBOARD_TOKEN before serving the dashboard, it exposes trades, positions and wallets`);
-      }
+    const allowOpenDashboard = options.allowOpenDashboard ?? env.DASHBOARD_ALLOW_OPEN;
+    const tokenProblem = modules.has("dashboard") ? dashboardTokenProblem(env.DASHBOARD_TOKEN) : null;
+    if (tokenProblem && !allowOpenDashboard) {
+      throw new Error(`${tokenProblem}: set a long random DASHBOARD_TOKEN before serving the dashboard, it exposes trades, positions and wallets`);
+    }
+    if (tokenProblem) {
+      log.warn({ problem: tokenProblem }, "DASHBOARD_ALLOW_OPEN is on: the dashboard API is served without a strong token");
     }
     await waitForDatabase(db, {
       clock,
@@ -283,22 +282,25 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       };
     };
     const port = options.port ?? env.PORT;
+    const ready = recorder ? () => (ingest?.pipeline.stats().batches ?? 0) > 0 : undefined;
     const http = modules.has("dashboard")
       ? await startAnalyticsServer({
           db,
           port,
           token: env.DASHBOARD_TOKEN ?? null,
+          allowOpen: allowOpenDashboard,
+          ready,
           clock,
           scoreLookup: scorer ? (mint) => scorer.service.latest(mint) : null,
           extraHealth: () => statsSnapshot(),
-          settings: { maxRisk: config.scorer.maxRisk }
+          settings: { maxRisk: config.scorer.maxRisk, labelHorizonHours: config.recorder.outcome.finalizeAfterHours }
         })
       : await startHealthServer({
           db,
           port,
           startedAtMs,
           nowMs: () => clock.nowMs(),
-          ready: recorder ? () => (ingest?.pipeline.stats().batches ?? 0) > 0 : undefined
+          ready
         });
     stoppables.push({ name: "http", stop: () => http.close() });
 
@@ -308,7 +310,10 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
         name: tradingLockName(tradingModeOf(env)),
         clock,
         retryMs: options.lockRetryMs,
-        onLost: () => resolveDone("trading lock lost")
+        onLost: () => {
+          tradingParts?.trader.halt();
+          resolveDone("trading lock lost");
+        }
       });
       stoppables.push({ name: "trading-lock", stop: () => lock.release() });
       if (!(await lock.acquire(() => stopping !== null || (options.abort?.() ?? false)))) {

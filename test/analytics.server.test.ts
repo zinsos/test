@@ -241,12 +241,32 @@ describe.skipIf(!hasTestDatabase)("analytics server without a token", () => {
 
   beforeAll(async () => {
     database = await createTestDatabase("analytics_open");
-    server = await startAnalyticsServer({ db: database.db, port: 0, host: "127.0.0.1", token: "", cacheTtlMs: 0 });
+    server = await startAnalyticsServer({ db: database.db, port: 0, host: "127.0.0.1", token: "", allowOpen: true, cacheTtlMs: 0 });
   });
 
   afterAll(async () => {
     await server?.close();
     await database?.drop();
+  });
+
+  it("refuses api access without a token unless open access is allowed, and keeps a set token required", async () => {
+    let ready = false;
+    const closed = await startAnalyticsServer({ db: database.db, port: 0, host: "127.0.0.1", token: null, cacheTtlMs: 0, ready: () => ready });
+    const guarded = await startAnalyticsServer({ db: database.db, port: 0, host: "127.0.0.1", token: "a-token-that-stays-required", allowOpen: true, cacheTtlMs: 0 });
+    try {
+      expect((await fetch(`http://127.0.0.1:${closed.port}/api/summary`)).status).toBe(401);
+      expect((await fetch(`http://127.0.0.1:${guarded.port}/api/summary`)).status).toBe(401);
+      const notReady = await fetch(`http://127.0.0.1:${closed.port}/healthz`);
+      expect(notReady.status).toBe(503);
+      expect(await notReady.json()).toMatchObject({ ok: false, db: "ok", ready: false });
+      ready = true;
+      const healthy = await fetch(`http://127.0.0.1:${closed.port}/healthz`);
+      expect(healthy.status).toBe(200);
+      expect(await healthy.json()).toMatchObject({ ok: true, ready: true });
+    } finally {
+      await closed.close();
+      await guarded.close();
+    }
   });
 
   it("allows api access and handles an empty database", async () => {

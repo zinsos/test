@@ -34,6 +34,7 @@ export interface RunInfo {
   dataToMs: number | null;
   closedTrades: number;
   openPositions: number;
+  pendingEntries: number;
   shadowTrades: number;
   realizedPnlSol: number;
   lastClosedAtMs: number | null;
@@ -197,6 +198,7 @@ function runFromRecord(row: DbRecord): RunInfo {
     dataToMs: msOf(row.data_to),
     closedTrades: toNumber(row.closed),
     openPositions: toNumber(row.open),
+    pendingEntries: toNumber(row.pending),
     shadowTrades: toNumber(row.shadows),
     realizedPnlSol: lamportsToSol(toBigInt(row.pnl)),
     lastClosedAtMs: msOf(row.last_closed)
@@ -207,12 +209,13 @@ export async function loadRuns(db: Db, options: { limit?: number; mode?: Trading
   const limit = clampLimit(options.limit, DEFAULT_RUN_LIMIT, 1_000);
   const result = await db.query<DbRecord>(
     `SELECT r.id, r.mode, r.label, r.started_at, r.ended_at, r.data_from, r.data_to,
-            coalesce(p.closed, 0) AS closed, coalesce(p.open, 0) AS open, coalesce(p.shadows, 0) AS shadows,
+            coalesce(p.closed, 0) AS closed, coalesce(p.open, 0) AS open, coalesce(p.pending, 0) AS pending, coalesce(p.shadows, 0) AS shadows,
             coalesce(p.pnl, 0)::bigint AS pnl, p.last_closed
      FROM strategy_runs r
      LEFT JOIN LATERAL (
        SELECT count(*) FILTER (WHERE status = 'closed' AND shadow_of IS NULL)::int AS closed,
               count(*) FILTER (WHERE status = 'open' AND shadow_of IS NULL)::int AS open,
+              count(*) FILTER (WHERE status = 'pending' AND shadow_of IS NULL)::int AS pending,
               count(*) FILTER (WHERE status = 'closed' AND shadow_of IS NOT NULL)::int AS shadows,
               sum(coalesce(realized_pnl, proceeds - entry_cost)) FILTER (WHERE status = 'closed' AND shadow_of IS NULL) AS pnl,
               max(closed_at) FILTER (WHERE shadow_of IS NULL) AS last_closed

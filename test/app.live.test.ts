@@ -186,6 +186,39 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
     expect(dashboardTokenProblem("a-long-random-dashboard-token-value")).toBeNull();
   });
 
+  it("serves an open dashboard only with DASHBOARD_ALLOW_OPEN", async () => {
+    const app = await startLiveApp({
+      env: loadEnv({ DATABASE_URL: database.url, MODULES: "dashboard", DASHBOARD_ALLOW_OPEN: "true" }),
+      config: config(),
+      clock: new VirtualClock(START_MS),
+      db: database.db,
+      rpc: null,
+      port: 0
+    });
+    try {
+      expect((await fetch(`http://127.0.0.1:${app.httpPort}/api/recorder/health`)).status).toBe(200);
+    } finally {
+      await app.stop("test");
+    }
+  });
+
+  it("keeps a recorder service with the dashboard unhealthy until its stream has delivered something", async () => {
+    const clock = new VirtualClock(START_MS);
+    const source = new ReplayLogSource({ clock, transactions: [] });
+    const app = await startLiveApp({ env: env(database.url, "recorder,dashboard"), config: config(), clock, db: database.db, rpc: null, source, port: 0 });
+    try {
+      const before = await fetch(`http://127.0.0.1:${app.httpPort}/healthz`);
+      expect({ status: before.status, body: await before.json() }).toMatchObject({ status: 503, body: { db: "ok", ready: false } });
+      const first = replayTransactions()[0];
+      if (first) {
+        source.push(first);
+      }
+      expect((await fetch(`http://127.0.0.1:${app.httpPort}/healthz`)).status).toBe(200);
+    } finally {
+      await app.stop("test");
+    }
+  });
+
   it("keeps a recorder service unhealthy until its stream has delivered something", async () => {
     const clock = new VirtualClock(START_MS);
     const source = new ReplayLogSource({ clock, transactions: [] });
@@ -310,6 +343,34 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
     const second = await starting;
     expect(second.runId).toBe(first.runId);
     await second.stop("test");
+  });
+
+  it("halts the trader at once when the trading lock connection is lost", async () => {
+    const clock = new VirtualClock(START_MS);
+    const app = await startLiveApp({
+      env: env(database.url, "trader"),
+      config: config(),
+      clock,
+      db: database.db,
+      rpc: null,
+      source: new ReplayLogSource({ clock, transactions: [] }),
+      port: 0
+    });
+    try {
+      expect(app.trader?.isRunning()).toBe(true);
+      const holders = await database.db.query<{ pid: number }>(
+        `SELECT l.pid FROM pg_locks l JOIN pg_database d ON d.oid = l.database
+          WHERE l.locktype = 'advisory' AND l.granted AND d.datname = current_database()`
+      );
+      expect(holders.rows).toHaveLength(1);
+      await database.db.query("SELECT pg_terminate_backend($1)", [holders.rows[0]?.pid]);
+      expect(await app.done).toBe("trading lock lost");
+      expect(app.trader?.isRunning()).toBe(false);
+      app.trader?.start();
+      expect(app.trader?.isRunning()).toBe(false);
+    } finally {
+      await app.stop("test");
+    }
   });
 });
 

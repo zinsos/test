@@ -31,6 +31,8 @@ export interface AnalyticsServerOptions {
   port: number;
   host?: string;
   token?: string | null;
+  allowOpen?: boolean;
+  ready?: (() => boolean) | null;
   scoreLookup?: ScoreLookup | null;
   extraHealth?: ExtraHealth | null;
   clock?: Clock;
@@ -75,10 +77,12 @@ async function pingDatabase(db: Db): Promise<boolean> {
   }
 }
 
-async function sendHealth(ctx: AnalyticsContext, res: ServerResponse, startedAtMs: number): Promise<void> {
+async function sendHealth(ctx: AnalyticsContext, res: ServerResponse, startedAtMs: number, ready: (() => boolean) | null): Promise<void> {
   const databaseUp = await pingDatabase(ctx.db);
+  const isReady = ready?.() ?? true;
+  const ok = databaseUp && isReady;
   const uptimeSec = Math.max(0, (ctx.clock.nowMs() - startedAtMs) / 1000);
-  sendJson(res, databaseUp ? 200 : 503, { ok: databaseUp, db: databaseUp ? "ok" : "unreachable", uptimeSec });
+  sendJson(res, ok ? 200 : 503, { ok, db: databaseUp ? "ok" : "unreachable", ready: isReady, uptimeSec });
 }
 
 function sendFailure(res: ServerResponse, error: unknown, path: string): void {
@@ -120,8 +124,13 @@ async function streamCsv(ctx: AnalyticsContext, route: CsvRoute, request: ApiReq
   }
 }
 
-async function handleApi(ctx: AnalyticsContext, token: string | null, url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  if (!isAuthorized(req, url, token)) {
+interface ApiAccess {
+  token: string | null;
+  allowOpen: boolean;
+}
+
+async function handleApi(ctx: AnalyticsContext, access: ApiAccess, url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (!isAuthorized(req, url, access.token, access.allowOpen)) {
     sendJson(res, 401, { error: "unauthorized", message: "send Authorization: Bearer <token> or ?token=" }, {
       "WWW-Authenticate": 'Bearer realm="snypra-edge"'
     });
@@ -162,7 +171,11 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
     scoreLookup: options.scoreLookup ?? null,
     extraHealth: options.extraHealth ?? null
   };
-  const token = options.token && options.token.length > 0 ? options.token : null;
+  const access: ApiAccess = {
+    token: options.token && options.token.length > 0 ? options.token : null,
+    allowOpen: options.allowOpen ?? false
+  };
+  const ready = options.ready ?? null;
   const page: PageAssets = { html: renderDashboardHtml(), csp: dashboardContentSecurityPolicy() };
   const startedAtMs = clock.nowMs();
 
@@ -182,7 +195,7 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
         return;
       }
       if (path === "/healthz") {
-        await sendHealth(ctx, res, startedAtMs);
+        await sendHealth(ctx, res, startedAtMs, ready);
         return;
       }
       if (path === "/favicon.ico") {
@@ -190,7 +203,7 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
         return;
       }
       if (path.startsWith(API_PREFIX)) {
-        await handleApi(ctx, token, url, req, res);
+        await handleApi(ctx, access, url, req, res);
         return;
       }
       throw new HttpError(404, "not_found", "unknown route");

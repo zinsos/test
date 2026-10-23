@@ -113,6 +113,7 @@ describe.skipIf(!hasTestDatabase)("analytics queries", () => {
     const live = runs.find((run) => run.id === seeded.liveRunId);
     expect(live?.shadowTrades).toBe(LIVE_PAIRS);
     expect(live?.closedTrades).toBe(LIVE_PAIRS);
+    expect(live?.pendingEntries).toBe(0);
     expect((await loadRuns(database.db, { mode: "live" })).map((run) => run.id)).toEqual([seeded.liveRunId]);
     const modes = await loadModes(database.db);
     expect(Object.fromEntries(modes.map((mode) => [mode.mode, mode.closedTrades]))).toEqual({
@@ -120,6 +121,28 @@ describe.skipIf(!hasTestDatabase)("analytics queries", () => {
       live: LIVE_PAIRS,
       backtest: BACKTEST_TRADES
     });
+  });
+
+  it("counts live entries still in flight separately from open positions", async () => {
+    const run = await database.db.query<{ id: bigint }>(
+      `INSERT INTO strategy_runs (mode, label, started_at, config) VALUES ('live', 'in-flight', $1, '{}'::jsonb) RETURNING id`,
+      [new Date(NOW_MS)]
+    );
+    const runId = Number(run.rows[0]?.id ?? 0);
+    try {
+      await database.db.query(
+        `INSERT INTO positions (id, run_id, mode, mint, signal_type, opened_at, opened_slot, entry_price, entry_tokens, entry_cost,
+           tokens_held, proceeds, fees_paid, peak_price, last_price, status)
+         VALUES ('pending-1', $1, 'live', 'PendingMint', 'smart_convergence', $2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'pending')`,
+        [runId, new Date(NOW_MS)]
+      );
+      const listed = (await loadRuns(database.db)).find((candidate) => candidate.id === runId);
+      expect(listed?.pendingEntries).toBe(1);
+      expect(listed?.openPositions).toBe(0);
+      expect(listed?.closedTrades).toBe(0);
+    } finally {
+      await database.db.query("DELETE FROM strategy_runs WHERE id = $1", [runId]);
+    }
   });
 
   it("pairs live trades with their shadow paper trades and fills", async () => {

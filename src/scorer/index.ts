@@ -14,6 +14,8 @@ import type { StoredFeaturesLookup } from "./types.js";
 
 const log = moduleLogger("scorer-module");
 
+export type IntelMode = "fetch" | "stored";
+
 export interface ScorerModuleOptions {
   db: Db | null;
   rpc: IntelRpc | null;
@@ -26,6 +28,7 @@ export interface ScorerModuleOptions {
   model?: ScoringModel | null;
   weightsFile?: string | null;
   persistScores?: boolean;
+  intelMode?: IntelMode;
 }
 
 export interface ScorerModule {
@@ -42,9 +45,10 @@ export interface ScorerModule {
 export function createScorerModule(options: ScorerModuleOptions): ScorerModule {
   const live = options.mode === "live";
   const trending = new TrendingTracker({ config: options.config });
+  const intelRpc = (options.intelMode ?? "fetch") === "fetch" ? options.rpc : null;
   const intel =
-    live && options.config.deepIntel.enabled && options.rpc
-      ? new WalletIntelService({ db: options.db, rpc: options.rpc, clock: options.clock, config: options.config })
+    live && options.config.deepIntel.enabled && (intelRpc || options.db)
+      ? new WalletIntelService({ db: options.db, rpc: intelRpc, clock: options.clock, config: options.config })
       : null;
   const devHistory = options.db ? new DevHistoryService({ db: options.db }) : null;
   const persist = options.persistScores ?? live;

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { VirtualClock } from "../src/core/clock.js";
+import { RiskConfigSchema } from "../src/config/strategy.js";
 import { dayKeyFor, nextDayResetMs, tradingDayStartMs } from "../src/risk/day.js";
 import { RiskManager, type RiskManagerOptions } from "../src/risk/manager.js";
 import { scaleLamports, solToLamports } from "../src/risk/money.js";
@@ -233,8 +234,16 @@ describe("risk manager kill switch", () => {
     expect(store.kinds()).toContain("kill_reset");
   });
 
+  it("rejects zero or negative loss limit fractions in the config", () => {
+    for (const value of [0, -0.1]) {
+      expect(RiskConfigSchema.safeParse({ dailyLossLimitFraction: value }).success).toBe(false);
+      expect(RiskConfigSchema.safeParse({ killSwitchDrawdownFraction: value }).success).toBe(false);
+    }
+    expect(RiskConfigSchema.safeParse({ dailyLossLimitFraction: 1, killSwitchDrawdownFraction: 1 }).success).toBe(true);
+  });
+
   it("never trips a zero fraction limit without an actual loss, and trips it on any loss", () => {
-    const { risk } = manager({ config: riskConfig({ killSwitchDrawdownFraction: 0, dailyLossLimitFraction: 0 }) });
+    const { risk } = manager({ config: { ...riskConfig(), killSwitchDrawdownFraction: 0, dailyLossLimitFraction: 0 } });
     risk.markToMarket(0n, NOON_UTC);
     risk.markToMarket(SOL, NOON_UTC + 1000);
     expect(risk.isKilled()).toBe(false);

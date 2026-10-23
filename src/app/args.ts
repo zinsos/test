@@ -81,7 +81,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       FROM_OPTION,
       TO_OPTION,
       { name: "quote", kind: "string", description: "only launches with this quote mint (SOL for SOL-quoted)" },
-      { name: "out", kind: "string", required: true, description: "output file, or - for stdout" }
+      { name: "out", kind: "string", required: true, description: "output file, or - for stdout" },
+      CONFIG_OPTION
     ]
   },
   {

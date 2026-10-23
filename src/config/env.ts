@@ -60,6 +60,7 @@ const EnvSchema = z.object({
   HOT_WALLET_SECRET_KEY: z.string().optional(),
   COLD_WALLET_ADDRESS: z.string().optional(),
   DASHBOARD_TOKEN: z.string().optional(),
+  DASHBOARD_ALLOW_OPEN: strictFlag(false),
   PORT: z.coerce.number().int().positive().default(8080),
   LOG_LEVEL: z.string().default("info"),
   METADATA_GATEWAY: z.string().optional(),

@@ -13,7 +13,9 @@ import {
   type BuildRequest,
   type BuiltTrade
 } from "../src/execution/instructions.js";
-import { loadPumpSdk } from "../src/execution/sdk.js";
+import { loadPumpSdk, loadPumpSwapSdk } from "../src/execution/sdk.js";
+import { canonicalPumpPoolAddress } from "../src/chain/pda.js";
+import { SOL_QUOTE, WSOL_MINT } from "../src/core/constants.js";
 import { PUMP_QUOTE_MINT, SOL, initialReserves } from "./execution.fixtures.js";
 
 const PUMP_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
@@ -316,5 +318,50 @@ describe("PumpInstructionBuilder token programs", () => {
     expect(await refusal(w.builder.build(request(w, {}, { hints: { migrated: true, pool: null, tokenProgram: TOKEN_2022_PROGRAM_ID } })))).toBe(
       "pool_unavailable"
     );
+  });
+});
+
+describe("PumpInstructionBuilder PumpSwap pools", () => {
+  function withPoolState(w: World, pool: { baseMint: PublicKey; creator: PublicKey }): PublicKey[] {
+    const loaded: PublicKey[] = [];
+    const fakeAmm = {
+      swapSolanaState: async (poolKey: PublicKey) => {
+        loaded.push(poolKey);
+        return { pool: { ...pool, quoteMint: new PublicKey(WSOL_MINT) } };
+      }
+    };
+    Object.assign(w.builder, { onlineAmm: fakeAmm });
+    return loaded;
+  }
+
+  function migrated(pool: string | null): Partial<BuildRequest> {
+    return { hints: { migrated: true, pool, tokenProgram: TOKEN_2022_PROGRAM_ID } };
+  }
+
+  it("refuses a pool hint that is not the canonical SOL pool of the mint without loading it", async () => {
+    const w = world();
+    const swapSdk = loadPumpSwapSdk();
+    const loaded = withPoolState(w, { baseMint: w.mint, creator: swapSdk.pumpPoolAuthorityPda(w.mint) });
+    const foreign = Keypair.generate().publicKey.toBase58();
+    expect(await refusal(w.builder.build(request(w, {}, migrated(foreign))))).toBe("invalid_order");
+    expect(loaded).toEqual([]);
+  });
+
+  it("loads the canonical pool even without a hint and refuses one that belongs to another mint", async () => {
+    const w = world();
+    const swapSdk = loadPumpSwapSdk();
+    const canonical = swapSdk.canonicalPumpPoolPda(w.mint);
+    expect(canonicalPumpPoolAddress(w.mint.toBase58(), SOL_QUOTE)).toBe(canonical.toBase58());
+    const other = Keypair.generate().publicKey;
+    const loaded = withPoolState(w, { baseMint: other, creator: swapSdk.pumpPoolAuthorityPda(other) });
+    expect(await refusal(w.builder.build(request(w, {}, migrated(null))))).toBe("invalid_order");
+    expect(await refusal(w.builder.build(request(w, {}, migrated(canonical.toBase58()))))).toBe("invalid_order");
+    expect(loaded.map((key) => key.toBase58())).toEqual([canonical.toBase58(), canonical.toBase58()]);
+  });
+
+  it("refuses a pool whose creator is not the pump pool authority of the mint", async () => {
+    const w = world();
+    withPoolState(w, { baseMint: w.mint, creator: Keypair.generate().publicKey });
+    expect(await refusal(w.builder.build(request(w, {}, migrated(null))))).toBe("invalid_order");
   });
 });

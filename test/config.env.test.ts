@@ -34,3 +34,12 @@ describe("DATABASE_SSL", () => {
     expect(() => loadEnv({ DATABASE_SSL: "require" })).toThrow(/DATABASE_SSL/);
   });
 });
+
+describe("DASHBOARD_ALLOW_OPEN", () => {
+  it("defaults to false and fails on unknown values", () => {
+    expect(loadEnv({}).DASHBOARD_ALLOW_OPEN).toBe(false);
+    expect(loadEnv({ DASHBOARD_ALLOW_OPEN: "" }).DASHBOARD_ALLOW_OPEN).toBe(false);
+    expect(loadEnv({ DASHBOARD_ALLOW_OPEN: " Yes " }).DASHBOARD_ALLOW_OPEN).toBe(true);
+    expect(() => loadEnv({ DASHBOARD_ALLOW_OPEN: "open" })).toThrow(/DASHBOARD_ALLOW_OPEN/);
+  });
+});

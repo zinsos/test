@@ -3,6 +3,7 @@ import { RpcClient } from "../src/chain/rpc.js";
 import { Bus } from "../src/core/bus.js";
 import { VirtualClock } from "../src/core/clock.js";
 import type { LaunchScore } from "../src/core/types.js";
+import type { Db } from "../src/db/pool.js";
 import { TrendingTracker } from "../src/scorer/copycat.js";
 import { createScorerModule } from "../src/scorer/index.js";
 import type { IntelRpc } from "../src/scorer/intel.js";
@@ -348,6 +349,42 @@ describe("ScorerService replay mode", () => {
     expect(scorer.devHistory).toBeNull();
     await scorer.start();
     await scorer.stop();
+  });
+
+  it("reads stored wallet intel without rpc calls in stored mode or when no rpc is configured", async () => {
+    const queries: string[] = [];
+    const db = {
+      query: async (sql: string) => {
+        queries.push(sql);
+        return { rows: [], rowCount: 0 };
+      }
+    } as unknown as Db;
+    for (const variant of [{ rpc: new CountingRpc(), intelMode: "stored" as const }, { rpc: null, intelMode: undefined }]) {
+      queries.length = 0;
+      const clock = new VirtualClock(T0 - 1_000);
+      const bus = new Bus();
+      const builder = clusteredLaunch();
+      const scorer = createScorerModule({
+        db,
+        rpc: variant.rpc,
+        bus,
+        market: builder.market,
+        clock,
+        config,
+        mode: "live",
+        model: ScoringModel.default(),
+        persistScores: false,
+        intelMode: variant.intelMode
+      });
+      expect(scorer.intel).not.toBeNull();
+      await scorer.start();
+      bus.emit("chain", builder.createEvent);
+      await clock.advanceTo(T0 + 200_000);
+      expect(scorer.intel?.stats().rpcCalls).toBe(0);
+      expect(variant.rpc?.calls ?? 0).toBe(0);
+      expect(queries.some((sql) => sql.includes("wallet_intel"))).toBe(true);
+      await scorer.stop();
+    }
   });
 });
 

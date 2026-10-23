@@ -428,12 +428,20 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
 
   private async swapState(request: BuildRequest, mint: PublicKey): Promise<SwapSolanaState> {
     const swapSdk = loadPumpSwapSdk();
-    const poolKey = request.hints.pool ? new PublicKey(request.hints.pool) : swapSdk.canonicalPumpPoolPda(mint);
+    const poolKey = swapSdk.canonicalPumpPoolPda(mint);
+    if (request.hints.pool !== null && request.hints.pool !== poolKey.toBase58()) {
+      throw new TradeRefusedError("invalid_order", `pool ${request.hints.pool} is not the canonical SOL pool ${poolKey.toBase58()} of ${mint.toBase58()}`);
+    }
+    let state: SwapSolanaState;
     try {
-      return await this.amm().swapSolanaState(poolKey, request.user);
+      state = await this.amm().swapSolanaState(poolKey, request.user);
     } catch (error) {
       throw new TradeRefusedError("pool_unavailable", `pool ${poolKey.toBase58()} unavailable: ${(error as Error).message}`);
     }
+    if (!state.pool.baseMint.equals(mint) || !state.pool.creator.equals(swapSdk.pumpPoolAuthorityPda(mint))) {
+      throw new TradeRefusedError("invalid_order", `pool ${poolKey.toBase58()} does not belong to ${mint.toBase58()}`);
+    }
+    return state;
   }
 
   private async buildPool(request: BuildRequest, mint: PublicKey, tokenProgram: PublicKey): Promise<BuiltTrade> {

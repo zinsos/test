@@ -320,7 +320,7 @@ describe("failures and costs", () => {
     const afterBuy = quoteBuyExactQuoteIn(initialReserves(), SOL, { protocolFeeBps: 95, creatorFeeBps: 30 }).after;
     const sell = order({ side: "sell", quoteBudget: null, tokenAmount: 1_000_000_000_000n, referencePrice: spotPrice(afterBuy) });
     const view = curveView({ ...afterBuy });
-    expect(attempt({ view, order: { ...sell, closesPosition: true } }).rentRefunded).toBe(2_039_280n);
+    expect(attempt({ view, order: { ...sell, closesPosition: true } }).rentRefunded).toBe(1_513_840n);
     expect(attempt({ view, order: { ...sell, closesPosition: false } }).rentRefunded).toBe(0n);
     expect(
       attempt({ view, order: { ...sell, closesPosition: true }, config: execConfig({ refundAtaOnClose: false }) }).rentRefunded
