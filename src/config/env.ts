@@ -62,6 +62,10 @@ const EnvSchema = z.object({
   DASHBOARD_TOKEN: z.string().optional(),
   DASHBOARD_ALLOW_OPEN: strictFlag(false),
   PORT: z.coerce.number().int().positive().default(8080),
+  HOST: z
+    .string()
+    .optional()
+    .transform((value) => (value === undefined || value.trim() === "" ? undefined : value.trim())),
   LOG_LEVEL: z.string().default("info"),
   METADATA_GATEWAY: z.string().optional(),
   JITO_BLOCK_ENGINE_URL: z.string().optional()

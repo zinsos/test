@@ -22,6 +22,7 @@ const ENV_NAMES = [
   "DASHBOARD_TOKEN",
   "DASHBOARD_ALLOW_OPEN",
   "PORT",
+  "HOST",
   "LOG_LEVEL",
   "METADATA_GATEWAY"
 ];
@@ -60,6 +61,12 @@ describe(".env.example", () => {
     expect(env.TRADING_MODE).toBe("paper");
     expect(env.LIVE_DRY_RUN).toBe(true);
     expect(env.MODULES).toEqual(["recorder", "scorer", "tracker", "trader", "dashboard"]);
+    expect(env.HOST).toBeUndefined();
+  });
+
+  it("binds the http server to a trimmed HOST when set", () => {
+    expect(loadEnv({ HOST: " 127.0.0.1 " }).HOST).toBe("127.0.0.1");
+    expect(loadEnv({ HOST: "" }).HOST).toBeUndefined();
   });
 });
 

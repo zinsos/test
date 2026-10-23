@@ -287,6 +287,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       ? await startAnalyticsServer({
           db,
           port,
+          host: env.HOST,
           token: env.DASHBOARD_TOKEN ?? null,
           allowOpen: allowOpenDashboard,
           ready,
@@ -298,6 +299,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       : await startHealthServer({
           db,
           port,
+          host: env.HOST,
           startedAtMs,
           nowMs: () => clock.nowMs(),
           ready
