@@ -159,7 +159,7 @@ describe("dashboard html", () => {
     dashboard.setResponder((path) => (path.startsWith("/api/positions") ? neverResponds() : respond(path)));
     await dashboard.advance(10_000);
     expect(positionReads()).toBe(settled + 2);
-    await dashboard.advance(19_000);
+    await dashboard.advance(29_000);
     expect(positionReads()).toBe(settled + 2);
     dashboard.setResponder(respond);
     await dashboard.advance(1_000);

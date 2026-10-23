@@ -712,7 +712,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   function todayStat(data) {
     var value = data.todayPnlEstimateSol;
-    if (isNum(value)) { return stat("Today", fmtSol(value), "SOL since the " + data.todayKey + " day start", signClass(value)); }
+    if (isNum(value)) { return stat("Today", fmtSol(value), "SOL, trading day " + data.todayKey, signClass(value)); }
     var idle = data.bankroll && !data.open.length;
     return stat("Today", idle ? "0" : DASH, idle ? "SOL, nothing traded yet on " + data.todayKey : "SOL, waiting for the trader to start the day");
   }
