@@ -113,6 +113,15 @@ class FakeNode {
     return;
   }
 
+  contains(node: FakeNode | null): boolean {
+    for (let current = node; current; current = current.parent) {
+      if (current === this) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   focus(): void {
     return;
   }
@@ -139,8 +148,38 @@ export interface RenderedView {
   authHeaders: string[];
 }
 
-function response(body: unknown): { ok: boolean; status: number; json(): Promise<unknown> } {
-  return { ok: true, status: 200, json: () => Promise.resolve(body) };
+export interface FakeResponse {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}
+
+export type Responder = (path: string) => Promise<FakeResponse>;
+
+export interface DashboardOptions {
+  storage?: Record<string, string>;
+  hash?: string;
+  search?: string;
+}
+
+export interface DashboardHarness {
+  paths: string[];
+  authHeaders: string[];
+  storage: Map<string, string>;
+  setResponder(responder: Responder): void;
+  setVisibility(state: "visible" | "hidden"): void;
+  focus(tag: string | null): void;
+  advance(ms: number): Promise<void>;
+  view(): RenderedView;
+  updated(): string;
+}
+
+export function jsonResponse(body: unknown, status = 200): FakeResponse {
+  return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) };
+}
+
+export function neverResponds(): Promise<FakeResponse> {
+  return new Promise(() => undefined);
 }
 
 async function settle(): Promise<void> {
@@ -149,14 +188,24 @@ async function settle(): Promise<void> {
   }
 }
 
-export async function renderTradesView(positions: Record<string, unknown>): Promise<RenderedView> {
+interface Interval {
+  run: () => void;
+  everyMs: number;
+  lastMs: number;
+}
+
+export async function startDashboard(positions: Record<string, unknown>, options: DashboardOptions = {}): Promise<DashboardHarness> {
   const body = new FakeNode("body");
-  const storage = new Map<string, string>();
+  const storage = new Map<string, string>(Object.entries(options.storage ?? {}));
   const paths: string[] = [];
   const authHeaders: string[] = [];
+  const intervals: Interval[] = [];
+  let nowMs = READ_AT_MS;
+  let responder: Responder = (path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : positions));
   const document = {
     readyState: "complete",
     visibilityState: "visible",
+    activeElement: null as FakeNode | null,
     body,
     createElement: (tag: string) => new FakeNode(tag),
     createTextNode: (text: string) => new FakeNode("#text", text),
@@ -170,30 +219,78 @@ export async function renderTradesView(positions: Record<string, unknown>): Prom
       setItem: (key: string, value: string) => storage.set(key, value),
       removeItem: (key: string) => storage.delete(key)
     },
-    location: { hash: "", search: `?token=${TOKEN}`, pathname: "/" },
+    location: { hash: options.hash ?? "", search: options.search ?? `?token=${TOKEN}`, pathname: "/" },
     history: { replaceState: () => undefined },
     addEventListener: () => undefined,
-    setInterval: () => 0,
+    setInterval: (run: () => void, everyMs: number) => {
+      intervals.push({ run, everyMs, lastMs: nowMs });
+      return intervals.length;
+    },
     setTimeout: () => 0
   };
+  const RealDate = Date;
+  class FakeDate extends RealDate {
+    constructor(...args: [] | [number]) {
+      super(args.length ? args[0] : nowMs);
+    }
+    static override now(): number {
+      return nowMs;
+    }
+  }
   const fetch = (path: string, init: { headers?: Record<string, string> }) => {
     if (path === "/healthz") {
-      return Promise.resolve(response({ ok: true }));
+      return Promise.resolve(jsonResponse({ ok: true }));
     }
     paths.push(path);
     authHeaders.push(init.headers?.Authorization ?? "");
-    return Promise.resolve(response(path.startsWith("/api/runs") ? { runs: [], modes: [] } : positions));
+    return responder(path);
   };
-  new Function("window", "document", "fetch", DASHBOARD_SCRIPT)(window, document, fetch);
+  new Function("window", "document", "fetch", "Date", DASHBOARD_SCRIPT)(window, document, fetch, FakeDate);
   await settle();
-  const main = body.descendants().find((node) => node.tagName === "main");
-  const nodes = main?.descendants() ?? [];
+  const main = (): FakeNode | undefined => body.descendants().find((node) => node.tagName === "main");
   return {
-    text: main?.textContent ?? "",
-    links: nodes.filter((node) => node.tagName === "a").map((node) => node.getAttribute("href") ?? ""),
     paths,
-    authHeaders
+    authHeaders,
+    storage,
+    setResponder(next) {
+      responder = next;
+    },
+    setVisibility(state) {
+      document.visibilityState = state;
+    },
+    focus(tag) {
+      document.activeElement = tag === null ? null : main()?.descendants().find((node) => node.tagName === tag) ?? null;
+    },
+    async advance(ms) {
+      const target = nowMs + ms;
+      while (nowMs < target) {
+        nowMs = Math.min(target, nowMs + 1_000);
+        for (const interval of intervals) {
+          if (nowMs - interval.lastMs >= interval.everyMs) {
+            interval.lastMs = nowMs;
+            interval.run();
+          }
+        }
+        await settle();
+      }
+    },
+    view() {
+      const nodes = main()?.descendants() ?? [];
+      return {
+        text: main()?.textContent ?? "",
+        links: nodes.filter((node) => node.tagName === "a").map((node) => node.getAttribute("href") ?? ""),
+        paths: [...paths],
+        authHeaders: [...authHeaders]
+      };
+    },
+    updated() {
+      return body.descendants().find((node) => node.className === "updated")?.textContent ?? "";
+    }
   };
+}
+
+export async function renderTradesView(positions: Record<string, unknown>, options: DashboardOptions = {}): Promise<RenderedView> {
+  return (await startDashboard(positions, options)).view();
 }
 
 export function tradesFixture(): Record<string, unknown> {
@@ -220,6 +317,8 @@ export function tradesFixture(): Record<string, unknown> {
     },
     openPnlEstimateSol: 0.1473,
     equityEstimateSol: 5.3973,
+    todayKey: "2026-10-23",
+    todayPnlEstimateSol: 0.2973,
     open: [
       {
         id: "1-a",

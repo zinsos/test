@@ -5,10 +5,12 @@ export const DASHBOARD_SCRIPT = String.raw`
   var PREFS_KEY = "snypra-edge-prefs";
   var REFRESH_MS = 60000;
   var LIVE_REFRESH_MS = 10000;
+  var STALL_MS = 30000;
   var TICK_MS = 1000;
   var PREFS_VERSION = "2";
   var PUMP_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
   var PUMP_COIN_URL = "https://pump.fun/coin/";
+  var MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
   var DASH = "—";
   var DOT = " · ";
   var TABS = [
@@ -41,6 +43,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   var renderSeq = 0;
   var sheetOpen = false;
   var rendering = false;
+  var locked = false;
   var lastAttemptMs = 0;
   var lastRenderMs = 0;
   var staleNote = "";
@@ -54,7 +57,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     } catch (e) { return; }
   }
   function loadPrefs() {
-    var prefs = { v: PREFS_VERSION, tab: "trades", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "" };
+    var prefs = { v: "", tab: "trades", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "" };
     var raw = storageGet(PREFS_KEY);
     if (raw) {
       try {
@@ -660,6 +663,7 @@ export const DASHBOARD_SCRIPT = String.raw`
 
   function coinLabel(item) { return item.symbol || item.name || shortAddr(item.mint); }
   function pumpLink(mint) {
+    if (typeof mint !== "string" || !MINT_PATTERN.test(mint)) { return null; }
     return el("a", { class: "ext-link", href: PUMP_COIN_URL + encodeURIComponent(mint), target: "_blank", rel: "noopener noreferrer", text: "pump.fun ↗" });
   }
   function modeWord(mode) { return mode === "live" ? "Live" : mode === "paper" ? "Paper" : readable(mode); }
@@ -706,24 +710,30 @@ export const DASHBOARD_SCRIPT = String.raw`
       el("p", { class: "subline", text: last24hText(data) }),
       el("p", { class: "subline", text: "Started " + fmtTime(run.startedAtMs) + (run.active ? DOT + "updates every " + LIVE_REFRESH_MS / 1000 + "s while this tab is open" : DOT + "ended " + fmtTime(run.endedAtMs)) }));
   }
+  function todayStat(data) {
+    var value = data.todayPnlEstimateSol;
+    if (isNum(value)) { return stat("Today", fmtSol(value), "SOL since the " + data.todayKey + " day start", signClass(value)); }
+    var idle = data.bankroll && !data.open.length;
+    return stat("Today", idle ? "0" : DASH, idle ? "SOL, nothing traded yet on " + data.todayKey : "SOL, waiting for the trader to start the day");
+  }
   function bankrollStats(data) {
     var b = data.bankroll || {};
     var c = data.counts;
     return grid([
       stat("Starting", fmtSol(b.startingSol, false), "SOL bankroll"),
       stat("Realized", fmtSol(b.realizedPnlSol), "SOL, closed trades", signClass(b.realizedPnlSol)),
-      stat("Today", fmtSol(b.dayPnlSol), "SOL" + (b.dayKey ? ", day " + b.dayKey : ""), signClass(b.dayPnlSol)),
+      todayStat(data),
       stat("Open now", fmtInt(c.open), (c.pending ? fmtInt(c.pending) + " awaiting fill" + DOT : "") + (c.open ? "est. " + fmtSol(data.openPnlEstimateSol) + " SOL" : "no positions"))
     ]);
   }
-  function coinMeta(item, ageSec) {
+  function coinMeta(item, timing) {
     var named = item.symbol || item.name;
-    return (item.name && item.symbol ? item.name + DOT : "") + (named ? shortAddr(item.mint) + DOT : "") + fmtDur(ageSec) + " old";
+    return (item.name && item.symbol ? item.name + DOT : "") + (named ? shortAddr(item.mint) + DOT : "") + timing;
   }
   function pendingItem(p) {
     return el("li", { class: "item" },
       el("div", { class: "row" }, mintButton(p.mint, coinLabel(p)), badge("Awaiting fill", "info")),
-      el("div", { class: "row" }, el("span", { class: "meta", text: coinMeta(p, p.ageSec) }), el("span", { class: "num", text: "budget " + fmtSol(p.budgetSol, false) + " SOL" })),
+      el("div", { class: "row" }, el("span", { class: "meta", text: coinMeta(p, "sent " + fmtDur(p.ageSec) + " ago") }), el("span", { class: "num", text: "budget " + fmtSol(p.budgetSol, false) + " SOL" })),
       el("div", { class: "row" }, el("span", { class: "meta", text: readable(p.signalType) + DOT + "risk " + fmtNum(p.riskScore, 0) + DOT + "the buy is being confirmed" }), pumpLink(p.mint)));
   }
   function openItem(p, data) {
@@ -735,7 +745,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     return el("li", { class: "item" },
       el("div", { class: "row" }, mintButton(p.mint, coinLabel(p)), el("span", { class: "big-num " + multipleClass(p.multiple), text: fmtMult(p.multiple) })),
       el("div", { class: "row" },
-        el("span", { class: "meta", text: coinMeta(p, p.ageSec) }),
+        el("span", { class: "meta", text: coinMeta(p, "held " + fmtDur(p.ageSec)) }),
         el("span", { class: "num " + signClass(p.estimatedPnlSol), text: fmtSol(p.estimatedPnlSol) + " SOL" })),
       el("div", { class: "row" },
         el("span", { class: "meta", text: readable(p.signalType) + DOT + "risk " + fmtNum(p.riskScore, 0) + DOT + "sold " + fmtPlainPct(p.soldPct) }),
@@ -809,7 +819,7 @@ export const DASHBOARD_SCRIPT = String.raw`
       out.push(bankrollCard(data));
       out.push(bankrollStats(data));
       if (data.open.length) {
-        out.push(card("Open positions", "Newest first. PnL so far is an estimate: what was already sold plus the tokens still held at the last trade price, minus the coin's latest sell fees (strategy defaults when none were recorded), before price impact. Tap a coin for its score.",
+        out.push(card("Open positions", "Newest first. PnL so far is an estimate of closing now, booked the way the trader books a close: what was already sold, plus the tokens still held at the last trade price minus the coin's latest sell fees (strategy defaults when none were recorded) and the transaction fee, plus the token account rent refunded on close. Price impact is not included. Tap a coin for its score.",
           el("ul", { class: "list" }, data.open.map(function (p) { return openItem(p, data); }))));
       } else {
         out.push(el("section", { class: "card empty" }, el("strong", { text: "No open positions right now" }), el("span", { text: entryRulesText(data) }), el("p", { class: "subline", text: frequencyText(data) })));
@@ -894,14 +904,22 @@ export const DASHBOARD_SCRIPT = String.raw`
     var text = "Updated " + fmtDur(Math.max(0, (Date.now() - lastRenderMs) / 1000)) + " ago";
     dom.updated.textContent = staleNote ? text + DOT + staleNote : text;
   }
+  function holdsFocus(node) {
+    var active = document.activeElement;
+    return !!(active && node && active !== node && typeof node.contains === "function" && node.contains(active));
+  }
+  function editingIn(node) {
+    var tag = holdsFocus(node) ? String(document.activeElement.tagName || "").toUpperCase() : "";
+    return tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA";
+  }
   function render(quiet) {
     var seq = ++renderSeq;
     var silent = quiet === true;
-    setActiveTab();
     if (!silent) {
-      renderFilters();
+      setActiveTab();
       dom.main.classList.add("loading");
     }
+    if (!silent || !holdsFocus(dom.filters)) { renderFilters(); }
     rendering = true;
     lastAttemptMs = Date.now();
     var view = VIEWS[state.tab] || tradesView;
@@ -912,9 +930,11 @@ export const DASHBOARD_SCRIPT = String.raw`
       dom.main.replaceChildren(fragment);
       lastRenderMs = Date.now();
       staleNote = "";
+      locked = false;
     }).catch(function (error) {
       if (seq !== renderSeq) { return; }
       if (silent && !(error && error.auth)) { staleNote = "retrying"; return; }
+      locked = !!(error && error.auth);
       dom.main.replaceChildren(error && error.auth ? tokenForm() : errorCard(error));
     }).then(function () {
       if (seq !== renderSeq) { return; }
@@ -923,8 +943,12 @@ export const DASHBOARD_SCRIPT = String.raw`
       showUpdated();
     });
   }
+  function autoRefreshAllowed() {
+    return document.visibilityState === "visible" && !sheetOpen && !locked && !editingIn(dom.main);
+  }
   function liveRefreshDue() {
-    return LIVE_TABS[state.tab] === true && document.visibilityState === "visible" && !sheetOpen && !rendering && Date.now() - lastAttemptMs >= LIVE_REFRESH_MS;
+    if (LIVE_TABS[state.tab] !== true || !autoRefreshAllowed()) { return false; }
+    return Date.now() - lastAttemptMs >= (rendering ? STALL_MS : LIVE_REFRESH_MS);
   }
   function tick() {
     showUpdated();
@@ -942,7 +966,13 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   function refresh(quiet) {
     checkHealth();
+    lastAttemptMs = Date.now();
     return loadMeta().then(function () { render(quiet === true); });
+  }
+  function periodicRefresh() {
+    if (!autoRefreshAllowed()) { return; }
+    if (LIVE_TABS[state.tab] === true) { checkHealth(); loadMeta(); return; }
+    refresh(true);
   }
   function selectTab(id) {
     if (window.location.hash === "#" + id) { if (state.tab !== id) { state.tab = id; savePrefs(); render(); } return; }
@@ -973,8 +1003,8 @@ export const DASHBOARD_SCRIPT = String.raw`
       var tab = tabFromHash();
       if (tab && tab !== state.tab) { state.tab = tab; savePrefs(); render(); }
     });
-    document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible" && !sheetOpen) { refresh(true); } });
-    window.setInterval(function () { if (document.visibilityState === "visible" && !sheetOpen) { refresh(true); } }, REFRESH_MS);
+    document.addEventListener("visibilitychange", function () { if (autoRefreshAllowed()) { refresh(true); } });
+    window.setInterval(periodicRefresh, REFRESH_MS);
     window.setInterval(tick, TICK_MS);
     refresh(false);
   }

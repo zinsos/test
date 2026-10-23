@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   emptyPositionsSnapshot,
   entryRulesOf,
+  estimatedCloseProceeds,
   netSellValue,
   pumpCoinUrl,
   selectPositionsRun,
@@ -11,8 +12,10 @@ import {
 import { startAnalyticsServer, type AnalyticsServer } from "../src/analytics/server.js";
 import { defaultStrategyConfig } from "../src/config/strategy.js";
 import { VirtualClock } from "../src/core/clock.js";
+import type { Position, Signal } from "../src/core/types.js";
 import type { Db } from "../src/db/pool.js";
-import { mintAt } from "./analytics.db.js";
+import { applySellFill, closePosition, realizedPnlOf, syntheticCloseFill } from "../src/trader/accounting.js";
+import { mintAt, PUMP_QUOTE } from "./analytics.db.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 
 const TOKEN = "positions-token";
@@ -31,11 +34,14 @@ interface ApiResult {
   body: Json;
 }
 
-const SELL_FEES = { curveBps: 200, poolBps: 30, extraPlatformBps: 10 };
+const CLOSE_TX = 305_000n;
+const RENT_REFUND = 1_513_840n;
+const SELL_FEES = { curveBps: 200, poolBps: 30, extraPlatformBps: 10, closeTxLamports: CLOSE_TX, rentRefundLamports: RENT_REFUND };
 const MINT_A = mintAt(20);
 const MINT_B = mintAt(21);
 const MINT_C = mintAt(22);
 const MINT_D = mintAt(23);
+const MINT_PUMP_QUOTED = mintAt(24);
 
 interface Runs {
   paper: number;
@@ -77,14 +83,22 @@ async function insertRun(db: Db, mode: string, label: string | null, startedAtMs
   return Number(result.rows[0]?.id ?? 0);
 }
 
-async function insertLaunch(db: Db, mint: string, name: string, symbol: string, createdAtMs: number, migratedAtMs: number | null): Promise<number> {
+async function insertLaunch(
+  db: Db,
+  mint: string,
+  name: string,
+  symbol: string,
+  createdAtMs: number,
+  migratedAtMs: number | null,
+  quoteMint = "SOL"
+): Promise<number> {
   const result = await db.query<{ id: bigint }>(
     `INSERT INTO launches (mint, bonding_curve, dev_wallet, creator, name, symbol, create_signature, create_slot, created_at,
-       token_total_supply, initial_virtual_token, initial_virtual_quote, initial_real_token, migrated_at, last_trade_at)
+       token_total_supply, initial_virtual_token, initial_virtual_quote, initial_real_token, migrated_at, last_trade_at, quote_mint)
      VALUES ($1, $1 || 'c', $1 || 'd', $1 || 'd', $2, $3, $1 || 's', 1, $4, 1000000000000000, 1073000000000000, 30000000000,
-       793100000000000, $5, $6)
+       793100000000000, $5, $6, $7)
      RETURNING id`,
-    [mint, name, symbol, new Date(createdAtMs), migratedAtMs === null ? null : new Date(migratedAtMs), new Date(NOW_MS - 3 * MINUTE_MS)]
+    [mint, name, symbol, new Date(createdAtMs), migratedAtMs === null ? null : new Date(migratedAtMs), new Date(NOW_MS - 3 * MINUTE_MS), quoteMint]
   );
   return Number(result.rows[0]?.id ?? 0);
 }
@@ -156,6 +170,7 @@ async function seed(db: Db): Promise<Runs> {
   const launchA = await insertLaunch(db, MINT_A, "Alpha Coin", "ALPHA", NOW_MS - 30 * MINUTE_MS, null);
   await insertLaunch(db, MINT_B, "Beta Coin", "BETA", NOW_MS - 30 * MINUTE_MS, null);
   const launchC = await insertLaunch(db, MINT_C, "Gamma Coin", "GAMMA", NOW_MS - 3 * HOUR_MS, NOW_MS - HOUR_MS);
+  await insertLaunch(db, MINT_PUMP_QUOTED, "Pump Quoted", "PQ", NOW_MS - 30 * MINUTE_MS, null, PUMP_QUOTE);
   await insertTrade(db, launchA, NOW_MS - 20 * MINUTE_MS, 10, 0, { protocol: 100, creator: 50, lp: 0 });
   await insertTrade(db, launchA, NOW_MS - 2 * MINUTE_MS, 20, 0, { protocol: 95, creator: 30, lp: 0 });
   await insertTrade(db, launchC, NOW_MS - 90 * MINUTE_MS, 5, 0, { protocol: 95, creator: 30, lp: 0 });
@@ -211,6 +226,17 @@ async function seed(db: Db): Promise<Runs> {
     meta: { pendingEntry: { quoteBudget: "150000000", maxSlippageBps: 1500, referencePrice: 1e-5 } }
   });
   await insertPosition(db, { id: "pos-a-shadow", runId: paper, mint: MINT_A, mode: "shadow", status: "open", openedAtMs: NOW_MS - 10 * MINUTE_MS, shadowOf: "pos-a" });
+  await insertPosition(db, { id: "pos-pump-quoted", runId: paper, mint: MINT_PUMP_QUOTED, status: "open", openedAtMs: NOW_MS - 2 * MINUTE_MS });
+  await insertPosition(db, {
+    id: "closed-pump-quoted",
+    runId: paper,
+    mint: MINT_PUMP_QUOTED,
+    status: "closed",
+    openedAtMs: NOW_MS - 30 * MINUTE_MS,
+    closedAtMs: NOW_MS - 2 * MINUTE_MS,
+    tokensHeld: 0n,
+    realizedPnl: 9n * SOL
+  });
   await insertPosition(db, {
     id: "closed-1",
     runId: paper,
@@ -291,7 +317,7 @@ async function seed(db: Db): Promise<Runs> {
   );
   await db.query(
     `INSERT INTO risk_state (run_id, starting_bankroll, realized_pnl, peak_equity, day_key, day_start_equity, halted_until, killed, kill_reason)
-     VALUES ($1, 5000000000, -1000000000, 5000000000, '2026-10-23', 5000000000, $2, TRUE, 'drawdown 0.2500 >= 0.25')`,
+     VALUES ($1, 5000000000, -1000000000, 5000000000, '2026-10-22', 5000000000, $2, TRUE, 'drawdown 0.2500 >= 0.25')`,
     [live, new Date(NOW_MS - HOUR_MS)]
   );
 
@@ -305,35 +331,107 @@ async function seed(db: Db): Promise<Runs> {
   return { paper, live, backtest, oldPaper };
 }
 
+function heldPosition(tokensHeld: bigint, proceeds: bigint, entryCost: bigint, lastPrice: number): Position {
+  const signal: Signal = { id: null, type: "score_momentum", mint: MINT_A, atMs: NOW_MS, slot: 1, riskScore: 18, wallets: [], meta: {} };
+  return {
+    id: "estimate-check",
+    runId: 1,
+    mode: "paper",
+    mint: signal.mint,
+    launchId: null,
+    signalId: null,
+    signalType: signal.type,
+    riskScore: signal.riskScore,
+    openedAtMs: NOW_MS - 10 * MINUTE_MS,
+    openedSlot: 1,
+    entryPrice: ENTRY_PRICE,
+    entryTokens: FULL_BAG,
+    entryCost,
+    tokensHeld,
+    proceeds,
+    feesPaid: 0n,
+    peakPrice: lastPrice,
+    lastPrice,
+    takeProfitLevelsHit: 0,
+    migratedSeen: false,
+    status: "open",
+    closedAtMs: null,
+    exitReason: null,
+    shadowOf: null,
+    meta: {}
+  };
+}
+
 describe("position estimates", () => {
   it("uses the latest trade's fee bps, falls back to venue defaults, and adds the platform fee", () => {
-    const defaults = { curveBps: 125, poolBps: 30, extraPlatformBps: 5 };
-    expect(sellFeeBpsFor({ protocolBps: 95, creatorBps: 30, lpBps: 0 }, false, defaults)).toEqual({ bps: 130, source: "last_trade" });
-    expect(sellFeeBpsFor({ protocolBps: 5, creatorBps: 5, lpBps: 20 }, true, defaults)).toEqual({ bps: 35, source: "last_trade" });
-    expect(sellFeeBpsFor(null, false, defaults)).toEqual({ bps: 130, source: "default" });
-    expect(sellFeeBpsFor(null, true, defaults)).toEqual({ bps: 35, source: "default" });
-    expect(sellFeeBpsFor({ protocolBps: 0, creatorBps: 0, lpBps: 0 }, false, defaults)).toEqual({ bps: 130, source: "default" });
+    const defaults = { curveBps: 125, poolBps: 30, extraPlatformBps: 5, closeTxLamports: 0n, rentRefundLamports: 0n };
+    expect(sellFeeBpsFor({ protocolBps: 95, creatorBps: 30, lpBps: 0 }, false, defaults)).toEqual({ venueBps: 125, platformBps: 5, bps: 130, source: "last_trade" });
+    expect(sellFeeBpsFor({ protocolBps: 5, creatorBps: 5, lpBps: 20 }, true, defaults)).toEqual({ venueBps: 30, platformBps: 5, bps: 35, source: "last_trade" });
+    expect(sellFeeBpsFor(null, false, defaults)).toEqual({ venueBps: 125, platformBps: 5, bps: 130, source: "default" });
+    expect(sellFeeBpsFor(null, true, defaults)).toEqual({ venueBps: 30, platformBps: 5, bps: 35, source: "default" });
+    expect(sellFeeBpsFor({ protocolBps: 0, creatorBps: 0, lpBps: 0 }, false, defaults)).toEqual({ venueBps: 125, platformBps: 5, bps: 130, source: "default" });
   });
 
-  it("nets the sell fee from the value at the last price in lamports", () => {
-    expect(netSellValue(HALF_BAG, 2 ** -13, 125)).toBe(197_500_000n);
-    expect(netSellValue(HALF_BAG, 2 ** -13, 0)).toBe(200_000_000n);
-    expect(netSellValue(0n, 2 ** -13, 125)).toBe(0n);
-    expect(netSellValue(HALF_BAG, Number.NaN, 125)).toBe(0n);
-    expect(netSellValue(HALF_BAG, 2 ** -13, 20_000)).toBe(0n);
+  it("nets the venue fee, then the platform fee on what is left, from the value at the last price in lamports", () => {
+    expect(netSellValue(HALF_BAG, 2 ** -13, { venueBps: 125, platformBps: 0 })).toBe(197_500_000n);
+    expect(netSellValue(HALF_BAG, 2 ** -13, { venueBps: 125, platformBps: 10 })).toBe(197_302_500n);
+    expect(netSellValue(HALF_BAG, 2 ** -13, { venueBps: 0, platformBps: 0 })).toBe(200_000_000n);
+    expect(netSellValue(0n, 2 ** -13, { venueBps: 125, platformBps: 0 })).toBe(0n);
+    expect(netSellValue(HALF_BAG, Number.NaN, { venueBps: 125, platformBps: 0 })).toBe(0n);
+    expect(netSellValue(HALF_BAG, 2 ** -13, { venueBps: 20_000, platformBps: 0 })).toBe(0n);
+    expect(netSellValue(HALF_BAG, 2 ** -13, { venueBps: Number.NaN, platformBps: Number.POSITIVE_INFINITY })).toBe(200_000_000n);
   });
 
-  it("derives fee defaults and entry rules from the strategy config", () => {
+  it("books the closing sell's network fee and ATA rent refund like the trader does, and nothing once no tokens are held", () => {
+    const fee = { venueBps: 125, platformBps: 0 };
+    const costs = { closeTxLamports: CLOSE_TX, rentRefundLamports: RENT_REFUND };
+    expect(estimatedCloseProceeds(HALF_BAG, 2 ** -13, fee, costs)).toBe(197_500_000n - CLOSE_TX + RENT_REFUND);
+    expect(estimatedCloseProceeds(0n, 2 ** -13, fee, costs)).toBe(0n);
+  });
+
+  it("estimates the same pnl the trader books when it closes the position at the last price", () => {
+    const execution = defaultStrategyConfig().execution;
+    const defaults = sellFeeDefaultsOf(execution);
+    const price = 2 ** -13;
+    for (const [tokens, proceeds] of [
+      [HALF_BAG, SOL / 20n],
+      [FULL_BAG, 0n]
+    ] as const) {
+      const open = heldPosition(tokens, proceeds, 76_819_145n, price);
+      const close = syntheticCloseFill(open, null, price, execution, NOW_MS, "take_profit", "estimate-check");
+      const booked = realizedPnlOf(closePosition(applySellFill(open, close.order, close.fill), NOW_MS, "take_profit"));
+      const estimate = proceeds + estimatedCloseProceeds(tokens, price, sellFeeBpsFor(null, false, defaults), defaults) - open.entryCost;
+      expect(estimate).toBe(booked);
+    }
+  });
+
+  it("derives fee and close cost defaults and entry rules from the strategy config", () => {
     const config = defaultStrategyConfig();
     config.signals.enabled = ["smart_convergence", "score_momentum"];
-    expect(sellFeeDefaultsOf(config.execution)).toEqual({ curveBps: 125, poolBps: 30, extraPlatformBps: 0 });
+    expect(sellFeeDefaultsOf(config.execution)).toEqual({
+      curveBps: 125,
+      poolBps: 30,
+      extraPlatformBps: 0,
+      closeTxLamports: 305_000n,
+      rentRefundLamports: 1_513_840n
+    });
+    expect(sellFeeDefaultsOf({ ...config.execution, useJito: true, refundAtaOnClose: false })).toMatchObject({
+      closeTxLamports: 1_305_000n,
+      rentRefundLamports: 0n
+    });
     const rules = entryRulesOf(config);
     expect(rules.enabled).toEqual(["smart_convergence", "score_momentum"]);
     expect(rules.scoreMomentum).toMatchObject({ checkpointSec: 60, maxRiskScore: 35, minMcapSol: 35, maxMcapSol: 150 });
     expect(rules.convergence).toEqual({ windowSec: 120, minWallets: 3, maxRiskScore: 55 });
     expect(rules.maxOpenPositions).toBe(config.risk.maxConcurrent);
+    expect(emptyPositionsSnapshot(5, 0)).toMatchObject({ run: null, todayKey: "1970-01-01", todayPnlEstimateSol: null });
+  });
+
+  it("links only valid base58 mints to pump.fun", () => {
     expect(pumpCoinUrl(MINT_A)).toBe(`https://pump.fun/coin/${MINT_A}`);
-    expect(emptyPositionsSnapshot(5).run).toBeNull();
+    for (const bad of ["", "javascript:alert(1)", "../../evil", `${MINT_A}/../x`, "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl", "a".repeat(45)]) {
+      expect(pumpCoinUrl(bad)).toBeNull();
+    }
   });
 });
 
@@ -416,22 +514,22 @@ describe.skipIf(!hasTestDatabase)("positions api", () => {
       proceedsSol: 0.05,
       sellFeeBps: 135,
       sellFeeSource: "last_trade",
-      estimatedValueSol: 0.1973,
+      estimatedValueSol: 0.19851134,
       takeProfitLevelsHit: 1,
       migrated: false,
       exiting: null,
       lastTradeAtMs: NOW_MS - 2 * MINUTE_MS,
       pumpUrl: `https://pump.fun/coin/${MINT_A}`
     });
-    expect(alpha?.estimatedPnlSol).toBeCloseTo(0.1473, 12);
-    expect(alpha?.estimatedPnlPct).toBeCloseTo(147.3, 9);
+    expect(alpha?.estimatedPnlSol).toBeCloseTo(0.14851134, 12);
+    expect(alpha?.estimatedPnlPct).toBeCloseTo(148.51134, 9);
 
-    expect(beta).toMatchObject({ sellFeeBps: 210, sellFeeSource: "default", estimatedValueSol: 0.04895, multiple: 0.5, exiting: "stop_loss", soldPct: 0 });
-    expect(beta?.estimatedPnlSol).toBeCloseTo(-0.05105, 12);
+    expect(beta).toMatchObject({ sellFeeBps: 210, sellFeeSource: "default", estimatedValueSol: 0.05015984, multiple: 0.5, exiting: "stop_loss", soldPct: 0 });
+    expect(beta?.estimatedPnlSol).toBeCloseTo(-0.04984016, 12);
     expect(beta?.lastTradeAtMs).toBe(NOW_MS - 3 * MINUTE_MS);
 
-    expect(gamma).toMatchObject({ migrated: true, sellFeeBps: 40, sellFeeSource: "last_trade", estimatedValueSol: 0.1992 });
-    expect(gamma?.estimatedPnlSol).toBeCloseTo(0.0992, 12);
+    expect(gamma).toMatchObject({ migrated: true, sellFeeBps: 40, sellFeeSource: "last_trade", estimatedValueSol: 0.20040944 });
+    expect(gamma?.estimatedPnlSol).toBeCloseTo(0.10040944, 12);
 
     expect(pending).toMatchObject({
       status: "pending",
@@ -447,8 +545,10 @@ describe.skipIf(!hasTestDatabase)("positions api", () => {
       soldPct: null
     });
 
-    expect(body.openPnlEstimateSol).toBeCloseTo(0.1473 - 0.05105 + 0.0992, 12);
-    expect(body.equityEstimateSol).toBeCloseTo(10.5 + 0.1473 - 0.05105 + 0.0992, 9);
+    expect(body.openPnlEstimateSol).toBeCloseTo(0.19908062, 12);
+    expect(body.equityEstimateSol).toBeCloseTo(10.69908062, 9);
+    expect(body.todayKey).toBe("2026-10-23");
+    expect(body.todayPnlEstimateSol).toBeCloseTo(10.69908062 - 10.2, 9);
     expect(text).not.toContain("pos-a-shadow");
   });
 
@@ -474,6 +574,9 @@ describe.skipIf(!hasTestDatabase)("positions api", () => {
     expect(live.body.bankroll).toMatchObject({ killed: true, killReason: "drawdown 0.2500 >= 0.25", haltedForDay: false, equitySol: null, dayPnlSol: null });
     expect(live.body.open).toEqual([]);
     expect(live.body.equityEstimateSol).toBe(4);
+    expect(live.body.bankroll).toMatchObject({ dayKey: "2026-10-22" });
+    expect(live.body.todayKey).toBe("2026-10-23");
+    expect(live.body.todayPnlEstimateSol).toBeNull();
   });
 
   it("lists recent closed trades of the run newest first with realized pnl", async () => {
@@ -556,5 +659,29 @@ describe.skipIf(!hasTestDatabase)("positions api", () => {
     await database.db.query("UPDATE positions SET last_price = $1, peak_price = $1 WHERE id = 'pos-b'", [2 ** -14]);
     const after = await call("/api/positions");
     expect(list(after.body, "open")[1]).toMatchObject({ id: "pos-b", multiple: 2, peakMultiple: 2 });
+  });
+
+  it("never shows positions on launches quoted in another coin, in lists, counts or the equity estimate", async () => {
+    const { text, body } = await call("/api/positions");
+    expect(text).not.toContain(MINT_PUMP_QUOTED);
+    expect(text).not.toContain("pos-pump-quoted");
+    expect(body.counts).toMatchObject({ open: 3, closed: 3, realizedLast24hSol: 0.05 });
+  });
+
+  it("prefers the active paper or live run over an ended one that has more history", async () => {
+    const db = database.db;
+    await db.query("UPDATE strategy_runs SET ended_at = $2 WHERE id = $1", [runs.paper, new Date(NOW_MS - MINUTE_MS)]);
+    await db.query("UPDATE strategy_runs SET ended_at = $2 WHERE id = $1", [runs.live, new Date(NOW_MS - MINUTE_MS)]);
+    const fresh = await insertRun(db, "paper", "fresh", NOW_MS - 30 * MINUTE_MS);
+    try {
+      const { body } = await call("/api/positions");
+      expect(body.run).toMatchObject({ id: fresh, active: true });
+      expect(body.open).toEqual([]);
+      expect(await selectPositionsRun(db, { mode: "paper" })).toMatchObject({ id: fresh });
+    } finally {
+      await db.query("DELETE FROM strategy_runs WHERE id = $1", [fresh]);
+      await db.query("UPDATE strategy_runs SET ended_at = NULL WHERE id = ANY($1::bigint[])", [[runs.paper, runs.live]]);
+    }
+    expect((await call("/api/positions")).body.run).toMatchObject({ id: runs.paper });
   });
 });

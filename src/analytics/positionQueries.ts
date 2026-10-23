@@ -1,7 +1,13 @@
+import { feeAmount } from "../chain/curve.js";
 import type { ExecutionConfig, StrategyConfig } from "../config/strategy.js";
+import { SOL_QUOTE } from "../core/constants.js";
 import type { TradingMode } from "../core/types.js";
 import { toBigInt, toNullableNumber, toNumber, type Db } from "../db/pool.js";
+import { platformFeeOn } from "../execution/fees.js";
+import { attemptCosts } from "../execution/model.js";
 import { isUsablePrice, valueAtPrice } from "../exits/math.js";
+import { dayKeyFor } from "../risk/day.js";
+import { isMintAddress } from "./http.js";
 import { clampLimit } from "./tradeQueries.js";
 import { lamportsToSol } from "./units.js";
 
@@ -21,6 +27,15 @@ export interface SellFeeDefaults {
   curveBps: number;
   poolBps: number;
   extraPlatformBps: number;
+  closeTxLamports: bigint;
+  rentRefundLamports: bigint;
+}
+
+export interface SellFee {
+  venueBps: number;
+  platformBps: number;
+  bps: number;
+  source: SellFeeSource;
 }
 
 export interface EntryRules {
@@ -108,7 +123,7 @@ export interface OpenPositionView {
   migrated: boolean;
   exiting: string | null;
   lastTradeAtMs: number | null;
-  pumpUrl: string;
+  pumpUrl: string | null;
 }
 
 export interface ClosedPositionView {
@@ -128,7 +143,7 @@ export interface ClosedPositionView {
   pnlPct: number | null;
   peakMultiple: number | null;
   exitReason: string;
-  pumpUrl: string;
+  pumpUrl: string | null;
 }
 
 export interface PositionCounts {
@@ -167,6 +182,8 @@ export interface PositionsSnapshot {
   bankroll: BankrollView | null;
   openPnlEstimateSol: number;
   equityEstimateSol: number | null;
+  todayKey: string;
+  todayPnlEstimateSol: number | null;
   open: OpenPositionView[];
   recentClosed: ClosedPositionView[];
   counts: PositionCounts;
@@ -177,13 +194,17 @@ export interface PositionsQuery {
   closedLimit?: number | null;
   nowMs: number;
   fees: SellFeeDefaults;
+  dayResetUtcHour: number;
 }
 
 export function sellFeeDefaultsOf(execution: ExecutionConfig): SellFeeDefaults {
+  const landedSell = attemptCosts(execution, true, true);
   return {
     curveBps: execution.defaultProtocolFeeBps + execution.defaultCreatorFeeBps,
     poolBps: execution.defaultPoolLpFeeBps + execution.defaultPoolProtocolFeeBps + execution.defaultPoolCreatorFeeBps,
-    extraPlatformBps: execution.extraPlatformFeeBps
+    extraPlatformBps: execution.extraPlatformFeeBps,
+    closeTxLamports: landedSell.networkFee + landedSell.tip,
+    rentRefundLamports: execution.refundAtaOnClose ? BigInt(execution.ataRentLamports) : 0n
   };
 }
 
@@ -211,25 +232,47 @@ export function entryRulesOf(config: StrategyConfig): EntryRules {
   };
 }
 
-export function pumpCoinUrl(mint: string): string {
-  return `${PUMP_COIN_URL}${encodeURIComponent(mint)}`;
+export function pumpCoinUrl(mint: string): string | null {
+  return isMintAddress(mint) ? `${PUMP_COIN_URL}${mint}` : null;
 }
 
-export function sellFeeBpsFor(
-  lastTrade: LastTradeFees | null,
-  migrated: boolean,
-  defaults: SellFeeDefaults
-): { bps: number; source: SellFeeSource } {
+function boundedBps(bps: number): number {
+  return Number.isFinite(bps) ? Math.max(0, Math.min(BPS_SCALE, Math.round(bps))) : 0;
+}
+
+function sellFee(venueBps: number, platformBps: number, source: SellFeeSource): SellFee {
+  const venue = boundedBps(venueBps);
+  const platform = boundedBps(platformBps);
+  return { venueBps: venue, platformBps: platform, bps: venue + platform, source };
+}
+
+export function sellFeeBpsFor(lastTrade: LastTradeFees | null, migrated: boolean, defaults: SellFeeDefaults): SellFee {
   if (lastTrade && lastTrade.protocolBps > 0) {
-    return { bps: lastTrade.protocolBps + lastTrade.creatorBps + lastTrade.lpBps + defaults.extraPlatformBps, source: "last_trade" };
+    return sellFee(lastTrade.protocolBps + lastTrade.creatorBps + lastTrade.lpBps, defaults.extraPlatformBps, "last_trade");
   }
-  return { bps: (migrated ? defaults.poolBps : defaults.curveBps) + defaults.extraPlatformBps, source: "default" };
+  return sellFee(migrated ? defaults.poolBps : defaults.curveBps, defaults.extraPlatformBps, "default");
 }
 
-export function netSellValue(tokens: bigint, price: number, feeBps: number): bigint {
+export function netSellValue(tokens: bigint, price: number, fee: Pick<SellFee, "venueBps" | "platformBps">): bigint {
   const gross = valueAtPrice(tokens, price);
-  const bps = BigInt(Math.max(0, Math.min(BPS_SCALE, Math.round(feeBps))));
-  return gross - (gross * bps) / BigInt(BPS_SCALE);
+  const afterVenue = gross - feeAmount(gross, boundedBps(fee.venueBps));
+  if (afterVenue <= 0n) {
+    return 0n;
+  }
+  const net = afterVenue - platformFeeOn(afterVenue, boundedBps(fee.platformBps));
+  return net > 0n ? net : 0n;
+}
+
+export function estimatedCloseProceeds(
+  tokens: bigint,
+  price: number,
+  fee: Pick<SellFee, "venueBps" | "platformBps">,
+  defaults: Pick<SellFeeDefaults, "closeTxLamports" | "rentRefundLamports">
+): bigint {
+  if (tokens <= 0n) {
+    return 0n;
+  }
+  return netSellValue(tokens, price, fee) - defaults.closeTxLamports + defaults.rentRefundLamports;
 }
 
 function msOf(value: unknown): number | null {
@@ -264,6 +307,11 @@ function pctOf(numerator: bigint, denominator: bigint): number | null {
   return (Number(numerator) / Number(denominator)) * 100;
 }
 
+function soldPctOf(entryTokens: bigint, tokensHeld: bigint): number | null {
+  const pct = pctOf(entryTokens - tokensHeld, entryTokens);
+  return pct === null ? null : Math.max(0, Math.min(100, pct));
+}
+
 function lamportsOrNull(value: unknown): bigint | null {
   if (typeof value === "string" && /^-?\d+$/.test(value)) {
     return BigInt(value);
@@ -293,6 +341,7 @@ export async function selectPositionsRun(
      WHERE ($1::bigint IS NULL OR r.id = $1)
        AND ($2::text IS NULL OR r.mode = $2)
      ORDER BY (r.mode = ANY($3::text[])) DESC,
+              (r.ended_at IS NULL) DESC,
               EXISTS (SELECT 1 FROM positions p WHERE p.run_id = r.id) DESC,
               r.started_at DESC, r.id DESC
      LIMIT 1`,
@@ -305,6 +354,7 @@ export async function selectPositionsRun(
 interface BankrollRecord {
   view: BankrollView;
   ledgerLamports: bigint;
+  dayStartLamports: bigint;
 }
 
 interface OpenPositionRecord {
@@ -344,7 +394,7 @@ async function loadBankrollRecord(db: Db, runId: number, nowMs: number): Promise
     killReason: textOrNull(row.kill_reason),
     updatedAtMs: msOf(row.updated_at)
   };
-  return { view, ledgerLamports: starting + realized };
+  return { view, ledgerLamports: starting + realized, dayStartLamports: dayStart };
 }
 
 export async function loadBankroll(db: Db, runId: number, nowMs: number): Promise<BankrollView | null> {
@@ -376,7 +426,7 @@ function openPositionFromRecord(row: DbRecord, nowMs: number, fees: SellFeeDefau
   const migrated = row.migrated_seen === true || row.migrated_at instanceof Date || toNumber(row.fee_venue) === 1;
   const fee = sellFeeBpsFor(lastTradeFeesOf(row), migrated, fees);
   const filled = status === "open" && entryTokens > 0n;
-  const value = filled && lastPrice !== null ? netSellValue(tokensHeld, lastPrice, fee.bps) : null;
+  const value = filled && lastPrice !== null ? estimatedCloseProceeds(tokensHeld, lastPrice, fee, fees) : null;
   const pnl = value === null ? null : proceeds + value - entryCost;
   const budget = lamportsOrNull(row.budget);
   const view: OpenPositionView = {
@@ -399,7 +449,7 @@ function openPositionFromRecord(row: DbRecord, nowMs: number, fees: SellFeeDefau
     peakMultiple: ratio(peakPrice, entryPrice),
     entryTokens,
     tokensHeld,
-    soldPct: entryTokens > 0n ? pctOf(entryTokens - tokensHeld, entryTokens) : null,
+    soldPct: entryTokens > 0n ? soldPctOf(entryTokens, tokensHeld) : null,
     proceedsSol: lamportsToSol(proceeds),
     feesPaidSol: lamportsToSol(toBigInt(row.fees_paid)),
     sellFeeBps: fee.bps,
@@ -435,9 +485,10 @@ async function loadOpenPositionRecords(db: Db, runId: number, nowMs: number, fee
        LIMIT 1
      ) f ON TRUE
      WHERE p.run_id = $1 AND p.status IN ('open', 'pending') AND p.shadow_of IS NULL
+       AND (l.id IS NULL OR l.quote_mint = $3)
      ORDER BY p.opened_at DESC, p.id DESC
      LIMIT $2`,
-    [runId, clampLimit(limit, DEFAULT_OPEN_POSITION_LIMIT, 1_000)]
+    [runId, clampLimit(limit, DEFAULT_OPEN_POSITION_LIMIT, 1_000), SOL_QUOTE]
   );
   return result.rows.map((row) => openPositionFromRecord(row, nowMs, fees));
 }
@@ -488,9 +539,10 @@ export async function loadRecentClosedPositions(db: Db, runId: number, limit = D
      FROM positions p
      LEFT JOIN launches l ON l.mint = p.mint
      WHERE p.run_id = $1 AND p.status = 'closed' AND p.closed_at IS NOT NULL AND p.shadow_of IS NULL
+       AND (l.id IS NULL OR l.quote_mint = $3)
      ORDER BY p.closed_at DESC, p.id DESC
      LIMIT $2`,
-    [runId, clampLimit(limit, DEFAULT_RECENT_CLOSED_LIMIT, MAX_RECENT_CLOSED_LIMIT)]
+    [runId, clampLimit(limit, DEFAULT_RECENT_CLOSED_LIMIT, MAX_RECENT_CLOSED_LIMIT), SOL_QUOTE]
   );
   return result.rows.map(closedPositionFromRecord);
 }
@@ -506,9 +558,10 @@ export async function loadPositionCounts(db: Db, runId: number, sinceMs: number)
             coalesce(sum(coalesce(realized_pnl, proceeds - entry_cost)) FILTER (WHERE status = 'closed' AND closed_at >= $2), 0)::bigint AS pnl_recent,
             max(opened_at) AS last_opened,
             max(closed_at) FILTER (WHERE status = 'closed') AS last_closed
-     FROM positions
-     WHERE run_id = $1 AND shadow_of IS NULL`,
-    [runId, new Date(sinceMs)]
+     FROM positions p
+     WHERE p.run_id = $1 AND p.shadow_of IS NULL
+       AND NOT EXISTS (SELECT 1 FROM launches l WHERE l.mint = p.mint AND l.quote_mint <> $3)`,
+    [runId, new Date(sinceMs), SOL_QUOTE]
   );
   const row = result.rows[0] ?? {};
   return {
@@ -575,13 +628,15 @@ function emptyCounts(): PositionCounts {
   };
 }
 
-export function emptyPositionsSnapshot(nowMs: number): PositionsSnapshot {
+export function emptyPositionsSnapshot(nowMs: number, dayResetUtcHour: number): PositionsSnapshot {
   return {
     readAtMs: nowMs,
     run: null,
     bankroll: null,
     openPnlEstimateSol: 0,
     equityEstimateSol: null,
+    todayKey: dayKeyFor(nowMs, dayResetUtcHour),
+    todayPnlEstimateSol: null,
     open: [],
     recentClosed: [],
     counts: emptyCounts(),
@@ -591,6 +646,7 @@ export function emptyPositionsSnapshot(nowMs: number): PositionsSnapshot {
 
 export async function loadPositionsSnapshot(db: Db, run: PositionsRun, query: PositionsQuery): Promise<PositionsSnapshot> {
   const sinceMs = query.nowMs - ACTIVITY_WINDOW_HOURS * HOUR_MS;
+  const todayKey = dayKeyFor(query.nowMs, query.dayResetUtcHour);
   const [bankroll, open, recentClosed, counts, activity] = await Promise.all([
     loadBankrollRecord(db, run.id, query.nowMs),
     loadOpenPositionRecords(db, run.id, query.nowMs, query.fees, DEFAULT_OPEN_POSITION_LIMIT),
@@ -602,12 +658,16 @@ export async function loadPositionsSnapshot(db: Db, run: PositionsRun, query: Po
   for (const record of open) {
     openPnl += record.pnlLamports ?? 0n;
   }
+  const equity = bankroll ? bankroll.ledgerLamports + openPnl : null;
+  const today = bankroll && equity !== null && bankroll.view.dayKey === todayKey ? equity - bankroll.dayStartLamports : null;
   return {
     readAtMs: query.nowMs,
     run,
     bankroll: bankroll?.view ?? null,
     openPnlEstimateSol: lamportsToSol(openPnl),
-    equityEstimateSol: bankroll ? lamportsToSol(bankroll.ledgerLamports + openPnl) : null,
+    equityEstimateSol: equity === null ? null : lamportsToSol(equity),
+    todayKey,
+    todayPnlEstimateSol: today === null ? null : lamportsToSol(today),
     open: open.map((record) => record.view),
     recentClosed,
     counts,

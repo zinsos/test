@@ -23,6 +23,10 @@ const BASE_HEADERS: Record<string, string> = {
 const BASE58_MINT = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const DIGITS = /^-?\d+$/;
 
+export function isMintAddress(value: string): boolean {
+  return BASE58_MINT.test(value);
+}
+
 export function jsonReplacer(_key: string, value: unknown): unknown {
   return typeof value === "bigint" ? value.toString() : value;
 }
@@ -161,7 +165,7 @@ export function parseMint(raw: string): string {
   } catch {
     throw new HttpError(400, "invalid_mint", "mint is not a valid base58 address");
   }
-  if (!BASE58_MINT.test(decoded)) {
+  if (!isMintAddress(decoded)) {
     throw new HttpError(400, "invalid_mint", "mint is not a valid base58 address");
   }
   return decoded;

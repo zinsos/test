@@ -7,7 +7,7 @@ import { DASHBOARD_CSS } from "../src/analytics/dashboardStyle.js";
 import { cacheKey, HttpError, parseInteger, parseMint, parseMode, parseTime, toJson, tokensMatch } from "../src/analytics/http.js";
 import { PUMP_COIN_URL } from "../src/analytics/positionQueries.js";
 import { resolveRoute } from "../src/analytics/routes.js";
-import { MINT, PENDING_MINT, renderTradesView, tradesFixture } from "./analytics.dashboardDom.js";
+import { jsonResponse, MINT, neverResponds, PENDING_MINT, renderTradesView, startDashboard, tradesFixture } from "./analytics.dashboardDom.js";
 
 function inlineBlocks(html: string, tag: string): string[] {
   const pattern = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "g");
@@ -60,7 +60,7 @@ describe("dashboard html", () => {
     expect(DASHBOARD_SCRIPT).toContain('if (prefs.v !== PREFS_VERSION) { prefs.v = PREFS_VERSION; prefs.tab = "trades"; }');
     expect(DASHBOARD_SCRIPT).toContain("var LIVE_REFRESH_MS = 10000;");
     expect(DASHBOARD_SCRIPT).toContain('var LIVE_TABS = { trades: true };');
-    expect(DASHBOARD_SCRIPT).toContain('document.visibilityState === "visible" && !sheetOpen && !rendering && Date.now() - lastAttemptMs >= LIVE_REFRESH_MS');
+    expect(DASHBOARD_SCRIPT).toContain('return document.visibilityState === "visible" && !sheetOpen && !locked && !editingIn(dom.main);');
     expect(DASHBOARD_SCRIPT).toContain('api("/api/positions"');
     expect(DASHBOARD_SCRIPT).toContain('"Updated " + fmtDur(');
     expect(DASHBOARD_SCRIPT).toContain("No open positions right now");
@@ -87,6 +87,94 @@ describe("dashboard html", () => {
     expect(empty.text).toContain("score momentum (risk 35 or lower at the 60s checkpoint");
     expect(empty.text).toContain("4 signals in the last 2h, 2 traded; most were skipped for max open positions");
     expect(empty.paths).toEqual(["/api/runs?limit=200", "/api/positions"]);
+  });
+
+  it("moves saved preferences from before the Trades tab onto it once, then keeps the chosen tab", async () => {
+    const before = JSON.stringify({ tab: "edge", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "" });
+    const migrated = await renderTradesView(tradesFixture(), { storage: { "snypra-edge-prefs": before } });
+    expect(migrated.paths).toEqual(["/api/runs?limit=200", "/api/positions"]);
+    expect(migrated.text).toContain("Paper run #1");
+    const chosen = JSON.stringify({ v: "2", tab: "signals", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "" });
+    const kept = await renderTradesView({ signals: [] }, { storage: { "snypra-edge-prefs": chosen } });
+    expect(kept.paths).toEqual(["/api/runs?limit=200", "/api/signals/recent?limit=50"]);
+  });
+
+  it("links only base58 mints to pump.fun", async () => {
+    const fixture = tradesFixture();
+    const open = (fixture.open as Array<Record<string, unknown>>).map((item, index) => (index === 0 ? { ...item, mint: "javascript:alert(1)" } : item));
+    const rendered = await renderTradesView({ ...fixture, open, recentClosed: [] });
+    expect(rendered.links).toEqual([`${PUMP_COIN_URL}${PENDING_MINT}`]);
+    expect(rendered.text).toContain("+0.2973");
+    expect(rendered.text).toContain("held 10m");
+  });
+
+  it("refreshes the Trades tab every 10 seconds in place, only while visible and not while a control is in use", async () => {
+    const fixture = tradesFixture();
+    const dashboard = await startDashboard(fixture);
+    const positionReads = (): number => dashboard.paths.filter((path) => path === "/api/positions").length;
+    expect(positionReads()).toBe(1);
+    await dashboard.advance(9_000);
+    expect(positionReads()).toBe(1);
+    expect(dashboard.updated()).toBe("Updated 9s ago");
+    const open = (fixture.open as Array<Record<string, unknown>>).map((item, index) => (index === 0 ? { ...item, multiple: 5.5 } : item));
+    dashboard.setResponder((path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : { ...fixture, open })));
+    await dashboard.advance(1_000);
+    expect(positionReads()).toBe(2);
+    expect(dashboard.view().text).toContain("5.50×");
+    expect(dashboard.updated()).toBe("Updated 0s ago");
+
+    dashboard.setVisibility("hidden");
+    await dashboard.advance(40_000);
+    expect(positionReads()).toBe(2);
+    dashboard.setVisibility("visible");
+    await dashboard.advance(1_000);
+    expect(positionReads()).toBe(3);
+
+    dashboard.setResponder(() => Promise.resolve(jsonResponse({ error: "internal_error", message: "internal error" }, 500)));
+    await dashboard.advance(10_000);
+    expect(positionReads()).toBe(4);
+    expect(dashboard.view().text).toContain("5.50×");
+    expect(dashboard.updated()).toContain("retrying");
+  });
+
+  it("does not replace a focused control and recovers when a refresh never answers", async () => {
+    const fixture = tradesFixture();
+    const runs = [
+      { id: 2, mode: "paper", label: null, endedAtMs: null },
+      { id: 1, mode: "paper", label: "old", endedAtMs: 5 }
+    ];
+    const respond = (path: string) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs, modes: [] } : fixture));
+    const dashboard = await startDashboard(fixture);
+    dashboard.setResponder(respond);
+    const positionReads = (): number => dashboard.paths.filter((path) => path.startsWith("/api/positions")).length;
+    await dashboard.advance(60_000);
+    const settled = positionReads();
+    dashboard.focus("select");
+    await dashboard.advance(30_000);
+    expect(positionReads()).toBe(settled);
+    dashboard.focus(null);
+    await dashboard.advance(1_000);
+    expect(positionReads()).toBe(settled + 1);
+
+    dashboard.setResponder((path) => (path.startsWith("/api/positions") ? neverResponds() : respond(path)));
+    await dashboard.advance(10_000);
+    expect(positionReads()).toBe(settled + 2);
+    await dashboard.advance(19_000);
+    expect(positionReads()).toBe(settled + 2);
+    dashboard.setResponder(respond);
+    await dashboard.advance(1_000);
+    expect(positionReads()).toBe(settled + 3);
+    expect(dashboard.view().text).toContain("Paper run #1");
+  });
+
+  it("stops refreshing behind the token form until a token is entered", async () => {
+    const dashboard = await startDashboard(tradesFixture(), { search: "" });
+    dashboard.setResponder(() => Promise.resolve(jsonResponse({ error: "unauthorized" }, 401)));
+    await dashboard.advance(10_000);
+    expect(dashboard.view().text).toContain("This dashboard is locked");
+    const reads = dashboard.paths.length;
+    await dashboard.advance(120_000);
+    expect(dashboard.paths.length).toBe(reads);
   });
 
   it("ships a syntactically valid script that never writes untrusted text as HTML", () => {

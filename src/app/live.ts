@@ -298,7 +298,8 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
             maxRisk: config.scorer.maxRisk,
             labelHorizonHours: config.recorder.outcome.finalizeAfterHours,
             sellFees: sellFeeDefaultsOf(config.execution),
-            entryRules: entryRulesOf(config)
+            entryRules: entryRulesOf(config),
+            dayResetUtcHour: config.risk.dayResetUtcHour
           }
         })
       : await startHealthServer({

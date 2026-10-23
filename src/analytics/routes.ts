@@ -68,6 +68,7 @@ export interface AnalyticsSettings {
   labelHorizonHours: number;
   sellFees: SellFeeDefaults;
   entryRules: EntryRules | null;
+  dayResetUtcHour: number;
 }
 
 export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
@@ -83,7 +84,8 @@ export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
   defaultCheckpointSec: 60,
   labelHorizonHours: DEFAULT_LABEL_HORIZON_HOURS,
   sellFees: sellFeeDefaultsOf(defaultStrategyConfig().execution),
-  entryRules: null
+  entryRules: null,
+  dayResetUtcHour: defaultStrategyConfig().risk.dayResetUtcHour
 };
 
 export type ScoreLookup = (mint: Pubkey) => LaunchScore | null;
@@ -289,9 +291,10 @@ async function positionsRoute(ctx: AnalyticsContext, request: ApiRequest): Promi
   if (!run && runId !== null) {
     throw new HttpError(404, "run_not_found", "no strategy run with this id and mode");
   }
+  const dayResetUtcHour = ctx.settings.dayResetUtcHour;
   const snapshot = run
-    ? await loadPositionsSnapshot(ctx.db, run, { closedLimit, nowMs, fees: ctx.settings.sellFees })
-    : emptyPositionsSnapshot(nowMs);
+    ? await loadPositionsSnapshot(ctx.db, run, { closedLimit, nowMs, fees: ctx.settings.sellFees, dayResetUtcHour })
+    : emptyPositionsSnapshot(nowMs, dayResetUtcHour);
   return { filter: { runId, mode }, ...snapshot, entryRules: ctx.settings.entryRules };
 }
 
