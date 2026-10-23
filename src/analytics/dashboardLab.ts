@@ -57,7 +57,9 @@ export const LAB_VIEW_SCRIPT = String.raw`
     } else if (s) {
       badges.push(badge("No trades", ""));
     }
-    if (row.error) { badges.push(badge("Failed", "bad")); }
+    if (row.sameTradesAsBaseline) { badges.push(badge("Same trades as baseline", "")); }
+    var skipped = !!row.error && row.error.indexOf("skipped: ") === 0;
+    if (row.error) { badges.push(skipped ? badge("Not run", "") : badge("Failed", "bad")); }
     var out = [
       el("div", { class: "row" }, el("strong", { class: "lab-name", text: readable(row.name) }),
         el("span", { class: "big-num " + signClass(traded ? s.expectancySol : null) }, traded ? fmtSol(s.expectancySol) : DASH, traded ? el("span", { class: "unit", text: " SOL/trade" }) : null)),
@@ -67,7 +69,7 @@ export const LAB_VIEW_SCRIPT = String.raw`
       out.push(el("div", { class: "meta", text: fmtInt(s.trades) + " trades" + DOT + "win " + fmtPct(s.winRate, 0) + DOT + "total " + fmtSol(s.totalPnlSol) + " SOL" + DOT + "max drawdown " + (isNum(s.maxDrawdownSol) ? fmtSol(-Math.abs(s.maxDrawdownSol)) : DASH) }));
       out.push(el("div", { class: "meta", text: "95% range " + labRange(s) + (isNum(row.vsBaselineSol) ? DOT + "vs baseline " + fmtSol(row.vsBaselineSol) + " per trade" : "") + (isNum(s.avgHoldSec) ? DOT + "avg hold " + fmtDur(s.avgHoldSec) : "") }));
     }
-    if (row.error) { out.push(el("div", { class: "error-text", text: row.error })); }
+    if (row.error) { out.push(el("div", { class: skipped ? "meta" : "error-text", text: skipped ? "Not run: " + row.error.slice(9) : row.error })); }
     out.push(el("div", { class: "row" }, el("div", { class: "badges" }, badges),
       row.strategyRunId ? el("button", { class: "link-btn", type: "button", text: "Open in Edge", onclick: function () { openLabRun(row.strategyRunId); } }) : null));
     return el("li", { class: "item lab-variant" + (row.isBaseline ? " baseline" : "") }, out);

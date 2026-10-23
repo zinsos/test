@@ -4,7 +4,7 @@ import { isUsablePrice, multipleOf } from "../exits/math.js";
 import { isSwitchedToPool, moonbagTokensOf, sortedTakeProfitLevels, trailFractionFor } from "../exits/rules.js";
 import { readExitState } from "../exits/state.js";
 import type { LaunchState, TradeRecord } from "../market/state.js";
-import { unrealizedPnlOf } from "../trader/accounting.js";
+import { estimatedCloseProceeds, sellFeeBpsFor, sellFeeDefaultsOf, type LastTradeFees } from "./positionQueries.js";
 import { lamportsRatio, lamportsToSol } from "./units.js";
 
 export const SERIES_LOOKBACK_MS = 60_000;
@@ -155,12 +155,31 @@ function finiteOrNull(value: number): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
+function lastTradeFeesOf(launch: LaunchState | undefined): LastTradeFees | null {
+  if (!launch || launch.protocolFeeBps === null) {
+    return null;
+  }
+  return {
+    protocolBps: launch.protocolFeeBps,
+    creatorBps: launch.creatorFeeBps ?? 0,
+    lpBps: launch.venue === "pool" ? (launch.lpFeeBps ?? 0) : 0
+  };
+}
+
+export function estimatedOpenPnl(position: Position, launch: LaunchState | undefined, price: number | null, execution: ExecutionConfig): bigint | null {
+  if (price === null || position.status !== "open" || position.entryTokens <= 0n) {
+    return null;
+  }
+  const defaults = sellFeeDefaultsOf(execution);
+  const fee = sellFeeBpsFor(lastTradeFeesOf(launch), position.migratedSeen || (launch?.migrated ?? false), defaults);
+  return position.proceeds + estimatedCloseProceeds(position.tokensHeld, price, fee, defaults) - position.entryCost;
+}
+
 export function livePositionView(position: Position, launch: LaunchState | undefined, config: LiveConfig, nowMs: number): LivePositionView {
   const spot = launch ? launch.price() : 0;
   const price = isUsablePrice(spot) ? spot : isUsablePrice(position.lastPrice) ? position.lastPrice : null;
   const peakPrice = Math.max(isUsablePrice(position.peakPrice) ? position.peakPrice : 0, price ?? 0);
-  const marked = price !== null && price !== position.lastPrice ? { ...position, lastPrice: price } : position;
-  const pnl = launch || price !== null ? unrealizedPnlOf(marked, launch ? launch.view(nowMs) : null, config.execution) : null;
+  const pnl = estimatedOpenPnl(position, launch, price, config.execution);
   const costSol = lamportsToSol(position.entryCost);
   const pnlSol = pnl === null ? null : lamportsToSol(pnl);
   return {

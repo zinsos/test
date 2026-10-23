@@ -20,6 +20,7 @@ import {
   rankVariants,
   topFeatures,
   trainingWindow,
+  variantNotes,
   type LabResult,
   type LabVariantResult
 } from "../src/lab/index.js";
@@ -97,6 +98,37 @@ describe("lab variants", () => {
     expect(inertReason(strict, changedSettings(enabled, strict))).toBeNull();
     const exits = applyOverrides(baseline, { exits: { timeStop: { afterSec: 120 } } });
     expect(inertReason(exits, changedSettings(baseline, exits))).toBeNull();
+  });
+
+  it("skips variants that only change settings a replay never reads instead of running the baseline under their name", () => {
+    const baseline = defaultStrategyConfig();
+    const inert = [
+      { scorer: { deepIntel: { minBuyersForDeep: 12 } } },
+      { recorder: { outcome: { rugDropFraction: 0.5 } } },
+      { tracker: { topN: 20, backfill: { enabled: false } } },
+      { sweeper: { enabled: true } },
+      { scorer: { deepIntel: { maxWalletsPerLaunch: 5 } }, signals: { scoreMomentum: { maxRiskScore: 20 } } }
+    ];
+    for (const overrides of inert) {
+      const merged = applyOverrides(baseline, overrides);
+      expect(inertReason(merged, changedSettings(baseline, merged))).toMatch(/^only changes /);
+    }
+    const mixed = applyOverrides(baseline, { scorer: { deepIntel: { maxWalletsPerLaunch: 5 } }, signals: { scoreMomentum: { maxRiskScore: 20 } } });
+    expect(inertReason(mixed, changedSettings(baseline, mixed))).toBe(
+      "only changes settings of score_momentum, which signals.enabled does not include and settings a replay does not use (scorer.deepIntel.maxWalletsPerLaunch; the recorder, wallet intel, wallet ranking and sweeper run only live)"
+    );
+    const effective = [
+      { recorder: { memory: { evictInactiveMinutes: 20 } } },
+      { tracker: { convergence: { minWallets: 2 } } },
+      { scorer: { maxRisk: 40 } },
+      { scorer: { deepIntel: { minBuyersForDeep: 12 } }, exits: { maxHoldSec: 900 } }
+    ];
+    for (const overrides of effective) {
+      const merged = applyOverrides(baseline, overrides);
+      expect(inertReason(merged, changedSettings(baseline, merged))).toBeNull();
+    }
+    const { planned } = planVariants(baseline, [{ name: "deep", description: "x", overrides: inert[0] ?? {} }], null, "service config");
+    expect(planned[1]).toMatchObject({ config: null, error: expect.stringMatching(/^skipped: only changes settings a replay does not use \(scorer\.deepIntel\.minBuyersForDeep;/) });
   });
 
   it("parses variant files strictly", () => {
@@ -255,10 +287,19 @@ describe("lab summaries and report", () => {
       changed: [],
       runtimeMs: 1_500,
       events: 1_000,
-      weightsVersion: "hand-v1"
+      weightsVersion: "hand-v1",
+      fingerprint: expectancySol === null ? null : `fp-${expectancySol}`
     });
     const variants = [variant("baseline", 0.001, true), variant("fast-exits", 0.004), variant("quiet", null), variant("broken", null, false, "boom")];
     expect(rankVariants(variants).map((entry) => entry.name)).toEqual(["fast-exits", "baseline", "quiet"]);
+    const notes = variantNotes([...variants, variant("copycat", 0.001)]) as Record<string, { sameTradesAsBaseline: boolean | null }>;
+    expect(Object.fromEntries(Object.entries(notes).map(([name, note]) => [name, note.sameTradesAsBaseline]))).toEqual({
+      baseline: null,
+      "fast-exits": false,
+      quiet: null,
+      broken: null,
+      copycat: true
+    });
     const result: LabResult = {
       labRunId: 7,
       status: "done",
@@ -297,6 +338,9 @@ describe("lab summaries and report", () => {
     expect(text).toContain("weights  backtests scored with hand-v1");
     expect(text).toContain("total 1m05s");
     expect(text).toContain("pruned   3 lab strategy runs (9 positions, 20 fills, 4 signals) and 8 inactive lab weights");
+    expect(text).not.toContain("same trades as the baseline");
+    const withCopy = formatLabReport({ ...result, variants: [...variants, variant("copycat", 0.001)] });
+    expect(withCopy.split("\n").find((line) => line.includes("copycat"))).toMatch(/insufficient_data, same trades as the baseline$/);
   });
 });
 

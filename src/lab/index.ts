@@ -10,6 +10,7 @@ export {
   MAX_LAB_HOURS,
   planVariants,
   runLab,
+  variantNotes,
   type LabProgress,
   type LabResult,
   type LabVariantResult,
@@ -56,5 +57,6 @@ export {
   loadLabVariants,
   parseLabVariants,
   unknownSettings,
+  unusedInReplay,
   type LabVariant
 } from "./variants.js";

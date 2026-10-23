@@ -82,6 +82,7 @@ export interface LabVariantResult {
   runtimeMs: number | null;
   events: number | null;
   weightsVersion: string | null;
+  fingerprint: string | null;
 }
 
 export interface LabResult {
@@ -190,7 +191,8 @@ async function runVariant(ctx: VariantContext, plan: PlannedVariant, variantId: 
     changed: plan.changed,
     runtimeMs: null,
     events: null,
-    weightsVersion: null
+    weightsVersion: null,
+    fingerprint: null
   };
   if (!plan.config) {
     return base;
@@ -220,7 +222,8 @@ async function runVariant(ctx: VariantContext, plan: PlannedVariant, variantId: 
       error: null,
       runtimeMs: ctx.timer() - startedAt,
       events: result.summary.counts.events,
-      weightsVersion: result.summary.weightsVersion
+      weightsVersion: result.summary.weightsVersion,
+      fingerprint: result.summary.fingerprint
     };
   } catch (error) {
     const message = messageOf(error);
@@ -230,14 +233,16 @@ async function runVariant(ctx: VariantContext, plan: PlannedVariant, variantId: 
   }
 }
 
-function variantNotes(results: readonly LabVariantResult[]): JsonObject {
+export function variantNotes(results: readonly LabVariantResult[]): JsonObject {
+  const baseline = results.find((result) => result.isBaseline)?.fingerprint ?? null;
   const notes: JsonObject = {};
   for (const result of results) {
     notes[result.name] = {
       changed: result.changed,
       runtimeMs: result.runtimeMs === null ? null : Math.round(result.runtimeMs),
       events: result.events,
-      weightsVersion: result.weightsVersion
+      weightsVersion: result.weightsVersion,
+      sameTradesAsBaseline: result.isBaseline || baseline === null || result.fingerprint === null ? null : result.fingerprint === baseline
     };
   }
   return notes;

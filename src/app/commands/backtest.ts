@@ -4,6 +4,7 @@ import { formatTradeReport } from "../../backtest/report.js";
 import { runBacktest, type BacktestProgress, type BacktestSummary } from "../../backtest/runner.js";
 import type { SkippedWeights, WeightsProvenance } from "../../backtest/weights.js";
 import { jsonSafe, type Db } from "../../db/pool.js";
+import { isLabLabel, LAB_LABEL_PREFIX } from "../../lab/variants.js";
 import { ScoringModel } from "../../scorer/model.js";
 import { loadWeightsFile, loadWeightsVersion } from "../../scorer/weights.js";
 import { dateOption, flagOption, stringOption, UsageError } from "../args.js";
@@ -89,6 +90,10 @@ export async function backtestCommand(ctx: CommandContext): Promise<number> {
   if (!from || !to || to.getTime() <= from.getTime()) {
     throw new UsageError("--to must be after --from", "backtest");
   }
+  const label = stringOption(ctx.options, "label") ?? null;
+  if (isLabLabel(label)) {
+    throw new UsageError(`labels starting with ${LAB_LABEL_PREFIX} are reserved for lab runs, which dashboards hide and lab pruning deletes`, "backtest");
+  }
   const config = await commandConfig(ctx);
   return withDatabase(ctx, "backtest", async (db) => {
     const weightsSpec = stringOption(ctx.options, "weights");
@@ -98,7 +103,7 @@ export async function backtestCommand(ctx: CommandContext): Promise<number> {
       fromMs: from.getTime(),
       toMs: to.getTime(),
       config,
-      label: stringOption(ctx.options, "label") ?? null,
+      label,
       includeIncomplete: flagOption(ctx.options, "include-incomplete"),
       walkForward: flagOption(ctx.options, "walk-forward"),
       model,

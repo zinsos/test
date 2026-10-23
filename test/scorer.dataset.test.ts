@@ -316,6 +316,27 @@ describe.skipIf(!hasTestDatabase)("scorer persistence", () => {
     expect(labelMaturitySec("migrated", query)).toBe(86_400);
   });
 
+  it("labels a launch that rugged in its first hour as rugged_1h even after it migrated later", async () => {
+    const db = database.db;
+    const asOf = T + 20 * 24 * 60 * MINUTE;
+    const createdAtMs = asOf - 25 * 60 * MINUTE;
+    const id = await insertLaunch(db, { mint: "RugThenMigrated", createdAtMs });
+    await db.query(
+      `INSERT INTO launch_scores (launch_id, checkpoint_sec, mint, computed_at, slot, score, features, contributions, weights_version)
+       VALUES ($1, 85, $2, $3, 1, 40, '{}', '{}', 'v')`,
+      [id, "RugThenMigrated", new Date(createdAtMs + 85_000)]
+    );
+    await insertOutcome(db, id, {
+      migrated: true,
+      finalized: true,
+      survived15m: true,
+      rugAtMs: createdAtMs + 30 * MINUTE,
+      knownAtMs: createdAtMs + 3 * 60 * MINUTE
+    });
+    const rows = await buildDataset(db, { checkpointSec: 85, asOf: new Date(asOf), label: "rugged_1h" });
+    expect(rows.map((row) => [row.mint, row.labels.rugged1h, row.labels.migrated, row.labels.rugged])).toEqual([["RugThenMigrated", true, true, false]]);
+  });
+
   it("saves, activates and loads weights from the database and a file", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "scorer-weights-"));
     try {

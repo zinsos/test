@@ -294,7 +294,7 @@ export class Trader {
     const skip = this.entrySkipReason(launch);
     if (skip || !launch) {
       this.counters.skipped += 1;
-      this.recordSignal(signal, false, skip ?? "launch_not_in_memory", launchId);
+      this.skipSignal(signal, skip ?? "launch_not_in_memory", launchId);
       return;
     }
     const decision = this.risk.evaluateEntry({
@@ -307,7 +307,7 @@ export class Trader {
     });
     if (!decision.allowed) {
       this.counters.rejectedByRisk += 1;
-      this.recordSignal(signal, false, decision.reason ?? "risk_rejected", launchId);
+      this.skipSignal(signal, decision.reason ?? "risk_rejected", launchId);
       return;
     }
     this.enter(signal, launch, decision.sizeLamports, nowMs);
@@ -602,6 +602,11 @@ export class Trader {
     this.counters.closed += 1;
     this.bus.emit("positionClosed", failed);
     this.markToMarket(nowMs);
+  }
+
+  private skipSignal(signal: Signal, reason: string, launchId: number | null): void {
+    this.recordSignal(signal, false, reason, launchId);
+    this.bus.emit("signalSkipped", { signal, reason });
   }
 
   private recordSignal(signal: Signal, acted: boolean, skipReason: string | null, launchId: number | null): void {

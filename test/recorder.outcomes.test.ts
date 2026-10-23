@@ -237,6 +237,13 @@ describe("rug labelling", () => {
     expect(outcome.details.insiderCount).toBe(3);
   });
 
+  it("keeps an early rug open until the 15 minute survival check so survived_15m is never left empty for the worst launches", () => {
+    const early = computeOutcome({ launch: launch(), trades: rugScenario(), nowMs: T0 + 600_000, params });
+    expect(early).toMatchObject({ status: "rugged", outcomeKnownAtMs: T0 + 360_000, finalized: false, survived15m: null, nextCheckAtMs: T0 + 900_000 });
+    const checked = computeOutcome({ launch: launch(), trades: rugScenario(), nowMs: T0 + 900_000, params });
+    expect(checked).toMatchObject({ status: "rugged", finalized: true, survived15m: false, nextCheckAtMs: null });
+  });
+
   it("is not final before the lookahead has passed", () => {
     const outcome = computeOutcome({ launch: launch(), trades: rugScenario(), nowMs: T0 + 200_000, params });
     expect(outcome.status).toBe("rugged");
@@ -306,7 +313,19 @@ describe("rug labelling", () => {
     });
     expect(outcome.status).toBe("migrated");
     expect(outcome.rugged).toBe(false);
-    expect(outcome.rugAtMs).toBeNull();
+    expect(outcome.rugAtMs).toBe(T0 + 60_000);
+  });
+
+  it("keeps the rug time of a launch that migrates later, so rugged_1h never depends on what happened after the first hour", () => {
+    const beforeMigration = computeOutcome({ launch: launch(), trades: rugScenario(), nowMs: T0 + 3_900_000, params });
+    const afterMigration = computeOutcome({
+      launch: launch({ completedAtMs: T0 + 3 * 3_600_000 }),
+      trades: rugScenario(),
+      nowMs: T0 + 4 * 3_600_000,
+      params
+    });
+    expect(beforeMigration).toMatchObject({ status: "rugged", rugged: true, rugAtMs: T0 + 60_000 });
+    expect(afterMigration).toMatchObject({ status: "migrated", rugged: false, rugAtMs: T0 + 60_000 });
   });
 
   it("does not call a dev exit after the pump already faded a rug", () => {

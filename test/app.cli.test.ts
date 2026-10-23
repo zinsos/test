@@ -139,6 +139,12 @@ describe("runCli", () => {
     expect(noDb.errLines[0]).toContain("DATABASE_URL");
   });
 
+  it("refuses backtest labels in the lab namespace before touching the database", async () => {
+    const io = captureIo();
+    expect(await runCli(["backtest", "--from", "2026-10-01", "--to", "2026-10-02", "--label", "lab:3:fast-exits"], io, { env })).toBe(EXIT_USAGE);
+    expect(io.errLines.join("\n")).toContain("reserved for lab runs");
+  });
+
   it("reports an invalid environment as a failure", async () => {
     const io = captureIo();
     const original = process.env.MODULES;

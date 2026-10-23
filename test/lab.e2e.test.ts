@@ -252,6 +252,13 @@ describe.skipIf(!hasTestDatabase)("lab end to end on a recorded synthetic market
     expect(counts.rows[0]?.acted).toBeGreaterThan(0);
   });
 
+  it("reports an explicitly chosen lab run with its label", async () => {
+    const baseline = (await labVariants(first.labRunId))[0];
+    const report = await cli(["report", "--run", String(baseline?.strategy_run_id)]);
+    expect(report.code).toBe(0);
+    expect(report.out.join("\n")).toContain(`(lab:${first.labRunId}:baseline)`);
+  });
+
   it("keeps runtime and per-variant timings in the result and the notes", async () => {
     expect(first.variants).toHaveLength(variants.length + 1);
     for (const variant of first.variants) {
@@ -293,7 +300,13 @@ describe.skipIf(!hasTestDatabase)("lab end to end on a recorded synthetic market
     );
     expect(before.rows[0]?.positions).toBeGreaterThan(0);
     await database.db.query("UPDATE scorer_weights SET active = (version = $1) WHERE active OR version = $1", [`lab-${first.labRunId}-rugged_1h-60`]);
+    const foreign = await database.db.query<{ id: string }>(
+      `INSERT INTO strategy_runs (mode, label, config) VALUES ('backtest', 'lab:notes', '{}'), ('paper', $1, '{}') RETURNING id::text AS id`,
+      [`lab:${first.labRunId}:baseline`]
+    );
     const pruned = await pruneLabRuns(database.db, 1);
+    const survivors = await database.db.query("SELECT 1 FROM strategy_runs WHERE id = ANY($1::bigint[])", [foreign.rows.map((row) => row.id)]);
+    expect(survivors.rowCount).toBe(2);
     expect(pruned.kept).toBe(1);
     expect(pruned.weights).toBe(3);
     const weights = await database.db.query<{ version: string; active: boolean }>(

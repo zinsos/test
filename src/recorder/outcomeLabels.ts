@@ -457,7 +457,8 @@ export function computeOutcome(input: OutcomeInput): LaunchOutcome {
   const postMigrationMs = input.params.postMigrationTrackHours * HOUR_MS;
   const hardStopAtMs = created + config.finalizeAfterHours * HOUR_MS;
   const migrationTrackingDone = status !== "migrated" || (completedAtMs !== null && nowMs >= completedAtMs + postMigrationMs);
-  const statusFinal = outcomeKnownAtMs !== null && nowMs >= outcomeKnownAtMs && migrationTrackingDone;
+  const surviveCheckedAtMs = created + config.surviveCheckSec * SECOND_MS;
+  const statusFinal = outcomeKnownAtMs !== null && nowMs >= outcomeKnownAtMs && migrationTrackingDone && nowMs >= surviveCheckedAtMs;
   const finalized = statusFinal || nowMs >= hardStopAtMs;
 
   const nextCheckAtMs = finalized
@@ -493,7 +494,7 @@ export function computeOutcome(input: OutcomeInput): LaunchOutcome {
     return15mFrom1m: multiple15From1 === null ? null : multiple15From1 - 1,
     devSoldAtMs: dev.firstSellAtMs,
     devSoldFraction: devSoldFractionOf(dev),
-    rugAtMs: rugged ? rug.rugAtMs : null,
+    rugAtMs: rug.rugAtMs,
     completedAtMs,
     lastTradeAtMs,
     tradeCount: trades.length,

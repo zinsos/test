@@ -19,6 +19,7 @@ export interface BusEvents {
   score: LaunchScore;
   signal: Signal;
   signalRejected: SignalRejection;
+  signalSkipped: SignalRejection;
   positionOpened: Position;
   positionUpdated: Position;
   positionClosed: Position;

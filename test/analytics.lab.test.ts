@@ -65,7 +65,8 @@ function variant(overrides: Partial<LabVariantRow> & { expectancy?: number | nul
           }
         : overrides.summary,
     error: overrides.error ?? null,
-    vsBaselineSol: null
+    vsBaselineSol: null,
+    sameTradesAsBaseline: false
   };
 }
 
@@ -244,6 +245,11 @@ async function seed(db: Db): Promise<Seeded> {
   await insertVariant(db, doneRunId, "faster_exits", false, labFasterRunId, summary({ trades: 118, expectancySol: 0.006, ciLowSol: -0.001, ciHighSol: 0.013 }));
   await insertVariant(db, doneRunId, "tight_stop", false, null, summary({ trades: 131, expectancySol: -0.003, ciLowSol: -0.009, ciHighSol: 0.003 }));
   await insertVariant(db, doneRunId, "broken", false, null, null, "replay failed: out of memory");
+  await insertVariant(db, doneRunId, "clone", false, null, summary({ trades: 120, expectancySol: 0.002, ciLowSol: -0.004, ciHighSol: 0.008 }));
+  await db.query(
+    `UPDATE lab_runs SET notes = '{"variants":{"baseline":{"sameTradesAsBaseline":null},"clone":{"sameTradesAsBaseline":true},"faster_exits":{"sameTradesAsBaseline":false}}}'::jsonb WHERE id = $1`,
+    [doneRunId]
+  );
   const runningRunId = await insertLabRun(db, "running", NOW_MS - 5 * 60_000);
   await insertVariant(db, runningRunId, "baseline", true, null, null);
   return { paperRunId, backtestRunId, labBaselineRunId, labFasterRunId, doneRunId, olderRunId, runningRunId };
@@ -278,9 +284,9 @@ describe.skipIf(!hasTestDatabase)("lab queries and run pickers", () => {
     expect(lab.runs).toBe(3);
     expect(lab.latest).toMatchObject({ id: seeded.runningRunId, status: "running", finishedAtMs: null });
     expect(lab.run).toMatchObject({ id: seeded.doneRunId, status: "done", dataFromMs: NOW_MS - 2 * HOUR_MS - 3 * DAY_MS, dataToMs: NOW_MS - 2 * HOUR_MS });
-    expect(lab.run?.notes).toEqual({ variants: 4 });
-    expect(lab.variants.map((row) => row.name)).toEqual(["faster_exits", "baseline", "tight_stop", "broken"]);
-    const [faster, baseline, tight, broken] = lab.variants;
+    expect(lab.variants.map((row) => row.name)).toEqual(["faster_exits", "baseline", "clone", "tight_stop", "broken"]);
+    const [faster, baseline, clone, tight, broken] = lab.variants;
+    expect([faster, baseline, clone, tight, broken].map((row) => row?.sameTradesAsBaseline)).toEqual([false, false, true, false, false]);
     expect(baseline).toMatchObject({ isBaseline: true, strategyRunId: seeded.labBaselineRunId, vsBaselineSol: null, description: "baseline description" });
     expect(faster?.vsBaselineSol).toBeCloseTo(0.004, 12);
     expect(tight?.vsBaselineSol).toBeCloseTo(-0.005, 12);
@@ -297,7 +303,7 @@ describe.skipIf(!hasTestDatabase)("lab queries and run pickers", () => {
     const response = await get("/api/lab");
     expect(response.status).toBe(200);
     expect((response.body.run as Record<string, unknown>).id).toBe(seeded.doneRunId);
-    expect((response.body.variants as unknown[]).length).toBe(4);
+    expect((response.body.variants as unknown[]).length).toBe(5);
   });
 
   it("keeps lab backtests out of automatic run and mode pickers unless a run is chosen explicitly", async () => {

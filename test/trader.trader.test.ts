@@ -171,11 +171,18 @@ describe("trader entry gating", () => {
     await createLaunch(env, MINT_B, T0 + 1_000);
     await createLaunch(env, MINT_C, T0 + 2_000, { quoteMint: PUMP_QUOTE });
     await env.clock.advanceTo(T0 + 5_000);
+    const skippedOnBus: string[] = [];
+    env.bus.on("signalSkipped", (skip) => skippedOnBus.push(`${skip.signal.mint}:${skip.reason}`));
     trader.handleSignal(signalFor(env, MINT_A));
     trader.handleSignal(signalFor(env, MINT_B));
     trader.handleSignal(signalFor(env, MINT_C));
     trader.handleSignal(signalFor(env, "UnknownMint111111111111111111111111111111111"));
     trader.recordRejection(signalFor(env, MINT_B), "risk_too_high");
+    expect(skippedOnBus).toEqual([
+      `${MINT_B}:max_concurrent`,
+      `${MINT_C}:quote_mint_not_tradable`,
+      "UnknownMint111111111111111111111111111111111:launch_not_in_memory"
+    ]);
     await flushMicrotasks();
     expect(store.signals.map((signal) => [signal.acted, signal.skipReason])).toEqual([
       [true, null],

@@ -434,6 +434,24 @@ describe("live tab", () => {
     expect(text()).toContain("No open positions.");
   });
 
+  it("keeps rare trade events in the feed while hundreds of scores stream past", async () => {
+    const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder: liveResponder(LIVE_STATUS) });
+    const stream = dashboard.streams[0];
+    stream?.open();
+    stream?.send("hello", { streamId: "s9", serverTimeMs: READ_AT_MS, tradingActive: true, maxClients: 10, clients: 1, heartbeatMs: 15_000, positions: [] });
+    stream?.send("message", liveEvent(1, "closed", "trade", "Closed $OLD: +0.010 SOL (+13.3%), take profit after 4m", { positionId: "gone" }), "s9:1");
+    for (let id = 2; id <= 800; id += 1) {
+      stream?.send("message", liveEvent(id, "score", "score", `Scored $S${id} 60s: 40 (clean)`), `s9:${id}`);
+    }
+    await dashboard.flush();
+    await dashboard.change("Show", "trades");
+    expect(dashboard.find("feed-text").map((node) => node.textContent)).toEqual(["Closed $OLD: +0.010 SOL (+13.3%), take profit after 4m"]);
+    await dashboard.change("Show", "scores");
+    const scores = dashboard.find("feed-text");
+    expect(scores).toHaveLength(300);
+    expect(scores[0]?.textContent).toBe("Scored $S800 60s: 40 (clean)");
+  });
+
   it("reconnects after the stream closes or stalls", async () => {
     const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder: liveResponder(LIVE_STATUS) });
     const first = dashboard.streams[0];

@@ -31,6 +31,7 @@ export const DEFAULT_HEARTBEAT_MS = 15_000;
 export const DEFAULT_UPDATE_THROTTLE_MS = 2_000;
 export const DEFAULT_MAX_BUFFERED_BYTES = 512 * 1024;
 export const DEFAULT_SKIP_LOOKUP_DELAY_MS = 2_500;
+export const DEFAULT_MAX_CONGESTED_MS = 30_000;
 export const DEFAULT_RING_SIZES: Readonly<Record<RingClass, number>> = { trade: 150, rejected: 75, score: 75 };
 const RETRY_MS = 3_000;
 const RESERVATION_MATCH_MS = 5_000;
@@ -66,6 +67,7 @@ export interface LiveHubOptions {
   ringSizes?: Partial<Record<RingClass, number>>;
   maxBufferedBytes?: number;
   skipLookupDelayMs?: number;
+  maxCongestedMs?: number;
 }
 
 export interface LiveStatus {
@@ -93,6 +95,7 @@ export interface LiveHello {
 interface StreamClient {
   res: ServerResponse;
   congested: boolean;
+  congestedSinceMs: number;
   dropped: number;
 }
 
@@ -141,11 +144,13 @@ export class LiveHub {
   private readonly ringSizes: Record<RingClass, number>;
   private readonly maxBufferedBytes: number;
   private readonly skipLookupDelayMs: number;
+  private readonly maxCongestedMs: number;
   private readonly rings: Record<RingClass, LiveEvent[]> = { trade: [], rejected: [], score: [] };
   private readonly watches = new Map<string, PositionWatch>();
   private readonly byMint = new Map<Pubkey, Set<string>>();
   private readonly references = new Map<Pubkey, ReferencePrice>();
   private readonly reservations = new Map<Pubkey, number>();
+  private readonly skips = new Map<Pubkey, number>();
   private readonly clients = new Set<StreamClient>();
   private readonly lookups = new Set<TimerHandle>();
   private unsubscribers: Array<() => void> = [];
@@ -170,6 +175,7 @@ export class LiveHub {
     this.ringSizes = { ...DEFAULT_RING_SIZES, ...options.ringSizes };
     this.maxBufferedBytes = options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
     this.skipLookupDelayMs = options.skipLookupDelayMs ?? DEFAULT_SKIP_LOOKUP_DELAY_MS;
+    this.maxCongestedMs = options.maxCongestedMs ?? DEFAULT_MAX_CONGESTED_MS;
     this.streamId = randomBytes(6).toString("hex");
   }
 
@@ -182,6 +188,7 @@ export class LiveHub {
       bus.on("score", (score) => this.onScore(score)),
       bus.on("signal", (signal) => this.onSignal(signal)),
       bus.on("signalRejected", (rejection) => this.onRejected(rejection)),
+      bus.on("signalSkipped", (skip) => this.onSkipped(skip)),
       bus.on("risk", (event) => this.onRisk(event)),
       bus.on("positionOpened", (position) => this.onOpened(position)),
       bus.on("positionUpdated", (position) => this.onUpdated(position)),
@@ -264,7 +271,7 @@ export class LiveHub {
     res.writeHead(200, SSE_HEADERS);
     req.socket.setNoDelay(true);
     req.socket.setKeepAlive(true);
-    const client: StreamClient = { res, congested: false, dropped: 0 };
+    const client: StreamClient = { res, congested: false, congestedSinceMs: 0, dropped: 0 };
     this.clients.add(client);
     res.on("close", () => this.drop(client));
     res.on("error", () => this.drop(client));
@@ -342,6 +349,12 @@ export class LiveHub {
       return;
     }
     if (client.congested) {
+      if (this.clock.nowMs() - client.congestedSinceMs > this.maxCongestedMs) {
+        log.warn({ dropped: client.dropped }, "live stream client stuck, disconnecting");
+        res.destroy();
+        this.drop(client);
+        return;
+      }
       client.dropped += 1;
       return;
     }
@@ -353,6 +366,7 @@ export class LiveHub {
     }
     if (!res.write(chunk)) {
       client.congested = true;
+      client.congestedSinceMs = this.clock.nowMs();
       res.once("drain", () => this.onDrain(client));
     }
   }
@@ -535,9 +549,11 @@ export class LiveHub {
         this.references.delete(mint);
       }
     }
-    for (const [mint, atMs] of this.reservations) {
-      if (nowMs - atMs > REFERENCE_TTL_MS || this.reservations.size > MAX_TRACKED_MINTS) {
-        this.reservations.delete(mint);
+    for (const decisions of [this.reservations, this.skips]) {
+      for (const [mint, atMs] of decisions) {
+        if (nowMs - atMs > REFERENCE_TTL_MS || decisions.size > MAX_TRACKED_MINTS) {
+          decisions.delete(mint);
+        }
       }
     }
   }
@@ -571,12 +587,17 @@ export class LiveHub {
     }
   }
 
+  private decided(mint: Pubkey, seenAtMs: number): boolean {
+    const reservedAtMs = this.reservations.get(mint);
+    const skippedAtMs = this.skips.get(mint);
+    return (
+      (reservedAtMs !== undefined && reservedAtMs >= seenAtMs - RESERVATION_MATCH_MS) ||
+      (skippedAtMs !== undefined && skippedAtMs >= seenAtMs - RESERVATION_MATCH_MS)
+    );
+  }
+
   private checkEntered(signal: Signal, seenAtMs: number): void {
-    if (this.stopped) {
-      return;
-    }
-    const reservedAtMs = this.reservations.get(signal.mint);
-    if (reservedAtMs !== undefined && reservedAtMs >= seenAtMs - RESERVATION_MATCH_MS) {
+    if (this.stopped || this.decided(signal.mint, seenAtMs)) {
       return;
     }
     const lookup = this.skipReason;
@@ -586,15 +607,24 @@ export class LiveHub {
     }
     const handle = this.clock.schedule(this.clock.nowMs() + this.skipLookupDelayMs, () => {
       this.lookups.delete(handle);
+      if (this.stopped || this.decided(signal.mint, seenAtMs)) {
+        return undefined;
+      }
       return lookup(signal)
         .catch(() => null)
         .then((reason) => {
-          if (!this.stopped) {
+          if (!this.stopped && !this.decided(signal.mint, seenAtMs)) {
             this.publish(skippedEvent(signal, reason, this.symbolOf(signal.mint), this.clock.nowMs()));
           }
         });
     });
     this.lookups.add(handle);
+  }
+
+  private onSkipped(skip: SignalRejection): void {
+    const nowMs = this.clock.nowMs();
+    this.skips.set(skip.signal.mint, nowMs);
+    this.publish(skippedEvent(skip.signal, skip.reason, this.symbolOf(skip.signal.mint), nowMs));
   }
 
   private onRejected(rejection: SignalRejection): void {

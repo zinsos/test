@@ -35,7 +35,8 @@ Solana RPC websocket (logsSubscribe: Pump + PumpSwap)
 | `src/risk` | Sizing, concurrency, daily loss limit, drawdown kill switch, hot to cold sweeper |
 | `src/trader` | Orchestrates signal -> risk -> executor -> position -> exits; trading store; pending live entries and wallet reconciliation (`pending.ts`) |
 | `src/backtest` | Replays recorded data through the same trader with a virtual clock; out-of-sample weight selection (`weights.ts`) |
-| `src/analytics` | Metrics, queries, HTTP API and dashboard |
+| `src/analytics` | Metrics, queries, HTTP API and dashboard, live event hub (`liveHub.ts`, Server-Sent Events) and Lab views |
+| `src/lab` | Fast training loop: scorer training on fast labels and backtest replays of strategy variants (`config/lab-variants.json`), stored in `lab_runs` and `lab_variants` |
 
 ## Time and determinism
 
@@ -51,6 +52,7 @@ Every component takes a `Clock`. Live uses `SystemClock`. Backtests use `Virtual
 - Launches with gaps are replayed in full. `launches.data_incomplete_at` marks the moment their data became incomplete, and the trader skips entries only from then on (`--include-incomplete` turns this off). Restart gaps come from `recorder_checkpoints` coverage, not from the fact of a restart.
 - Outcome labels (insider sells, rug detection) use the insiders stored in `launch_scores`, so memory, the finaliser and a recompute agree.
 - Backtests without `--weights` skip scorer weights whose training window ends after `--from` unless `--allow-in-sample` is set.
+- Fast labels: `survived_15m` enters a dataset once the launch is `surviveCheckSec` + 5 minutes old, `rugged_1h` (insider dump and collapse within the first hour) once it is 1 hour + `rugLookaheadSec` old and its outcome was recomputed after the hour. `launch_outcomes.rug_at` keeps the rug time even when the launch migrates later (`rugged` stays false), and outcomes never finalize before the survival check, so neither fast label depends on what happened after it matured. Training splits by launch time and validates on the newest 30%.
 
 ## Data flow per launch
 
@@ -82,3 +84,8 @@ Only the canonical PumpSwap pool of a launch (the pool PDA for its own quote min
 - Optimizer: `GET /api/export/scorer-dataset.csv` returns one row per launch and checkpoint with every feature and outcome label.
 - Tracked wallets: the view `snypra_tracked_wallets` (migration `072`) or `GET /api/wallets/tracked`. Both exclude walk-forward runs; a hand-written join to the latest `wallet_rank_runs` row would not.
 - Signals: `signals` table and `GET /api/signals/recent`.
+
+## Live tab and Lab
+
+- `GET /api/live/stream` is a Server-Sent Events stream from `LiveHub` in the service that runs the dashboard (scores, accepted, rejected and skipped signals, buys, sells, closes, risk notices, throttled position updates). EventSource cannot send headers, so the token comes as `?token=`. At most 10 streams; a client whose socket stays congested for 30s is disconnected, events are dropped (and counted in a `gap` message) instead of buffered. The replay ring keeps trades, rejections and scores in separate classes so scores never push trades out. `GET /api/live/position/:id/series` returns in-memory prices and exit levels of an open position; its PnL estimate uses the same fee, close-cost and rent-refund formula as the Trades tab.
+- `lab` (CLI) trains the scorer on fast labels (weights saved inactive as `lab-<run>-<label>-<checkpoint>`), then replays the last hours for the baseline and each variant one at a time through `runBacktest` (no rejected signals stored). Variants that only touch settings a replay never reads (recorder, wallet intel, wallet ranking, sweeper, disabled signals) are recorded as `skipped: ...`, and `notes.variants.<name>.sameTradesAsBaseline` flags a variant that traded exactly like the baseline. Lab backtests are `strategy_runs` labelled `lab:<labRunId>:<variant>`; every automatic run or mode pick in the dashboard and `report` leaves them out, and `backtest --label lab:...` is refused. Each lab run prunes lab backtests of all but the latest 20 lab runs. The lab is a separate process: on the 1-CPU VPS run it with `nice` and a heap cap, it re-reads the replay window from Postgres for each variant.

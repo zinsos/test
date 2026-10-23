@@ -3,7 +3,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { thresholdsOf } from "../src/analytics/liveEvents.js";
 import { LiveHub, type LiveHubOptions } from "../src/analytics/liveHub.js";
-import { downsamplePoints, exitLevels } from "../src/analytics/liveSeries.js";
+import { downsamplePoints, exitLevels, livePositionView } from "../src/analytics/liveSeries.js";
+import { estimatedCloseProceeds, sellFeeBpsFor, sellFeeDefaultsOf } from "../src/analytics/positionQueries.js";
+import { lamportsToSol } from "../src/analytics/units.js";
 import { startAnalyticsServer, type AnalyticsServer } from "../src/analytics/server.js";
 import { defaultStrategyConfig } from "../src/config/strategy.js";
 import { Bus } from "../src/core/bus.js";
@@ -445,6 +447,36 @@ describe("live hub", () => {
     expect(hub.recentEvents()[2]?.text).toBe("Signal $XYZ: smart convergence, risk 18, 3 tracked wallets, mcap 42 SOL");
   });
 
+  it("reports trader skips the moment the trader decides, with its exact reason, and no false skip when the reservation comes late", async () => {
+    const lookups: string[] = [];
+    const { hub, clock, bus } = setup({
+      tradingActive: () => true,
+      skipReason: (skipped) => {
+        lookups.push(skipped.mint);
+        return Promise.resolve("max_concurrent");
+      }
+    });
+    bus.on("signal", (seen) => {
+      if (seen.mint === OTHER_MINT) {
+        bus.emit("signalSkipped", { signal: seen, reason: "dev_daily_limit" });
+      }
+    });
+    bus.emit("signal", signal({ mint: OTHER_MINT }));
+    await Promise.resolve();
+    expect(hub.recentEvents().map((event) => event.text)).toEqual([
+      "Signal $XYZ: score momentum, risk 18, mcap 42 SOL",
+      "Skipped $XYZ: dev's daily entry limit reached"
+    ]);
+    bus.emit("signal", signal());
+    await Promise.resolve();
+    await clock.advanceTo(clock.nowMs() + 1_000);
+    bus.emit("risk", { runId: 7, atMs: clock.nowMs(), kind: "entry_reserved", detail: { mint: MINT, sizeLamports: "50000000", signalType: "score_momentum" } });
+    await clock.advanceTo(clock.nowMs() + 5_000);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(lookups).toEqual([]);
+    expect(hub.recentEvents().map((event) => event.kind)).toEqual(["signal", "skipped", "signal", "entering"]);
+  });
+
   it("shows rejections from the real signal engine", () => {
     const { hub, clock, bus, market } = setup();
     const engine = new SignalEngine({
@@ -505,6 +537,38 @@ describe("live hub", () => {
     bus.emit("score", score({ score: 5 }));
     expect(stuck.destroyed).toBe(true);
     expect(hub.clientCount()).toBe(1);
+  });
+
+  it("disconnects a client that stays congested, so stale connections cannot hold the stream slots", async () => {
+    const { hub, bus, clock } = setup({ maxCongestedMs: 30_000, heartbeatMs: 15_000 });
+    const startMs = clock.nowMs();
+    const res = connectFake(hub);
+    res.accept = false;
+    bus.emit("score", score({ score: 1 }));
+    await clock.advanceTo(startMs + 30_000);
+    expect(res.destroyed).toBe(false);
+    expect(hub.clientCount()).toBe(1);
+    await clock.advanceTo(startMs + 45_000);
+    expect(res.destroyed).toBe(true);
+    expect(hub.clientCount()).toBe(0);
+    expect(clock.pendingCount()).toBe(0);
+  });
+
+  it("estimates open PnL exactly like the Trades tab: fee-netted spot value, close transaction cost and rent refund", async () => {
+    const { market, clock, apply } = setup();
+    await clock.advanceTo(T0 + 1_000);
+    apply(tradeAt(MINT, 3, T0 + 500, 1_001));
+    const held = position({ tokensHeld: ENTRY_TOKENS / 2n, proceeds: 60_000_000n, takeProfitLevelsHit: 1 });
+    const launch = market.get(MINT);
+    const view = livePositionView(held, launch, { exits: config.exits, execution: config.execution }, T0 + 1_000);
+    const defaults = sellFeeDefaultsOf(config.execution);
+    expect(defaults.rentRefundLamports).toBeGreaterThan(0n);
+    const fee = sellFeeBpsFor({ protocolBps: 95, creatorBps: 30, lpBps: 0 }, false, defaults);
+    const price = launch?.price() ?? 0;
+    const expected = held.proceeds + estimatedCloseProceeds(held.tokensHeld, price, fee, defaults) - held.entryCost;
+    expect(view.price).toBe(price);
+    expect(view.pnlEstimateSol).toBe(lamportsToSol(expected));
+    expect(livePositionView({ ...held, status: "pending", entryTokens: 0n }, launch, { exits: config.exits, execution: config.execution }, T0 + 1_000).pnlEstimateSol).toBeNull();
   });
 
   it("restores open positions from the trader on connect and sends them in hello", () => {

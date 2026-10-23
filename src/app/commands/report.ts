@@ -65,7 +65,7 @@ export async function reportCommand(ctx: CommandContext): Promise<number> {
     };
     const trades = await loadClosedTrades(db, filter);
     const summary = summarizeTrades(trades);
-    const run = runId === undefined ? undefined : (await loadRuns(db, { limit: 1_000 })).find((entry) => entry.id === runId);
+    const run = runId === undefined ? undefined : (await loadRuns(db, { limit: 1_000, includeLab: true })).find((entry) => entry.id === runId);
     ctx.io.out(
       formatTradeReport({
         title: runId === undefined ? `${mode ?? "all"} trades` : `run ${runId}`,

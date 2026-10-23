@@ -76,7 +76,9 @@ function scorerLines(result: LabResult): string[] {
 
 function leaderboardLines(result: LabResult): string[] {
   const ranked = rankVariants(result.variants);
-  const baseline = result.variants.find((variant) => variant.isBaseline)?.summary ?? null;
+  const baselineRun = result.variants.find((variant) => variant.isBaseline) ?? null;
+  const baseline = baselineRun?.summary ?? null;
+  const baselineFingerprint = baselineRun?.fingerprint ?? null;
   const lines = ["leaderboard (sorted by expectancy per trade; * = baseline)"];
   if (ranked.length === 0) {
     lines.push("  no variant finished");
@@ -91,10 +93,11 @@ function leaderboardLines(result: LabResult): string[] {
       return;
     }
     const ci = summary.ciLowSol === null || summary.ciHighSol === null ? "n/a" : `[${signed(summary.ciLowSol)}, ${signed(summary.ciHighSol)}]`;
+    const same = !variant.isBaseline && baselineFingerprint !== null && variant.fingerprint === baselineFingerprint;
     const delta =
       variant.isBaseline || baseline?.expectancySol == null || summary.expectancySol === null ? "" : signed(summary.expectancySol - baseline.expectancySol);
     lines.push(
-      `  ${String(index + 1).padStart(2)}  ${`${variant.name}${variant.isBaseline ? " *" : ""}`.padEnd(26)} ${String(summary.trades).padStart(6)} ${pct(summary.winRate).padStart(6)} ${signed(summary.expectancySol).padStart(10)} ${ci.padStart(21)} ${signed(summary.totalPnlSol, 3).padStart(9)} ${summary.maxDrawdownSol.toFixed(3).padStart(7)} ${holdText(summary.avgHoldSec).padStart(6)}  ${delta.padStart(9)}  ${summary.verdict}`
+      `  ${String(index + 1).padStart(2)}  ${`${variant.name}${variant.isBaseline ? " *" : ""}`.padEnd(26)} ${String(summary.trades).padStart(6)} ${pct(summary.winRate).padStart(6)} ${signed(summary.expectancySol).padStart(10)} ${ci.padStart(21)} ${signed(summary.totalPnlSol, 3).padStart(9)} ${summary.maxDrawdownSol.toFixed(3).padStart(7)} ${holdText(summary.avgHoldSec).padStart(6)}  ${delta.padStart(9)}  ${summary.verdict}${same ? ", same trades as the baseline" : ""}`
     );
   });
   for (const variant of result.variants.filter((entry) => entry.summary === null)) {

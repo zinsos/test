@@ -79,20 +79,43 @@ const SIGNAL_SCOPED: ReadonlyArray<{ prefix: string; signal: StrategyConfig["sig
   { prefix: "tracker.convergence.", signal: "smart_convergence" }
 ];
 
+const REPLAY_UNUSED: ReadonlyArray<{ prefix: string; except: string | null }> = [
+  { prefix: "recorder.", except: "recorder.memory." },
+  { prefix: "scorer.deepIntel.", except: null },
+  { prefix: "tracker.", except: "tracker.convergence." },
+  { prefix: "sweeper.", except: null }
+];
+
+export function unusedInReplay(setting: string): boolean {
+  return REPLAY_UNUSED.some((entry) => setting.startsWith(entry.prefix) && !(entry.except !== null && setting.startsWith(entry.except)));
+}
+
 export function inertReason(merged: StrategyConfig, changed: readonly string[]): string | null {
   if (changed.length === 0) {
     return "identical to the baseline strategy";
   }
   const enabled = new Set(merged.signals.enabled);
   const disabledSignals = new Set<string>();
+  const unused: string[] = [];
   for (const setting of changed) {
+    if (unusedInReplay(setting)) {
+      unused.push(setting);
+      continue;
+    }
     const scope = SIGNAL_SCOPED.find((entry) => setting.startsWith(entry.prefix));
     if (!scope || enabled.has(scope.signal)) {
       return null;
     }
     disabledSignals.add(scope.signal);
   }
-  return `only changes settings of ${[...disabledSignals].join(" and ")}, which signals.enabled does not include`;
+  const parts: string[] = [];
+  if (disabledSignals.size > 0) {
+    parts.push(`settings of ${[...disabledSignals].join(" and ")}, which signals.enabled does not include`);
+  }
+  if (unused.length > 0) {
+    parts.push(`settings a replay does not use (${unused.join(", ")}; the recorder, wallet intel, wallet ranking and sweeper run only live)`);
+  }
+  return `only changes ${parts.join(" and ")}`;
 }
 
 export function parseLabVariants(raw: unknown): LabVariant[] {

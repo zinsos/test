@@ -160,7 +160,8 @@ const PRUNABLE_RUNS_SQL = `
 WITH kept AS (SELECT id FROM lab_runs ORDER BY id DESC LIMIT $1)
 SELECT r.id
   FROM strategy_runs r
- WHERE r.label LIKE '${LAB_LABEL_PREFIX}%'
+ WHERE r.mode = 'backtest'
+   AND r.label ~ '^${LAB_LABEL_PREFIX}[0-9]+:'
    AND NOT EXISTS (SELECT 1 FROM kept k WHERE r.label LIKE '${LAB_LABEL_PREFIX}' || k.id || ':%')`;
 
 const PRUNE_WEIGHTS_SQL = `

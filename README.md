@@ -113,7 +113,7 @@ Run commands with `node dist/src/main.js <command>`, or `npx tsx src/main.ts <co
 | `start` | Run the services listed in `MODULES`. Shuts down cleanly on SIGINT and SIGTERM: stops the stream, finishes in-flight orders, flushes writers and closes the database. |
 | `migrate` | Apply database migrations. |
 | `backtest --from 2026-10-01 --to 2026-10-15 [--label x] [--config f] [--weights file-or-version] [--allow-in-sample] [--walk-forward] [--include-incomplete] [--json]` | Replay a date range (UTC, `--to` exclusive). It records a `strategy_runs` row with mode `backtest`, prints the report and stores the summary on the run. |
-| `tune-scorer --checkpoint 30 --label rugged [--from --to] [--activate] [--write-file] [--version name]` | Fit weights against `rugged`, `died`, `survived_15m` or `migrated`. Prints feature AUCs and validation AUC, then stores the new version. It uses only launches older than `recorder.outcome.finalizeAfterHours`, whose labels are final, and keeps the `solo` weights of the current model. |
+| `tune-scorer --checkpoint 30 --label rugged [--from --to] [--activate] [--write-file] [--version name]` | Fit weights against `rugged`, `died`, `survived_15m`, `rugged_1h` or `migrated`. Prints feature AUCs and validation AUC, then stores the new version. It uses only launches whose label has matured (`recorder.outcome.finalizeAfterHours` for the 24h labels, about 20 and 65 minutes for `survived_15m` and `rugged_1h`) and keeps the `solo` weights of the current model. |
 | `export-dataset --checkpoint 30 --out scorer.csv [--from --to] [--quote SOL]` | Write one row per launch with every feature and outcome label, for SNYPRA's optimizer. Use `--out -` for stdout. Launches younger than `recorder.outcome.finalizeAfterHours` are left out because their labels can still change. |
 | `rank-wallets [--as-of 2026-10-15]` | Rank wallets now, or as of a past time using only data before it. |
 | `backfill-wallets [--top 200] [--since-days 90]` | Fetch on-chain history for the latest ranking's top wallets. Needs `RPC_HTTP_URL`. |
@@ -122,6 +122,7 @@ Run commands with `node dist/src/main.js <command>`, or `npx tsx src/main.ts <co
 | `reset-kill --run 12 [--reason "..."]` | Clear the drawdown kill switch. A running trader picks the reset up within 30 seconds. |
 | `recompute-outcomes [--from --to]` | Relabel outcomes after changing `recorder.outcome` settings. Defaults to the last 30 days. |
 | `prune-data --keep-days 100 [--dry-run]` | Free disk space: drop trade partitions, launch scores and holder snapshots older than the kept window. |
+| `lab [--hours 6] [--max-variants N] [--labels survived_15m,rugged_1h,migrated] [--variants file] [--json]` | The fast training loop shown on the dashboard's Lab tab. Trains the scorer on fast labels (`survived_15m` after about 20 minutes, `rugged_1h` after about 65) and saves the weights inactive, then replays the last hours for the current strategy and each variant in `config/lab-variants.json`. Variants that cannot change a replay are listed as skipped. Keeps the backtests of the latest 20 lab runs; `lab --prune-keep N` only prunes. On a small server run it as `nice -n 15 node --expose-gc --max-old-space-size=384 dist/src/main.js lab --hours 3`. |
 
 How a backtest works:
 

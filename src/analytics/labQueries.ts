@@ -54,6 +54,7 @@ export interface LabVariantRow {
   summary: LabVariantSummary | null;
   error: string | null;
   vsBaselineSol: number | null;
+  sameTradesAsBaseline: boolean;
 }
 
 export interface LabFeature {
@@ -299,7 +300,8 @@ function variantFromRecord(row: DbRecord): LabVariantRow {
     strategyRunId: runId === null || runId === undefined ? null : toNumber(runId),
     summary: parseVariantSummary(row.summary),
     error: textOrNull(row.error),
-    vsBaselineSol: null
+    vsBaselineSol: null,
+    sameTradesAsBaseline: false
   };
 }
 
@@ -309,6 +311,14 @@ function withBaselineDelta(rows: readonly LabVariantRow[]): LabVariantRow[] {
   return rows.map((row) => {
     const own = expectancyOf(row);
     return { ...row, vsBaselineSol: base === null || own === null || row.isBaseline ? null : own - base };
+  });
+}
+
+export function withRunNotes(rows: readonly LabVariantRow[], notes: Record<string, unknown>): LabVariantRow[] {
+  const byName = isRecord(notes.variants) ? notes.variants : {};
+  return rows.map((row) => {
+    const note = byName[row.name];
+    return { ...row, sameTradesAsBaseline: !row.isBaseline && isRecord(note) && note.sameTradesAsBaseline === true };
   });
 }
 
@@ -387,7 +397,7 @@ export async function loadLabOverview(db: Db, options: { historyLimit?: number }
     if (!run) {
       return emptyLabOverview(true);
     }
-    const variants = await loadLabVariants(db, run.id);
+    const variants = withRunNotes(await loadLabVariants(db, run.id), run.notes);
     return {
       available: true,
       runs,

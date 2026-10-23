@@ -1,7 +1,7 @@
 export const LIVE_VIEW_SCRIPT = String.raw`
   var LIVE_FILTERS = [["all", "Everything"], ["trades", "Trades only"], ["signals", "Signals"], ["scores", "Scores"]];
   var LIVE_FEED_MAX = 300;
-  var LIVE_FEED_KEEP = 600;
+  var LIVE_FEED_KEEP = { score: 300, rejected: 150, other: 300 };
   var LIVE_POINTS_KEEP = 600;
   var LIVE_SERIES_MS = 10000;
   var LIVE_STALL_MS = 45000;
@@ -104,6 +104,20 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     liveUpdatePause();
   }
 
+  function liveFeedClass(event) {
+    if (event.kind === "score") { return "score"; }
+    return event.kind === "rejected" ? "rejected" : "other";
+  }
+  function liveTrimFeed() {
+    var excess = { score: -LIVE_FEED_KEEP.score, rejected: -LIVE_FEED_KEEP.rejected, other: -LIVE_FEED_KEEP.other };
+    live.feed.forEach(function (event) { excess[liveFeedClass(event)] += 1; });
+    if (excess.score <= 0 && excess.rejected <= 0 && excess.other <= 0) { return; }
+    live.feed = live.feed.filter(function (event) {
+      var kind = liveFeedClass(event);
+      if (excess[kind] > 0) { excess[kind] -= 1; return false; }
+      return true;
+    });
+  }
   function liveAdd(event) {
     if (!event || !isNum(event.id) || event.id <= live.lastId) { return; }
     live.lastId = event.id;
@@ -111,7 +125,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     if (event.kind === "position") { livePositionUpdate(event.data, event.atMs); return; }
     if (event.kind === "closed" && event.data) { liveRemoveCard(event.data.positionId); }
     live.feed.push(event);
-    if (live.feed.length > LIVE_FEED_KEEP) { live.feed.splice(0, live.feed.length - LIVE_FEED_KEEP); }
+    liveTrimFeed();
     if (live.paused) { live.held += 1; liveUpdatePause(); return; }
     livePrepend(event);
   }
