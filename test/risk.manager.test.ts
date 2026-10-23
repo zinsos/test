@@ -110,6 +110,16 @@ describe("risk manager entry rejections", () => {
     expect(risk.evaluateEntry(entry("MintC", "DevC", NOON_UTC + 120_000)).allowed).toBe(true);
   });
 
+  it("counts entries the trader still reports as pending even after their reservation expired", () => {
+    const { risk } = manager({ config: riskConfig({ maxConcurrent: 1 }) });
+    expect(risk.evaluateEntry(entry("MintA", DEV_A, NOON_UTC)).allowed).toBe(true);
+    const later = NOON_UTC + 10 * 60_000;
+    expect(risk.evaluateEntry({ ...entry("MintB", DEV_B, later), pendingMints: ["MintA"] }).reason).toBe("max_concurrent");
+    expect(risk.evaluateEntry({ ...entry("MintA", DEV_B, later), pendingMints: ["MintA"] }).reason).toBe("max_concurrent");
+    const roomy = manager({ config: riskConfig({ maxConcurrent: 2 }) }).risk;
+    expect(roomy.evaluateEntry({ ...entry("MintA", DEV_B, later), pendingMints: ["MintA"] }).reason).toBe("already_holding_mint");
+  });
+
   it("hands a reservation over to the opened position", () => {
     const { risk } = manager({ config: riskConfig({ maxConcurrent: 2 }) });
     expect(risk.evaluateEntry(entry("MintA", DEV_A, NOON_UTC)).allowed).toBe(true);
@@ -221,6 +231,19 @@ describe("risk manager kill switch", () => {
     expect(risk.status().peakEquityLamports).toBe(3_750_000_000n);
     expect(risk.evaluateEntry(entry("MintA", DEV_A, NOON_UTC + 48 * HOUR)).allowed).toBe(true);
     expect(store.kinds()).toContain("kill_reset");
+  });
+
+  it("never trips a zero fraction limit without an actual loss, and trips it on any loss", () => {
+    const { risk } = manager({ config: riskConfig({ killSwitchDrawdownFraction: 0, dailyLossLimitFraction: 0 }) });
+    risk.markToMarket(0n, NOON_UTC);
+    risk.markToMarket(SOL, NOON_UTC + 1000);
+    expect(risk.isKilled()).toBe(false);
+    expect(risk.isHaltedForDay()).toBe(false);
+    risk.markToMarket(SOL - 1n, NOON_UTC + 2000);
+    expect(risk.isKilled()).toBe(true);
+    expect(risk.isHaltedForDay()).toBe(false);
+    risk.markToMarket(-1n, NOON_UTC + 3000);
+    expect(risk.isHaltedForDay()).toBe(true);
   });
 
   it("does not flatten when flattening is disabled", () => {

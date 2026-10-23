@@ -5,7 +5,7 @@ import { moduleLogger } from "../core/logger.js";
 import type { Pubkey } from "../core/types.js";
 import type { Db } from "../db/pool.js";
 import { fundingTransfer, type IncomingTransfer } from "./funding.js";
-import { loadHubFacts, loadIntelRows, markHubs, saveIntelRow, type HubFacts } from "./intelStore.js";
+import { fundingBurstKey, loadHubFacts, loadIntelRows, markHubs, saveIntelRow, type HubFacts } from "./intelStore.js";
 import { LruCache } from "./lru.js";
 import type { IntelEnsureOptions, IntelRequest, WalletIntel, WalletIntelProvider } from "./types.js";
 
@@ -58,13 +58,29 @@ interface HubVerdict {
   atMs: number;
 }
 
-export function isHubFromFacts(facts: HubFacts | undefined, memoryFanout: number, threshold: number): boolean {
+export function isHubFromFacts(facts: HubFacts | undefined, memoryBursts: number, threshold: number): boolean {
   const kind = facts?.entityKind ?? null;
   if (kind !== null) {
     return !LINKING_ENTITY_KINDS.has(kind);
   }
-  const fanout = Math.max(facts?.fanout ?? 0, memoryFanout);
-  return (facts?.flagged ?? false) || fanout >= threshold;
+  const bursts = Math.max(facts?.fundingBursts ?? 0, memoryBursts);
+  return (facts?.flagged ?? false) || bursts >= threshold;
+}
+
+const STOPPED = "wallet intel stopped";
+
+function withKnownFunding(fetched: WalletIntel, previous: WalletIntel | null): WalletIntel {
+  if (fetched.funder !== null || !previous?.funder) {
+    return fetched;
+  }
+  return {
+    ...fetched,
+    funder: previous.funder,
+    fundingSignature: previous.fundingSignature,
+    fundingSlot: previous.fundingSlot,
+    fundedAtMs: previous.fundedAtMs,
+    fundingAmount: previous.fundingAmount
+  };
 }
 
 export class WalletIntelService implements WalletIntelProvider {
@@ -76,12 +92,13 @@ export class WalletIntelService implements WalletIntelProvider {
   private readonly errorRetryMs: number;
   private readonly hubCacheMs: number;
   private readonly maxInflight: number;
-  private readonly fanout = new Map<Pubkey, number>();
+  private readonly bursts = new Map<Pubkey, Map<string, number>>();
   private readonly memory: LruCache<Pubkey, WalletIntel>;
   private readonly hubs: LruCache<Pubkey, HubVerdict>;
   private readonly inflight = new Map<Pubkey, Promise<WalletIntel>>();
   private readonly persisting = new Set<Promise<void>>();
   private readonly counters = { memoryHits: 0, dbHits: 0, lookups: 0, failures: 0, skipped: 0, rpcCalls: 0 };
+  private stopped = false;
 
   constructor(options: WalletIntelServiceOptions) {
     this.db = options.db;
@@ -93,7 +110,7 @@ export class WalletIntelService implements WalletIntelProvider {
     this.hubCacheMs = options.hubCacheMs ?? 10 * 60_000;
     this.maxInflight = options.maxInflight ?? 400;
     this.memory = new LruCache<Pubkey, WalletIntel>(options.cacheSize ?? 100_000, (_wallet, intel) =>
-      this.adjustFanout(intel.funder, -1)
+      this.adjustBursts(intel, -1)
     );
     this.hubs = new LruCache<Pubkey, HubVerdict>(20_000);
   }
@@ -118,7 +135,7 @@ export class WalletIntelService implements WalletIntelProvider {
     if (verdict && this.clock.nowMs() - verdict.atMs <= this.hubCacheMs) {
       return verdict.isHub;
     }
-    return (this.fanout.get(address) ?? 0) >= this.deep.hubFanoutThreshold;
+    return this.memoryBursts(address) >= this.deep.hubFanoutThreshold;
   }
 
   async ensure(entries: readonly IntelRequest[], deadlineMs: number, options: IntelEnsureOptions = {}): Promise<Map<Pubkey, WalletIntel>> {
@@ -127,7 +144,7 @@ export class WalletIntelService implements WalletIntelProvider {
     let missing: IntelRequest[] = [];
     for (const request of requests) {
       const intel = this.fresh(request.wallet);
-      if (intel) {
+      if (intel && this.answers(intel, request)) {
         this.counters.memoryHits += 1;
         ready.set(request.wallet, intel);
       } else {
@@ -136,10 +153,19 @@ export class WalletIntelService implements WalletIntelProvider {
     }
     if (missing.length > 0 && this.db) {
       const loaded = await this.untilDeadline(this.loadFromDb(missing.map((request) => request.wallet)), deadlineMs);
+      const byWallet = new Map(missing.map((request) => [request.wallet, request]));
       for (const intel of loaded ?? []) {
-        this.counters.dbHits += 1;
-        this.remember(intel);
-        ready.set(intel.wallet, intel);
+        const request = byWallet.get(intel.wallet);
+        if (!request) {
+          continue;
+        }
+        if (this.answers(intel, request)) {
+          this.counters.dbHits += 1;
+          this.remember(intel);
+          ready.set(intel.wallet, intel);
+        } else if (!this.memory.has(intel.wallet)) {
+          this.remember(intel);
+        }
       }
       missing = missing.filter((request) => !ready.has(request.wallet));
     }
@@ -154,7 +180,7 @@ export class WalletIntelService implements WalletIntelProvider {
     }
     for (const request of missing) {
       const intel = this.fresh(request.wallet);
-      if (intel) {
+      if (intel && this.answers(intel, request)) {
         ready.set(request.wallet, intel);
       }
     }
@@ -170,6 +196,21 @@ export class WalletIntelService implements WalletIntelProvider {
     while (this.inflight.size > 0 || this.persisting.size > 0) {
       await Promise.allSettled([...this.inflight.values(), ...this.persisting]);
     }
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    while (this.persisting.size > 0) {
+      await Promise.allSettled([...this.persisting]);
+    }
+  }
+
+  private answers(intel: WalletIntel, request: IntelRequest): boolean {
+    return intel.checkedBeforeSignature === request.buySignature || !this.claimsFresh(intel);
+  }
+
+  private claimsFresh(intel: WalletIntel): boolean {
+    return intel.priorTxCount !== null && !intel.priorTxCapped && intel.priorTxCount <= this.deep.freshMaxPriorTxs;
   }
 
   private dedupe(entries: readonly IntelRequest[]): IntelRequest[] {
@@ -203,18 +244,29 @@ export class WalletIntelService implements WalletIntelProvider {
 
   private remember(intel: WalletIntel): void {
     this.memory.set(intel.wallet, intel);
-    this.adjustFanout(intel.funder, 1);
+    this.adjustBursts(intel, 1);
   }
 
-  private adjustFanout(funder: Pubkey | null, delta: number): void {
-    if (!funder) {
+  private memoryBursts(funder: Pubkey): number {
+    return this.bursts.get(funder)?.size ?? 0;
+  }
+
+  private adjustBursts(intel: WalletIntel, delta: number): void {
+    if (!intel.funder) {
       return;
     }
-    const next = (this.fanout.get(funder) ?? 0) + delta;
+    const byBurst = this.bursts.get(intel.funder) ?? new Map<string, number>();
+    const key = fundingBurstKey(intel);
+    const next = (byBurst.get(key) ?? 0) + delta;
     if (next <= 0) {
-      this.fanout.delete(funder);
+      byBurst.delete(key);
     } else {
-      this.fanout.set(funder, next);
+      byBurst.set(key, next);
+    }
+    if (byBurst.size === 0) {
+      this.bursts.delete(intel.funder);
+    } else {
+      this.bursts.set(intel.funder, byBurst);
     }
   }
 
@@ -253,14 +305,16 @@ export class WalletIntelService implements WalletIntelProvider {
     if (existing) {
       return existing;
     }
-    if (!this.rpc || this.inflight.size >= this.maxInflight) {
+    if (!this.rpc || this.stopped || this.inflight.size >= this.maxInflight) {
       this.counters.skipped += 1;
       return null;
     }
     this.counters.lookups += 1;
+    const previous = this.memory.peek(request.wallet) ?? null;
     const promise = this.fetchIntel(request)
       .catch((error: unknown) => this.failedIntel(request, error))
-      .then((intel) => {
+      .then((fetched) => {
+        const intel = withKnownFunding(fetched, previous);
         this.remember(intel);
         if (intel.priorTxCount !== null) {
           this.persist(intel);
@@ -295,7 +349,7 @@ export class WalletIntelService implements WalletIntelProvider {
   }
 
   private persist(intel: WalletIntel): void {
-    if (!this.db) {
+    if (!this.db || this.stopped) {
       return;
     }
     this.background(
@@ -312,12 +366,19 @@ export class WalletIntelService implements WalletIntelProvider {
     this.persisting.add(tracked);
   }
 
+  private ensureRunning(): void {
+    if (this.stopped) {
+      throw new Error(STOPPED);
+    }
+  }
+
   private async fetchIntel(request: IntelRequest): Promise<WalletIntel> {
     const rpc = this.rpc;
     if (!rpc) {
       throw new Error("rpc unavailable");
     }
     const limit = this.deep.signatureLookback;
+    this.ensureRunning();
     this.counters.rpcCalls += 1;
     const signatures = await rpc.getSignaturesForAddress(
       request.wallet,
@@ -325,7 +386,11 @@ export class WalletIntelService implements WalletIntelProvider {
       RPC_PRIORITY
     );
     const oldest = signatures[signatures.length - 1];
-    const funding = await this.findFunding(rpc, request.wallet, signatures);
+    const capped = signatures.length >= limit;
+    let funding = await this.findFunding(rpc, request.wallet, signatures);
+    if (!funding.hit && !capped) {
+      funding = await this.findFundingInBuy(rpc, request, funding.error);
+    }
     return {
       wallet: request.wallet,
       funder: funding.hit?.transfer.source ?? null,
@@ -334,7 +399,7 @@ export class WalletIntelService implements WalletIntelProvider {
       fundedAtMs: funding.hit?.atMs ?? null,
       fundingAmount: funding.hit?.transfer.lamports ?? null,
       priorTxCount: signatures.length,
-      priorTxCapped: signatures.length >= limit,
+      priorTxCapped: capped,
       oldestSeenAtMs: oldest?.blockTime ? oldest.blockTime * 1000 : null,
       checkedBeforeSignature: request.buySignature,
       checkedAtMs: this.clock.nowMs(),
@@ -343,12 +408,39 @@ export class WalletIntelService implements WalletIntelProvider {
     };
   }
 
+  private async findFundingInBuy(
+    rpc: IntelRpc,
+    request: IntelRequest,
+    historyError: string | null
+  ): Promise<{ hit: FundingHit | null; error: string | null }> {
+    this.ensureRunning();
+    try {
+      this.counters.rpcCalls += 1;
+      const tx = await rpc.getParsedTransaction(request.buySignature, RPC_PRIORITY);
+      const transfer = tx ? fundingTransfer(tx, request.wallet, this.minFundingLamports()) : null;
+      if (!tx || !transfer) {
+        return { hit: null, error: historyError };
+      }
+      const atMs = tx.blockTime ? tx.blockTime * 1000 : null;
+      return { hit: { transfer, signature: request.buySignature, slot: tx.slot ?? request.buySlot, atMs }, error: null };
+    } catch (error) {
+      if (this.stopped) {
+        throw error;
+      }
+      return { hit: null, error: `buy transaction lookup failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  private minFundingLamports(): bigint {
+    return BigInt(Math.trunc(this.deep.minFundingLamports));
+  }
+
   private async findFunding(
     rpc: IntelRpc,
     wallet: Pubkey,
     signatures: readonly SignatureInfo[]
   ): Promise<{ hit: FundingHit | null; error: string | null }> {
-    const minLamports = BigInt(Math.trunc(this.deep.minFundingLamports));
+    const minLamports = this.minFundingLamports();
     let fetched = 0;
     let failed = 0;
     let lastError: string | null = null;
@@ -360,6 +452,7 @@ export class WalletIntelService implements WalletIntelProvider {
         continue;
       }
       fetched += 1;
+      this.ensureRunning();
       try {
         this.counters.rpcCalls += 1;
         const tx = await rpc.getParsedTransaction(info.signature, RPC_PRIORITY);
@@ -403,13 +496,13 @@ export class WalletIntelService implements WalletIntelProvider {
     const newlyHubs: Pubkey[] = [];
     for (const address of addresses) {
       const fact = facts.get(address);
-      const isHub = isHubFromFacts(fact, this.fanout.get(address) ?? 0, this.deep.hubFanoutThreshold);
+      const isHub = isHubFromFacts(fact, this.memoryBursts(address), this.deep.hubFanoutThreshold);
       this.hubs.set(address, { isHub, atMs: now });
       if (isHub && !fact?.flagged && fact?.entityKind == null) {
         newlyHubs.push(address);
       }
     }
-    if (newlyHubs.length > 0 && this.db) {
+    if (newlyHubs.length > 0 && this.db && !this.stopped) {
       this.background(
         markHubs(this.db, newlyHubs).catch((error: unknown) => {
           log.warn({ err: error }, "failed to mark hub wallets");

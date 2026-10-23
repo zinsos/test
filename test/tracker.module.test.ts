@@ -7,7 +7,7 @@ import type { LaunchCreatedEvent, LaunchScore, Signal, TradeEvent } from "../src
 import type { Db } from "../src/db/pool.js";
 import { MarketState } from "../src/market/state.js";
 import { createTrackerModule, walkForwardAsOfs, type TrackerModule } from "../src/tracker/index.js";
-import { TrackedWalletRegistry } from "../src/tracker/registry.js";
+import { latestRun, TrackedWalletRegistry } from "../src/tracker/registry.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 
 const HOUR = 3_600_000;
@@ -72,22 +72,25 @@ function buy(mint: string, wallet: string, atMs: number): TradeEvent {
   };
 }
 
+function scoreOf(mint: string): LaunchScore {
+  return {
+    mint,
+    launchId: null,
+    checkpointSec: 10,
+    computedAtMs: 0,
+    slot: 0,
+    score: 20,
+    hardBlocked: false,
+    flags: [],
+    features: {},
+    contributions: {},
+    weightsVersion: "t"
+  };
+}
+
 const scores: ScoreProvider = {
-  latest: (mint) =>
-    ({
-      mint,
-      launchId: null,
-      checkpointSec: 10,
-      computedAtMs: 0,
-      slot: 0,
-      score: 20,
-      hardBlocked: false,
-      flags: [],
-      features: {},
-      contributions: {},
-      weightsVersion: "t"
-    }) satisfies LaunchScore,
-  scoreNow: async () => null
+  latest: scoreOf,
+  scoreNow: async (mint) => scoreOf(mint)
 };
 
 async function insertRun(db: Db, asOfMs: number, tracked: string[]): Promise<number> {
@@ -222,6 +225,36 @@ describe.skipIf(!hasTestDatabase)("tracker module", () => {
     await r.module.stop();
   });
 
+  it("keeps walk-forward runs private to backtests with the same ranking parameters", async () => {
+    const liveRun = await insertRun(database.db, T1 + 3 * DAY, ["L1", "L2", "L3"]);
+    const r = rig(database.db, "backtest", T1);
+    const first = await r.module.prepareWalkForward(T1, T1 + 7 * DAY);
+    expect(first).toHaveLength(2);
+    expect((await latestRun(database.db))?.runId).toBe(liveRun);
+    const live = await TrackedWalletRegistry.loadAsOf(database.db, T1 + 30 * DAY);
+    expect(live.currentRun()?.runId).toBe(liveRun);
+    await r.module.start();
+    r.module.registry.setAsOf(T1 + 4 * DAY);
+    expect(r.module.registry.currentRun()?.runId).toBe(first[0]);
+    await r.module.stop();
+    const narrower = defaultStrategyConfig();
+    narrower.tracker.topN = 3;
+    const other = rig(database.db, "backtest", T1, {
+      config: { tracker: narrower.tracker, signals: narrower.signals, scorer: narrower.scorer }
+    });
+    const second = await other.module.prepareWalkForward(T1, T1 + 7 * DAY);
+    expect(second).toHaveLength(2);
+    expect(second.some((runId) => first.includes(runId))).toBe(false);
+    const params = await database.db.query<{ top_n: string; label: string }>(
+      "SELECT params->>'topN' AS top_n, params->>'label' AS label FROM wallet_rank_runs WHERE id = ANY($1::bigint[])",
+      [second.map(String)]
+    );
+    expect(params.rows).toEqual([
+      { top_n: "3", label: "walk-forward" },
+      { top_n: "3", label: "walk-forward" }
+    ]);
+  });
+
   it("loads the latest run live and reranks on schedule", async () => {
     const previous = await insertRun(database.db, T2 - 7 * DAY + HOUR, ["A", "B", "C"]);
     const r = rig(database.db, "live", T2);
@@ -234,6 +267,8 @@ describe.skipIf(!hasTestDatabase)("tracker module", () => {
     const runs = await database.db.query<{ id: bigint; as_of: Date }>(`SELECT id, as_of FROM wallet_rank_runs ORDER BY id`);
     expect(runs.rows).toHaveLength(2);
     expect(runs.rows[1]?.as_of.getTime()).toBe(T2 + HOUR);
+    const label = await database.db.query<{ label: string }>("SELECT params->>'label' AS label FROM wallet_rank_runs WHERE id = $1", [runs.rows[1]?.id]);
+    expect(label.rows[0]?.label).toBe("live");
     expect(r.module.registry.version()).toBe(`run:${Number(runs.rows[1]?.id)}`);
     expect(r.module.registry.count()).toBe(0);
     await r.module.stop();

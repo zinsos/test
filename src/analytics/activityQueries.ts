@@ -1,6 +1,7 @@
 import { SOL_QUOTE } from "../core/constants.js";
 import type { FeatureVector, LaunchScore, Pubkey } from "../core/types.js";
 import { toBigInt, toNullableNumber, toNumber, type Db } from "../db/pool.js";
+import { PUBLISHED_RUN_SQL } from "../tracker/registry.js";
 import { clampLimit } from "./tradeQueries.js";
 import { lamportsRatio } from "./units.js";
 
@@ -270,7 +271,7 @@ export async function latestScore(db: Db, mint: Pubkey): Promise<LaunchScore | n
 
 export async function latestRankRun(db: Db): Promise<RankRunSummary | null> {
   const result = await db.query<DbRecord>(
-    `SELECT id, as_of, ran_at, candidates, tracked FROM wallet_rank_runs ORDER BY as_of DESC, id DESC LIMIT 1`
+    `SELECT id, as_of, ran_at, candidates, tracked FROM wallet_rank_runs WHERE ${PUBLISHED_RUN_SQL} ORDER BY as_of DESC, id DESC LIMIT 1`
   );
   const row = result.rows[0];
   if (!row) {

@@ -17,10 +17,18 @@ const HOUR_MS = 3_600_000;
 
 export const REPLAY_PHASE = { create: 0, migrate: 1, trade: 2, complete: 3 } as const;
 
+export interface ObservationModel {
+  defaultDelayMs: number;
+  maxLagMs: number;
+}
+
+export const DEFAULT_OBSERVATION: ObservationModel = { defaultDelayMs: 1_500, maxLagMs: 30_000 };
+
 const VENUE_BY_CODE: Record<number, TradeVenue> = { 0: "curve", 1: "pool", 2: "curve_post_complete" };
 
 export interface ReplayEvent {
   atMs: number;
+  visibleAtMs: number;
   slot: number;
   phase: number;
   seq: number;
@@ -34,13 +42,14 @@ export interface ReplayEvent {
 type DbRecord = Record<string, unknown>;
 
 export const LAUNCH_SELECT = `id, mint, bonding_curve, dev_wallet, creator, name, symbol, uri, quote_mint, token_program,
-  is_mayhem, is_cashback, is_holder_reward, creator_fee_bps, depth, create_signature, create_slot, created_at,
+  is_mayhem, is_cashback, is_holder_reward, creator_fee_bps, depth, create_signature, create_slot, created_at, observed_at,
   token_total_supply, initial_virtual_token, initial_virtual_quote, initial_real_token, pool,
   completed_at, completed_slot, migrated_at, migrated_slot, data_complete, data_incomplete_at`;
 
 export const TRADE_SELECT = `t.launch_id, l.mint, l.pool AS launch_pool, t.block_time, t.slot, t.seq, t.signature, t.event_index,
   t.venue, t.wallet, t.is_buy, t.token_amount, t.quote_amount, t.user_quote, t.protocol_fee, t.creator_fee, t.lp_fee,
-  t.protocol_fee_bps, t.creator_fee_bps, t.lp_fee_bps, t.virtual_token, t.virtual_quote, t.real_token, t.real_quote, t.ix_name`;
+  t.protocol_fee_bps, t.creator_fee_bps, t.lp_fee_bps, t.virtual_token, t.virtual_quote, t.real_token, t.real_quote, t.ix_name,
+  t.received_at`;
 
 function msOf(value: unknown): number {
   return value instanceof Date ? value.getTime() : toNumber(value);
@@ -61,12 +70,25 @@ export function compareReplayEvents(a: ReplayEvent, b: ReplayEvent): number {
   );
 }
 
-export function launchEventFromRow(row: DbRecord): LaunchCreatedEvent {
+export function observedAtMs(blockMs: number, receivedAt: unknown, observation: ObservationModel = DEFAULT_OBSERVATION): number {
+  if (!(receivedAt instanceof Date)) {
+    return blockMs + observation.defaultDelayMs;
+  }
+  return Math.min(Math.max(receivedAt.getTime(), blockMs), blockMs + observation.maxLagMs);
+}
+
+export function launchEventFromRow(row: DbRecord, observation: ObservationModel = DEFAULT_OBSERVATION): LaunchCreatedEvent {
   const createdAtMs = msOf(row.created_at);
   const slot = toNumber(row.create_slot);
   return {
     kind: "create",
-    tx: { signature: text(row.create_signature), slot, seq: 0, eventIndex: 0, receivedAtMs: createdAtMs },
+    tx: {
+      signature: text(row.create_signature),
+      slot,
+      seq: 0,
+      eventIndex: 0,
+      receivedAtMs: observedAtMs(createdAtMs, row.observed_at, observation)
+    },
     mint: text(row.mint),
     bondingCurve: text(row.bonding_curve),
     devWallet: text(row.dev_wallet),
@@ -89,7 +111,7 @@ export function launchEventFromRow(row: DbRecord): LaunchCreatedEvent {
   };
 }
 
-export function tradeEventFromRow(row: DbRecord): TradeEvent {
+export function tradeEventFromRow(row: DbRecord, observation: ObservationModel = DEFAULT_OBSERVATION): TradeEvent {
   const atMs = msOf(row.block_time);
   const venue = VENUE_BY_CODE[toNumber(row.venue)] ?? "curve";
   return {
@@ -99,7 +121,7 @@ export function tradeEventFromRow(row: DbRecord): TradeEvent {
       slot: toNumber(row.slot),
       seq: toNumber(row.seq),
       eventIndex: toNumber(row.event_index),
-      receivedAtMs: atMs
+      receivedAtMs: observedAtMs(atMs, row.received_at, observation)
     },
     venue,
     mint: text(row.mint),
@@ -140,7 +162,7 @@ export function completeEventFromRow(row: DbRecord): CurveCompleteEvent | null {
   };
 }
 
-export function migrateEventFromRow(row: DbRecord): MigrationEvent | null {
+export function migrateEventFromRow(row: DbRecord, observation: ObservationModel = DEFAULT_OBSERVATION): MigrationEvent | null {
   if (!(row.migrated_at instanceof Date) || typeof row.pool !== "string" || row.pool.length === 0) {
     return null;
   }
@@ -148,7 +170,13 @@ export function migrateEventFromRow(row: DbRecord): MigrationEvent | null {
   const mint = text(row.mint);
   return {
     kind: "migrate",
-    tx: { signature: `replay-migrate-${mint}`, slot: toNumber(row.migrated_slot), seq: 0, eventIndex: 0, receivedAtMs: atMs },
+    tx: {
+      signature: `replay-migrate-${mint}`,
+      slot: toNumber(row.migrated_slot),
+      seq: 0,
+      eventIndex: 0,
+      receivedAtMs: atMs + observation.defaultDelayMs
+    },
     mint,
     pool: row.pool,
     bondingCurve: text(row.bonding_curve),
@@ -186,7 +214,14 @@ export function scheduleIncomplete(clock: Clock, market: MarketState, replay: Re
 }
 
 export function replayEventOf(event: ChainEvent, launchId: number): ReplayEvent {
-  const base = { launchId, event, atMs: event.timestampMs, slot: event.tx.slot, tiebreak: event.tx.signature };
+  const base = {
+    launchId,
+    event,
+    atMs: event.timestampMs,
+    visibleAtMs: Math.max(event.timestampMs, event.tx.receivedAtMs),
+    slot: event.tx.slot,
+    tiebreak: event.tx.signature
+  };
   switch (event.kind) {
     case "create":
       return { ...base, phase: REPLAY_PHASE.create, seq: -1, eventIndex: -1 };
@@ -199,14 +234,14 @@ export function replayEventOf(event: ChainEvent, launchId: number): ReplayEvent 
   }
 }
 
-export function lifecycleEventsOf(row: DbRecord): ReplayEvent[] {
+export function lifecycleEventsOf(row: DbRecord, observation: ObservationModel = DEFAULT_OBSERVATION): ReplayEvent[] {
   const launchId = toNumber(row.id);
   const events: ReplayEvent[] = [];
   const complete = completeEventFromRow(row);
   if (complete) {
     events.push(replayEventOf(complete, launchId));
   }
-  const migrate = migrateEventFromRow(row);
+  const migrate = migrateEventFromRow(row, observation);
   if (migrate) {
     events.push(replayEventOf(migrate, launchId));
   }
@@ -220,6 +255,7 @@ export interface BacktestLoaderOptions {
   includeIncomplete?: boolean;
   tradeQuoteMints?: readonly string[] | null;
   windowMs?: number;
+  observation?: ObservationModel;
 }
 
 export interface LoaderCounts {
@@ -237,6 +273,7 @@ export class BacktestLoader {
   private readonly includeIncomplete: boolean;
   private readonly tradeQuoteMints: readonly string[] | null;
   private readonly windowMs: number;
+  private readonly observation: ObservationModel;
   private lifecycle: ReplayEvent[] = [];
   private lifecycleIndex = 0;
   private readonly counts: LoaderCounts = { launches: 0, incompleteLaunches: 0, trades: 0, lifecycle: 0, windows: 0 };
@@ -251,6 +288,7 @@ export class BacktestLoader {
     this.includeIncomplete = options.includeIncomplete ?? false;
     this.tradeQuoteMints = options.tradeQuoteMints ?? null;
     this.windowMs = Math.max(1_000, options.windowMs ?? 60_000);
+    this.observation = options.observation ?? DEFAULT_OBSERVATION;
   }
 
   stats(): LoaderCounts {
@@ -267,7 +305,7 @@ export class BacktestLoader {
     );
     const events: ReplayEvent[] = [];
     for (const row of result.rows) {
-      for (const event of lifecycleEventsOf(row)) {
+      for (const event of lifecycleEventsOf(row, this.observation)) {
         if (event.atMs >= this.fromMs && event.atMs < this.toMs) {
           events.push(event);
         }
@@ -323,7 +361,7 @@ export class BacktestLoader {
       [new Date(startMs), new Date(endMs)]
     );
     return result.rows.map((row) => ({
-      ...replayEventOf(launchEventFromRow(row), toNumber(row.id)),
+      ...replayEventOf(launchEventFromRow(row, this.observation), toNumber(row.id)),
       incompleteFromMs: this.includeIncomplete ? null : incompleteFromOf(row)
     }));
   }
@@ -338,7 +376,7 @@ export class BacktestLoader {
         ORDER BY t.block_time, t.slot, t.seq, t.event_index, t.signature`,
       [new Date(startMs), new Date(endMs), new Date(this.fromMs), new Date(this.toMs), this.tradeQuoteMints]
     );
-    return result.rows.map((row) => replayEventOf(tradeEventFromRow(row), toNumber(row.launch_id)));
+    return result.rows.map((row) => replayEventOf(tradeEventFromRow(row, this.observation), toNumber(row.launch_id)));
   }
 }
 

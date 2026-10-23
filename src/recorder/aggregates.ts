@@ -245,14 +245,14 @@ export interface AggregateWriteResult {
   error: unknown;
 }
 
-export async function loadLaunchWallets(db: Db, launchIds: readonly number[]): Promise<Map<number, Pubkey[]>> {
+export async function loadLaunchWallets(db: Db, launchIds: readonly number[], sinceMs: number): Promise<Map<number, Pubkey[]>> {
   const wallets = new Map<number, Pubkey[]>();
   if (launchIds.length === 0) {
     return wallets;
   }
   const result = await db.query<{ launch_id: unknown; wallet: string }>(
-    "SELECT DISTINCT launch_id, wallet FROM trades WHERE launch_id = ANY($1::bigint[])",
-    [launchIds.map(String)]
+    "SELECT DISTINCT launch_id, wallet FROM trades WHERE launch_id = ANY($1::bigint[]) AND block_time >= $2",
+    [launchIds.map(String), new Date(sinceMs)]
   );
   for (const row of result.rows) {
     const launchId = Number(row.launch_id);

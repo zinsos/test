@@ -61,7 +61,7 @@ describe(".env.example", () => {
     const env = loadEnv(values);
     expect(env.TRADING_MODE).toBe("paper");
     expect(env.LIVE_DRY_RUN).toBe(true);
-    expect(env.MODULES).toEqual(["recorder", "scorer", "dashboard"]);
+    expect(env.MODULES).toEqual(["recorder", "scorer", "tracker", "trader", "dashboard"]);
   });
 });
 
@@ -69,10 +69,13 @@ describe("railway.json", () => {
   it("builds with npm, starts the compiled CLI and checks /healthz", () => {
     const railway = JSON.parse(readFileSync(new URL("../railway.json", import.meta.url), "utf8")) as {
       build: { buildCommand: string };
-      deploy: { startCommand: string; healthcheckPath: string };
+      deploy: { startCommand: string; healthcheckPath: string; restartPolicyType: string; overlapSeconds: number; restartPolicyMaxRetries?: number };
     };
     expect(railway.build.buildCommand).toBe("npm run build");
     expect(railway.deploy.startCommand).toBe("node dist/src/main.js start");
     expect(railway.deploy.healthcheckPath).toBe("/healthz");
+    expect(railway.deploy.restartPolicyType).toBe("ALWAYS");
+    expect(railway.deploy.restartPolicyMaxRetries).toBeUndefined();
+    expect(railway.deploy.overlapSeconds).toBeGreaterThan(0);
   });
 });

@@ -61,10 +61,10 @@ export function cappedProfitFactor(stats: WindowStats, cap: number): number {
 }
 
 export function confidenceAdjustedEdge(stats: WindowStats, weights: WalletScoreWeights): number {
-  if (stats.closed === 0 || stats.realizedPnlSol <= 0) {
+  if (stats.closed === 0 || stats.realizedPnlSol <= 0 || stats.pnlExBestSol <= 0) {
     return 0;
   }
-  return stats.winRateLower * cappedProfitFactor(stats, weights.profitFactorCap) * Math.log1p(stats.realizedPnlSol);
+  return stats.winRateLower * cappedProfitFactor(stats, weights.profitFactorCap) * Math.log1p(stats.pnlExBestSol);
 }
 
 export function compositeWalletScore(

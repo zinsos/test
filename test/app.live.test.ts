@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { startLiveApp } from "../src/app/live.js";
+import { dashboardTokenProblem, startLiveApp } from "../src/app/live.js";
+import type { RpcClient } from "../src/chain/rpc.js";
 import { loadEnv } from "../src/config/env.js";
 import { defaultStrategyConfig, type StrategyConfig } from "../src/config/strategy.js";
 import { VirtualClock } from "../src/core/clock.js";
 import { decodeLogs } from "../src/chain/events.js";
+import type { Db } from "../src/db/pool.js";
+import { DatabaseWaitAborted, waitForDatabase } from "../src/db/wait.js";
 import { ReplayLogSource, type ReplayTransaction } from "../src/ingest/replaySource.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 
@@ -42,7 +45,7 @@ function env(databaseUrl: string, modules: string) {
     MODULES: modules,
     TRADING_MODE: "paper",
     RPC_WS_URL: "ws://127.0.0.1:9",
-    DASHBOARD_TOKEN: "s3cret"
+    DASHBOARD_TOKEN: "s3cret-dashboard-token-for-tests"
   });
 }
 
@@ -81,7 +84,7 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
     expect(health.status).toBe(200);
     expect(((await health.json()) as { ok: boolean }).ok).toBe(true);
     expect((await fetch(`http://127.0.0.1:${app.httpPort}/api/summary`)).status).toBe(401);
-    const summary = await fetch(`http://127.0.0.1:${app.httpPort}/api/recorder/health`, { headers: { authorization: "Bearer s3cret" } });
+    const summary = await fetch(`http://127.0.0.1:${app.httpPort}/api/recorder/health`, { headers: { authorization: "Bearer s3cret-dashboard-token-for-tests" } });
     expect(summary.status).toBe(200);
     const body = (await summary.json()) as { process: { trader: { open: number } } };
     expect(body.process.trader.open).toBe(0);
@@ -154,7 +157,7 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
 
   it("serves only the dashboard without opening a chain stream", async () => {
     const app = await startLiveApp({
-      env: loadEnv({ DATABASE_URL: database.url, MODULES: "dashboard" }),
+      env: loadEnv({ DATABASE_URL: database.url, MODULES: "dashboard", DASHBOARD_TOKEN: "dashboard-only-token-0123456789" }),
       config: config(),
       clock: new VirtualClock(START_MS),
       db: database.db,
@@ -166,6 +169,110 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
     expect((await fetch(`http://127.0.0.1:${app.httpPort}/healthz`)).status).toBe(200);
     expect((app.stats() as { stream: unknown }).stream).toBeNull();
     await app.stop("test");
+  });
+
+  it("refuses to serve the dashboard without a long, non-placeholder token", async () => {
+    for (const token of [undefined, "", "short-token", "change-me-to-a-long-random-string"]) {
+      const started = startLiveApp({
+        env: loadEnv({ DATABASE_URL: database.url, MODULES: "dashboard", ...(token === undefined ? {} : { DASHBOARD_TOKEN: token }) }),
+        config: config(),
+        clock: new VirtualClock(START_MS),
+        db: database.db,
+        rpc: null,
+        port: 0
+      });
+      await expect(started).rejects.toThrow(/DASHBOARD_TOKEN/);
+    }
+    expect(dashboardTokenProblem("a-long-random-dashboard-token-value")).toBeNull();
+  });
+
+  it("keeps a recorder service unhealthy until its stream has delivered something", async () => {
+    const clock = new VirtualClock(START_MS);
+    const source = new ReplayLogSource({ clock, transactions: [] });
+    const app = await startLiveApp({ env: env(database.url, "recorder"), config: config(), clock, db: database.db, rpc: null, source, port: 0 });
+    const before = await fetch(`http://127.0.0.1:${app.httpPort}/healthz`);
+    expect({ status: before.status, body: await before.json() }).toMatchObject({ status: 503, body: { db: true, ready: false } });
+    const first = replayTransactions()[0];
+    if (first) {
+      source.push(first);
+    }
+    const after = await fetch(`http://127.0.0.1:${app.httpPort}/healthz`);
+    expect(after.status).toBe(200);
+    await app.stop("test");
+  });
+
+  it("lets a trader-only service score from stored wallet intel without making wallet-intel RPC calls", async () => {
+    const calls: string[] = [];
+    const rpc = {
+      stats: () => ({ calls: calls.length, errors: 0, queued: 0, active: 0 }),
+      getSignaturesForAddress: async (address: string) => {
+        calls.push(`signatures:${address}`);
+        return [];
+      },
+      getParsedTransaction: async (signature: string) => {
+        calls.push(`transaction:${signature}`);
+        return null;
+      },
+      getTokenLargestAccounts: async () => [],
+      getMultipleParsedAccounts: async () => []
+    } as unknown as RpcClient;
+    const clock = new VirtualClock(START_MS + 60_000);
+    const app = await startLiveApp({
+      env: env(database.url, "trader"),
+      config: config(),
+      clock,
+      db: database.db,
+      rpc,
+      source: new ReplayLogSource({ clock, transactions: [] }),
+      port: 0
+    });
+    try {
+      const template = fixtures
+        .flatMap((tx) => decodeLogs(tx.logs, { signature: tx.signature, slot: tx.slot, seq: 0, receivedAtMs: 0 }).events)
+        .find((event) => event.kind === "create");
+      if (!template || template.kind !== "create") {
+        throw new Error("create fixture missing");
+      }
+      const mint = "StoredIntelMint1111111111111111111111111111";
+      app.market.apply({ ...template, mint, quoteMint: "SOL", timestampMs: START_MS, tx: { ...template.tx, slot: 1_000 } });
+      for (let index = 0; index < 6; index += 1) {
+        app.market.apply({
+          kind: "trade",
+          tx: { signature: `stored-intel-${index}`, slot: 1_001 + index, seq: index, eventIndex: 0, receivedAtMs: START_MS + 2_000 * (index + 1) },
+          venue: "curve",
+          mint,
+          pool: null,
+          wallet: `StoredIntelBuyer${index}`,
+          isBuy: true,
+          tokenAmount: 1_000_000_000n,
+          quoteAmount: 100_000_000n,
+          userQuote: 101_250_000n,
+          protocolFee: 950_000n,
+          creatorFee: 300_000n,
+          lpFee: 0n,
+          protocolFeeBps: 95,
+          creatorFeeBps: 30,
+          lpFeeBps: 0,
+          virtualTokenReserves: 1_070_000_000_000_000n - BigInt(index) * 1_000_000_000n,
+          virtualQuoteReserves: 30_100_000_000n + BigInt(index) * 100_000_000n,
+          realTokenReserves: 790_000_000_000_000n,
+          realQuoteReserves: 100_000_000n * BigInt(index + 1),
+          timestampMs: START_MS + 2_000 * (index + 1),
+          ixName: "buy"
+        });
+      }
+      await database.db.query(
+        `INSERT INTO wallet_intel (wallet, prior_tx_count, prior_tx_capped, checked_before_signature, checked_at)
+         VALUES ('StoredIntelBuyer0', 2, false, 'stored-intel-0', $1)`,
+        [new Date(START_MS + 20_000)]
+      );
+      const score = await app.scorer?.service.runCheckpoint(mint, 30);
+      expect(score).not.toBeNull();
+      expect(calls).toEqual([]);
+      expect(Number(score?.features.intel_coverage ?? 0)).toBeGreaterThan(0);
+    } finally {
+      await app.stop("test");
+    }
   });
 
   it("starts a second trader only after the first one released the trading lock", async () => {
@@ -214,4 +321,60 @@ async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<voi
     }
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+describe("startup while the database is unreachable", () => {
+  it("keeps waiting for the database until stopped instead of failing at once", async () => {
+    let aborted = false;
+    const startedAt = performance.now();
+    const started = startLiveApp({
+      env: loadEnv({ DATABASE_URL: "postgres://postgres:postgres@127.0.0.1:1/snypra", MODULES: "trader", TRADING_MODE: "paper", RPC_WS_URL: "ws://127.0.0.1:9" }),
+      config: defaultStrategyConfig(),
+      rpc: null,
+      source: new ReplayLogSource({ clock: new VirtualClock(0), transactions: [] }),
+      port: 0,
+      abort: () => aborted
+    });
+    const settled = started.then(
+      () => "started",
+      (error: unknown) => (error instanceof Error ? error.message : String(error))
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    aborted = true;
+    expect(await settled).toBe(new DatabaseWaitAborted().message);
+    expect(performance.now() - startedAt).toBeGreaterThanOrEqual(1_200);
+  });
+
+  it("retries with backoff until the database answers and gives up after the maximum wait", async () => {
+    let failures = 2;
+    const flaky = {
+      query: async () => {
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("connect ECONNREFUSED");
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    } as unknown as Db;
+    const clock = new VirtualClock(0);
+    expect(await drive(clock, waitForDatabase(flaky, { clock, initialDelayMs: 1_000 }))).toBe(3);
+    expect(clock.nowMs()).toBe(3_000);
+    const down = { query: async () => Promise.reject(new Error("connect ECONNREFUSED")) } as unknown as Db;
+    const giveUp = waitForDatabase(down, { clock, initialDelayMs: 1_000, maxWaitMs: 10_000 }).then(
+      () => "connected",
+      (error: unknown) => (error as Error).message
+    );
+    expect(await drive(clock, giveUp)).toMatch(/database unreachable for 10s/);
+  });
+});
+
+async function drive<T>(clock: VirtualClock, work: Promise<T>): Promise<T> {
+  let done = false;
+  const tracked = work.finally(() => {
+    done = true;
+  });
+  while (!done) {
+    await clock.advanceTo(clock.nextDueMs() ?? clock.nowMs());
+  }
+  return tracked;
 }

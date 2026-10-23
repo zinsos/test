@@ -197,6 +197,7 @@ describe("smart convergence", () => {
   it("drops buyers that fell out of the window", async () => {
     const h = setup({ convergence: { windowSec: 120 } });
     h.scores.latestScores.set("M", launchScore("M"));
+    h.scores.onDemand = async (mint) => launchScore(mint, { computedAtMs: h.clock.nowMs() });
     await h.feed(createEvent("M", T0));
     await h.feed(tradeEvent("M", "W1", T0));
     await h.feed(tradeEvent("M", "W2", T0 + 60 * SEC));
@@ -209,9 +210,10 @@ describe("smart convergence", () => {
     expect(h.signals[0]?.wallets).toEqual(["W2", "W3", "W4"]);
   });
 
-  it("applies the per-mint cooldown and signals again after it expires", async () => {
+  it("applies the per-mint cooldown without recording repeats as rejections and signals again after it expires", async () => {
     const h = setup({ signals: { cooldownPerMintSec: 600 } });
     h.scores.latestScores.set("M", launchScore("M"));
+    h.scores.onDemand = async (mint) => launchScore(mint, { computedAtMs: h.clock.nowMs() });
     await h.feed(createEvent("M", T0));
     for (const [index, wallet] of ["W1", "W2", "W3"].entries()) {
       await h.feed(tradeEvent("M", wallet, T0 + (10 + index) * SEC));
@@ -220,7 +222,8 @@ describe("smart convergence", () => {
     await h.feed(tradeEvent("M", "W4", T0 + 30 * SEC));
     await h.engine.idle();
     expect(h.signals).toHaveLength(1);
-    expect(h.rejected.map((item) => item.reason)).toEqual(["cooldown"]);
+    expect(h.rejected).toEqual([]);
+    expect(h.engine.stats().cooldownRepeats).toBe(1);
     expect(h.engine.isCoolingDown("M", T0 + 100 * SEC)).toBe(true);
     for (const [index, wallet] of ["W5", "W6", "W7"].entries()) {
       await h.feed(tradeEvent("M", wallet, T0 + (700 + index) * SEC));
@@ -326,6 +329,92 @@ describe("smart convergence", () => {
     expect(h.scores.requests).toEqual([]);
   });
 
+  it("records a failed precheck once per mint instead of once per tracked buy", async () => {
+    const h = setup({ convergence: { maxLaunchAgeSec: 600 } });
+    await h.feed(createEvent("PQ", T0, PUMP_COIN));
+    for (const [index, wallet] of ["W1", "W2", "W3", "W4", "W5"].entries()) {
+      await h.feed(tradeEvent("PQ", wallet, T0 + (10 + index) * SEC));
+    }
+    await h.engine.idle();
+    expect(h.rejected.map((item) => item.reason)).toEqual(["quote_mint_not_allowed"]);
+    expect(h.engine.stats().repeatedRejections).toBe(2);
+  });
+
+  it("records one accepted signal and no rejections when many tracked wallets pile into one mint", async () => {
+    const h = setup({ tracked: ["W1", "W2", "W3", "W4", "W5", "W6", "W7", "W8", "W9"] });
+    h.scores.latestScores.set("M", launchScore("M", { computedAtMs: T0 + 10 * SEC }));
+    await h.feed(createEvent("M", T0));
+    for (let index = 1; index <= 9; index += 1) {
+      await h.feed(tradeEvent("M", `W${index}`, T0 + 20 * SEC + (index - 1) * 2 * SEC));
+      await h.engine.idle();
+    }
+    expect(h.signals).toHaveLength(1);
+    expect(h.rejected).toEqual([]);
+    expect(h.engine.stats().cooldownRepeats).toBe(6);
+  });
+
+  it("does not count tracked wallets that already sold out as converging", async () => {
+    const h = setup();
+    h.scores.latestScores.set("M", launchScore("M", { computedAtMs: T0 + 10 * SEC }));
+    h.scores.onDemand = async (mint) => launchScore(mint, { computedAtMs: h.clock.nowMs() });
+    await h.feed(createEvent("M", T0));
+    await h.feed(tradeEvent("M", "W1", T0 + 5 * SEC));
+    await h.feed(tradeEvent("M", "W1", T0 + 12 * SEC, { isBuy: false }));
+    await h.feed(tradeEvent("M", "W2", T0 + 60 * SEC));
+    await h.feed(tradeEvent("M", "W3", T0 + 70 * SEC));
+    await h.engine.idle();
+    expect(h.engine.smartExitCount("M", T0)).toBe(1);
+    expect(h.signals).toHaveLength(0);
+    await h.feed(tradeEvent("M", "W4", T0 + 80 * SEC));
+    await h.engine.idle();
+    expect(h.signals.map((signal) => signal.wallets)).toEqual([["W2", "W3", "W4"]]);
+  });
+
+  it("rejects when converging wallets sell out while the score is pending", async () => {
+    const h = setup({ convergence: { waitForScoreMs: 5_000 } });
+    h.scores.onDemand = (mint) =>
+      new Promise((resolve) => {
+        h.clock.schedule(h.clock.nowMs() + 3_000, () => resolve(launchScore(mint, { computedAtMs: h.clock.nowMs() })));
+      });
+    await h.feed(createEvent("M", T0));
+    for (const [index, wallet] of ["W1", "W2", "W3"].entries()) {
+      await h.feed(tradeEvent("M", wallet, T0 + (10 + index) * SEC));
+    }
+    await h.feed(tradeEvent("M", "W2", T0 + 13 * SEC, { isBuy: false }));
+    await h.clock.advanceTo(T0 + 16 * SEC);
+    await h.engine.idle();
+    expect(h.signals).toHaveLength(0);
+    expect(h.rejected.map((item) => [item.reason, item.signal.wallets])).toEqual([["buyers_exited", ["W1", "W3"]]]);
+  });
+
+  it("re-scores a launch whose latest checkpoint score is stale instead of trusting it", async () => {
+    const h = setup();
+    h.scores.latestScores.set("M", launchScore("M", { checkpointSec: 120, computedAtMs: T0 + 120 * SEC, score: 30 }));
+    h.scores.onDemand = async (mint) =>
+      launchScore(mint, { checkpointSec: 2_400, computedAtMs: h.clock.nowMs(), score: 80, hardBlocked: true, flags: ["hard_dev_share"] });
+    await h.feed(createEvent("M", T0));
+    for (const [index, wallet] of ["W1", "W2", "W3"].entries()) {
+      await h.feed(tradeEvent("M", wallet, T0 + 40 * 60 * SEC + index * 5 * SEC));
+    }
+    await h.engine.idle();
+    expect(h.scores.requests).toEqual(["M:convergence"]);
+    expect(h.signals).toHaveLength(0);
+    expect(h.rejected.map((item) => item.reason)).toEqual(["hard_blocked"]);
+    expect(h.rejected[0]?.signal.meta.scoreAgeMs).toBe(0);
+  });
+
+  it("uses a recent checkpoint score without re-scoring and records its age", async () => {
+    const h = setup();
+    h.scores.latestScores.set("M", launchScore("M", { computedAtMs: T0 + 10 * SEC }));
+    await h.feed(createEvent("M", T0));
+    for (const [index, wallet] of ["W1", "W2", "W3"].entries()) {
+      await h.feed(tradeEvent("M", wallet, T0 + (20 + index) * SEC));
+    }
+    await h.engine.idle();
+    expect(h.scores.requests).toEqual([]);
+    expect(h.signals[0]?.meta.scoreAgeMs).toBe(12 * SEC);
+  });
+
   it("ignores trades for launches the market does not hold and respects the enabled list", async () => {
     const h = setup({ signals: { enabled: ["score_momentum"] } });
     h.scores.latestScores.set("M", launchScore("M"));
@@ -406,7 +495,8 @@ describe("score momentum", () => {
     expect(h.signals[0]?.meta.mcapSol).toBeCloseTo(50, 6);
     expect(h.signals[0]?.meta.uniqueBuyersPerMin).toBe(20);
     h.bus.emit("score", launchScore("M", { checkpointSec: 60, computedAtMs: T0 + 60 * SEC }));
-    expect(h.rejected.map((item) => item.reason)).toEqual(["cooldown"]);
+    expect(h.rejected).toEqual([]);
+    expect(h.engine.stats().cooldownRepeats).toBe(1);
   });
 
   it("rejects with the first failing check", async () => {

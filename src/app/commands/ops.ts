@@ -3,13 +3,14 @@ import { requireEnv } from "../../config/env.js";
 import { SystemClock } from "../../core/clock.js";
 import type { TradingMode } from "../../core/types.js";
 import { runMigrations } from "../../db/migrate.js";
+import { pruneRecordedData } from "../../db/retention.js";
 import { loadKeypair } from "../../execution/keys.js";
 import { recomputeOutcomes } from "../../recorder/outcomes.js";
 import { RiskManager } from "../../risk/manager.js";
 import { loadRiskState, RiskStateDbWriter } from "../../risk/persistence.js";
 import { HotColdSweeper, type SweepResult } from "../../risk/sweeper.js";
 import { countOpenPositions, requestKillReset, runExists } from "../../trader/runs.js";
-import { dateOption, flagOption, numberOption, stringOption } from "../args.js";
+import { dateOption, flagOption, numberOption, stringOption, UsageError } from "../args.js";
 import { commandConfig, EXIT_FAILURE, EXIT_OK, isoDay, withDatabase, type CommandContext } from "../commandContext.js";
 import { openDatabase } from "../context.js";
 
@@ -112,6 +113,29 @@ export async function recomputeOutcomesCommand(ctx: CommandContext): Promise<num
   return withDatabase(ctx, "recompute-outcomes", async (db) => {
     const result = await recomputeOutcomes(db, { from, to, config, nowMs });
     ctx.io.out(`relabelled ${result.launches} launches created ${isoDay(from.getTime())} to ${isoDay(to.getTime())} (${result.finalized} already finalized)`);
+    return EXIT_OK;
+  });
+}
+
+export async function pruneDataCommand(ctx: CommandContext): Promise<number> {
+  const keepDays = numberOption(ctx.options, "keep-days") ?? 0;
+  if (!Number.isFinite(keepDays) || keepDays < 1) {
+    throw new UsageError("--keep-days must be at least 1", "prune-data");
+  }
+  const dryRun = flagOption(ctx.options, "dry-run");
+  const beforeMs = new SystemClock().nowMs() - Math.floor(keepDays) * DAY_MS;
+  return withDatabase(ctx, "prune-data", async (db) => {
+    const result = await pruneRecordedData(db, { beforeMs, dryRun });
+    ctx.io.out(
+      [
+        `== prune recorded data before ${isoDay(result.cutoffMs)}${dryRun ? " (dry run)" : ""} ==`,
+        `trade partitions ${result.droppedPartitions.length === 0 ? "none" : result.droppedPartitions.join(", ")}`,
+        `launches         ${result.launchesPruned} keep their row and outcome; their scores and holder snapshots ${dryRun ? "would be" : "were"} deleted`,
+        ...(dryRun
+          ? []
+          : [`deleted          ${result.scoresDeleted} launch scores, ${result.snapshotsDeleted} holder snapshots, ${result.defaultTradesDeleted} unpartitioned trades`])
+      ].join("\n")
+    );
     return EXIT_OK;
   });
 }

@@ -12,6 +12,7 @@ export interface HealthServerOptions {
   host?: string;
   startedAtMs: number;
   nowMs: () => number;
+  ready?: () => boolean;
 }
 
 export interface HealthServer {
@@ -48,8 +49,10 @@ export async function startHealthServer(options: HealthServerOptions): Promise<H
       res.end(JSON.stringify({ error: "not_found" }));
       return;
     }
-    void pingDatabase(options.db).then((ok) => {
-      const body = JSON.stringify({ ok, db: ok, uptimeSec: Math.max(0, (options.nowMs() - options.startedAtMs) / 1000) });
+    void pingDatabase(options.db).then((db) => {
+      const ready = options.ready?.() ?? true;
+      const ok = db && ready;
+      const body = JSON.stringify({ ok, db, ready, uptimeSec: Math.max(0, (options.nowMs() - options.startedAtMs) / 1000) });
       res.writeHead(ok ? 200 : 503, { "content-type": "application/json", "cache-control": "no-store" });
       res.end(req.method === "HEAD" ? undefined : body);
     });

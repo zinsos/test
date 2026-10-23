@@ -1,5 +1,7 @@
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import type { RecorderConfig } from "../config/strategy.js";
-import type { Clock } from "../core/clock.js";
+import type { Clock, TimerHandle } from "../core/clock.js";
 import { moduleLogger } from "../core/logger.js";
 import type { Pubkey } from "../core/types.js";
 import type { Db } from "../db/pool.js";
@@ -9,7 +11,11 @@ import { cleanText, jsonText } from "./sql.js";
 const log = moduleLogger("metadata");
 
 export type MetadataConfig = RecorderConfig["metadata"];
-export type FetchLike = (input: string, init?: { signal?: AbortSignal; headers?: Record<string, string> }) => Promise<Response>;
+export type FetchLike = (
+  input: string,
+  init?: { signal?: AbortSignal; headers?: Record<string, string>; redirect?: "manual" }
+) => Promise<Response>;
+export type HostResolver = (hostname: string) => Promise<string[]>;
 
 export interface ParsedMetadata {
   name: string | null;
@@ -37,6 +43,9 @@ export interface MetadataFetcherOptions {
   maxQueue?: number;
   maxBytes?: number;
   retryDelayMs?: number;
+  maxRedirects?: number;
+  resolveHost?: HostResolver;
+  sweepIntervalMs?: number | null;
 }
 
 export class MetadataFetchError extends Error {
@@ -50,7 +59,74 @@ export class MetadataFetchError extends Error {
 
 const CID_PATTERN = /^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,})$/;
 const SUBDOMAIN_GATEWAY = /^([^.]+)\.ipfs\.[^/]+$/i;
-const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:"]);
+const ALLOWED_PROTOCOLS = new Set(["https:", "data:"]);
+const INTERNAL_HOST_SUFFIXES = [".internal", ".local", ".localhost", ".localdomain", ".home.arpa"];
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function ipv4Parts(address: string): number[] | null {
+  const parts = address.split(".").map((part) => Number(part));
+  return parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255) ? parts : null;
+}
+
+function isPrivateIpv4(address: string): boolean {
+  const parts = ipv4Parts(address);
+  if (!parts) {
+    return true;
+  }
+  const [a = 0, b = 0] = parts;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+export function isPrivateAddress(address: string): boolean {
+  const unbracketed = address.replace(/^\[|\]$/g, "").toLowerCase();
+  const version = isIP(unbracketed);
+  if (version === 4) {
+    return isPrivateIpv4(unbracketed);
+  }
+  if (version !== 6) {
+    return true;
+  }
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(unbracketed);
+  if (mapped?.[1]) {
+    return isPrivateIpv4(mapped[1]);
+  }
+  return (
+    unbracketed === "::" ||
+    unbracketed === "::1" ||
+    unbracketed.startsWith("fc") ||
+    unbracketed.startsWith("fd") ||
+    /^fe[89ab]/.test(unbracketed) ||
+    unbracketed.startsWith("ff")
+  );
+}
+
+export function blockedHostReason(hostname: string): string | null {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (host.length === 0 || host === "localhost" || INTERNAL_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix)) || !host.includes(".")) {
+    return `internal host ${host}`;
+  }
+  const literal = host.replace(/^\[|\]$/g, "");
+  if (isIP(literal) !== 0 && isPrivateAddress(literal)) {
+    return `private address ${literal}`;
+  }
+  return null;
+}
+
+async function resolveAll(hostname: string): Promise<string[]> {
+  const addresses = await lookup(hostname, { all: true, verbatim: true });
+  return addresses.map((entry) => entry.address);
+}
 
 export function normalizeGateway(gateway: string): string {
   const trimmed = gateway.trim();
@@ -156,8 +232,14 @@ export class MetadataFetcher {
   private readonly maxQueue: number;
   private readonly maxBytes: number;
   private readonly retryDelayMs: number;
+  private readonly maxRedirects: number;
+  private readonly resolveHost: HostResolver | null;
+  private readonly sweepIntervalMs: number | null;
   private readonly queue: MetadataJob[] = [];
+  private readonly known = new Set<number>();
   private readonly inflight = new Set<Promise<void>>();
+  private sweepTimer: TimerHandle | null = null;
+  private sweeping: Promise<void> | null = null;
   private running = false;
   private readonly counters = {
     enqueued: 0,
@@ -165,7 +247,9 @@ export class MetadataFetcher {
     fetched: 0,
     failed: 0,
     retries: 0,
-    storeErrors: 0
+    storeErrors: 0,
+    blocked: 0,
+    swept: 0
   };
 
   constructor(options: MetadataFetcherOptions) {
@@ -177,9 +261,12 @@ export class MetadataFetcher {
       options.gatewayOverride && options.gatewayOverride.length > 0 ? options.gatewayOverride : options.config.gateway
     );
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
+    this.resolveHost = options.resolveHost ?? (options.fetchImpl ? null : resolveAll);
     this.maxQueue = options.maxQueue ?? 10_000;
     this.maxBytes = options.maxBytes ?? 256 * 1024;
     this.retryDelayMs = options.retryDelayMs ?? 1_000;
+    this.maxRedirects = options.maxRedirects ?? 3;
+    this.sweepIntervalMs = options.sweepIntervalMs ?? null;
   }
 
   get gatewayUrl(): string {
@@ -188,12 +275,47 @@ export class MetadataFetcher {
 
   start(): void {
     this.running = this.config.enabled;
+    if (this.running && this.sweepIntervalMs !== null) {
+      this.scheduleSweep(this.clock.nowMs());
+    }
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    this.queue.length = 0;
+    if (this.sweepTimer) {
+      this.clock.cancel(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    await this.sweeping;
+    for (const job of this.queue.splice(0, this.queue.length)) {
+      this.known.delete(job.launchId);
+    }
     await this.drain();
+  }
+
+  async sweep(): Promise<number> {
+    const room = this.maxQueue - this.queue.length;
+    if (!this.running || room <= 0) {
+      return 0;
+    }
+    const result = await this.db.query<{ id: unknown; mint: string; uri: string }>(
+      `SELECT id, mint, uri FROM launches
+        WHERE metadata_fetched_at IS NULL AND tracking_ended_at IS NULL
+        ORDER BY created_at DESC LIMIT $1`,
+      [room + this.known.size]
+    );
+    let added = 0;
+    for (const row of result.rows) {
+      const launchId = Number(row.id);
+      if (added >= room || this.known.has(launchId)) {
+        continue;
+      }
+      if (this.enqueue({ launchId, mint: row.mint, uri: row.uri })) {
+        added += 1;
+      }
+    }
+    this.counters.swept += added;
+    return added;
   }
 
   async drain(): Promise<void> {
@@ -203,14 +325,18 @@ export class MetadataFetcher {
   }
 
   enqueue(job: MetadataJob): boolean {
-    if (!this.running) {
+    if (!this.running || this.known.has(job.launchId)) {
       return false;
     }
     if (this.queue.length >= this.maxQueue) {
-      this.queue.shift();
+      const dropped = this.queue.shift();
+      if (dropped) {
+        this.known.delete(dropped.launchId);
+      }
       this.counters.droppedQueueFull += 1;
     }
     this.queue.push(job);
+    this.known.add(job.launchId);
     this.counters.enqueued += 1;
     this.pump();
     return true;
@@ -218,6 +344,28 @@ export class MetadataFetcher {
 
   stats(): Record<string, number> {
     return { ...this.counters, queued: this.queue.length, active: this.inflight.size };
+  }
+
+  private scheduleSweep(atMs: number): void {
+    const intervalMs = this.sweepIntervalMs;
+    if (intervalMs === null) {
+      return;
+    }
+    this.sweepTimer = this.clock.schedule(atMs, async () => {
+      this.sweepTimer = null;
+      if (!this.running) {
+        return;
+      }
+      const run = this.sweep()
+        .then(() => undefined)
+        .catch((error: unknown) => log.warn({ err: error }, "metadata sweep failed"));
+      this.sweeping = run;
+      await run;
+      this.sweeping = null;
+      if (this.running) {
+        this.scheduleSweep(this.clock.nowMs() + intervalMs);
+      }
+    });
   }
 
   private pump(): void {
@@ -228,6 +376,7 @@ export class MetadataFetcher {
       }
       const task = this.process(job).finally(() => {
         this.inflight.delete(task);
+        this.known.delete(job.launchId);
         this.pump();
       });
       this.inflight.add(task);
@@ -265,35 +414,88 @@ export class MetadataFetcher {
     }
   }
 
+  private async checkUrl(url: string): Promise<URL> {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new MetadataFetchError(`invalid uri ${cleanText(url, 200)}`, false);
+    }
+    if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+      throw new MetadataFetchError(`unsupported protocol ${parsed.protocol}`, false);
+    }
+    if (parsed.protocol === "data:") {
+      return parsed;
+    }
+    const blocked = blockedHostReason(parsed.hostname);
+    if (blocked) {
+      this.counters.blocked += 1;
+      throw new MetadataFetchError(`refused ${blocked}`, false);
+    }
+    if (this.resolveHost && isIP(parsed.hostname.replace(/^\[|\]$/g, "")) === 0) {
+      const addresses = await this.resolveHost(parsed.hostname);
+      const internal = addresses.find((address) => isPrivateAddress(address));
+      if (addresses.length === 0 || internal !== undefined) {
+        this.counters.blocked += 1;
+        throw new MetadataFetchError(`refused host ${parsed.hostname} resolving to ${internal ?? "nothing"}`, false);
+      }
+    }
+    return parsed;
+  }
+
+  private async readLimited(response: Response, controller: AbortController): Promise<string> {
+    const length = Number(response.headers.get("content-length") ?? "0");
+    if (length > this.maxBytes) {
+      throw new MetadataFetchError(`metadata too large (${length} bytes)`, false);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return "";
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      total += value.byteLength;
+      if (total > this.maxBytes) {
+        controller.abort();
+        await reader.cancel().catch(() => undefined);
+        throw new MetadataFetchError(`metadata too large (over ${this.maxBytes} bytes)`, false);
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
   private async fetchJson(url: string): Promise<unknown> {
     if (url.length === 0) {
       throw new MetadataFetchError("empty uri", false);
     }
-    let protocol: string;
-    try {
-      protocol = new URL(url).protocol;
-    } catch {
-      throw new MetadataFetchError(`invalid uri ${cleanText(url, 200)}`, false);
-    }
-    if (!ALLOWED_PROTOCOLS.has(protocol)) {
-      throw new MetadataFetchError(`unsupported protocol ${protocol}`, false);
-    }
+    await this.checkUrl(url);
     const controller = new AbortController();
     const timer = this.clock.schedule(this.clock.nowMs() + this.config.timeoutMs, () => controller.abort());
     try {
-      const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json" } });
+      let target = url;
+      let response = await this.fetchImpl(target, { signal: controller.signal, headers: { accept: "application/json" }, redirect: "manual" });
+      for (let hop = 0; REDIRECT_STATUSES.has(response.status); hop += 1) {
+        const location = response.headers.get("location");
+        if (!location || hop >= this.maxRedirects) {
+          throw new MetadataFetchError(`http ${response.status} redirect not followed`, false);
+        }
+        await response.body?.cancel().catch(() => undefined);
+        target = new URL(location, target).toString();
+        await this.checkUrl(target);
+        response = await this.fetchImpl(target, { signal: controller.signal, headers: { accept: "application/json" }, redirect: "manual" });
+      }
       if (!response.ok) {
         const retryable = response.status === 429 || response.status >= 500;
+        await response.body?.cancel().catch(() => undefined);
         throw new MetadataFetchError(`http ${response.status}`, retryable);
       }
-      const length = Number(response.headers.get("content-length") ?? "0");
-      if (length > this.maxBytes) {
-        throw new MetadataFetchError(`metadata too large (${length} bytes)`, false);
-      }
-      const body = await response.text();
-      if (body.length > this.maxBytes) {
-        throw new MetadataFetchError(`metadata too large (${body.length} chars)`, false);
-      }
+      const body = await this.readLimited(response, controller);
       try {
         return JSON.parse(body) as unknown;
       } catch {

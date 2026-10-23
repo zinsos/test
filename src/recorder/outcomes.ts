@@ -85,6 +85,28 @@ export function subjectFromLaunchState(launchId: number, launch: LaunchState): O
   };
 }
 
+export async function loadStoredInsiders(db: Db, launchIds: readonly number[]): Promise<Map<number, Pubkey[]>> {
+  const insiders = new Map<number, Pubkey[]>();
+  if (launchIds.length === 0) {
+    return insiders;
+  }
+  const result = await db.query<{ launch_id: unknown; insiders: string[] }>(
+    `SELECT s.launch_id, array_agg(DISTINCT w ORDER BY w) AS insiders
+       FROM launch_scores s CROSS JOIN LATERAL unnest(s.insiders) AS w
+      WHERE s.launch_id = ANY($1::bigint[])
+      GROUP BY s.launch_id`,
+    [launchIds.map(String)]
+  );
+  for (const row of result.rows) {
+    insiders.set(toNumber(row.launch_id), row.insiders);
+  }
+  return insiders;
+}
+
+export function withStoredInsiders<T extends OutcomeSubject>(subject: T, insiders: ReadonlyMap<number, readonly Pubkey[]>): T {
+  return { ...subject, launch: { ...subject.launch, knownInsiders: insiders.get(subject.launchId) ?? [] } };
+}
+
 export async function loadOutcomeSubjects(db: Db, launchIds: readonly number[], trackHours: number): Promise<Map<number, LoadedSubject>> {
   const subjects = new Map<number, LoadedSubject>();
   if (launchIds.length === 0) {
@@ -136,6 +158,10 @@ export async function loadOutcomeSubjects(db: Db, launchIds: readonly number[], 
       ORDER BY launch_id, slot, seq, event_index`,
     [[...subjects.keys()].map(String), new Date(earliest - DAY_MS), new Date(latest + trackHours * HOUR_MS + DAY_MS)]
   );
+  const insiders = await loadStoredInsiders(db, [...subjects.keys()]);
+  for (const [launchId, subject] of subjects) {
+    subjects.set(launchId, withStoredInsiders(subject, insiders));
+  }
   for (const row of trades.rows) {
     const launchId = toNumber(row.launch_id);
     const subject = subjects.get(launchId);
@@ -445,17 +471,22 @@ export class OutcomeFinalizer {
   }
 
   private async collectSubjects(batch: readonly Candidate[]): Promise<OutcomeSubject[]> {
-    const subjects: OutcomeSubject[] = [];
+    const fromMemory: OutcomeSubject[] = [];
     const fromDb: number[] = [];
     for (const { entry } of batch) {
       const launch = this.memoryLaunch(entry);
       if (launch) {
-        subjects.push(subjectFromLaunchState(entry.launchId, launch));
+        fromMemory.push(subjectFromLaunchState(entry.launchId, launch));
         this.counters.fromMemory += 1;
       } else {
         fromDb.push(entry.launchId);
       }
     }
+    const insiders = await loadStoredInsiders(
+      this.db,
+      fromMemory.map((subject) => subject.launchId)
+    );
+    const subjects = fromMemory.map((subject) => withStoredInsiders(subject, insiders));
     if (fromDb.length > 0) {
       const trackHours = this.config.outcome.finalizeAfterHours + this.config.postMigrationTrackHours;
       const loaded = await loadOutcomeSubjects(this.db, fromDb, trackHours);

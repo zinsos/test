@@ -175,7 +175,12 @@ describe("trader live buys whose outcome stays unknown", () => {
     const config = strategy((c) => {
       c.risk.maxConcurrent = 1;
     });
-    const executor = new WalletExecutor({ clock: env.clock, inner: paper(env, config), hide: (order) => order.side === "buy" });
+    const executor = new WalletExecutor({
+      clock: env.clock,
+      inner: paper(env, config),
+      hide: (order) => order.side === "buy",
+      settleDelayMs: 30_000
+    });
     const { trader, store, risk } = buildTrader(env, { config, executor, mode: "live", reconcile: neverReconciles });
     await createLaunch(env, MINT_A, T0);
     await createLaunch(env, MINT_B, T0 + 1_000);
@@ -184,7 +189,8 @@ describe("trader live buys whose outcome stays unknown", () => {
     await flushMicrotasks();
     const [pendingRow] = store.pendingPositions();
     expect(pendingRow?.meta[PENDING_ENTRY_META]).toBeDefined();
-    await env.clock.advanceTo(T0 + 5_000 + 121_000);
+    await env.clock.advanceTo(T0 + 5_000 + 125_000);
+    expect(trader.primaryPositions()).toHaveLength(0);
     expect(trader.hasOpenPosition(MINT_A)).toBe(true);
     expect(trader.isBusy()).toBe(true);
     trader.handleSignal(signalFor(env, MINT_B));

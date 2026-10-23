@@ -4,9 +4,11 @@ import {
   REPLAY_PHASE,
   compareReplayEvents,
   completeEventFromRow,
+  DEFAULT_OBSERVATION,
   hydrateLaunch,
   launchEventFromRow,
   migrateEventFromRow,
+  observedAtMs,
   replayEventOf,
   tradeEventFromRow,
   type ReplayEvent
@@ -98,7 +100,21 @@ describe("replay rows", () => {
       virtualQuoteReserves: 30_000_000_000n,
       tokenTotalSupply: 1_000_000_000_000_000n
     });
-    expect(event.tx).toEqual({ signature: "sig", slot: 100, seq: 0, eventIndex: 0, receivedAtMs: T });
+    expect(event.tx).toEqual({ signature: "sig", slot: 100, seq: 0, eventIndex: 0, receivedAtMs: T + DEFAULT_OBSERVATION.defaultDelayMs });
+    expect(launchEventFromRow(launchRow({ observed_at: new Date(T + 900) })).tx.receivedAtMs).toBe(T + 900);
+  });
+
+  it("makes replayed events visible when the recorder received them, never before the block and never later than the lag cap", () => {
+    expect(observedAtMs(T, null)).toBe(T + DEFAULT_OBSERVATION.defaultDelayMs);
+    expect(observedAtMs(T, new Date(T + 1_234))).toBe(T + 1_234);
+    expect(observedAtMs(T, new Date(T - 300))).toBe(T);
+    expect(observedAtMs(T, new Date(T + 10 * 60_000))).toBe(T + DEFAULT_OBSERVATION.maxLagMs);
+    const trade = tradeEventFromRow(tradeRow({ received_at: new Date(T + 6_200) }));
+    expect(trade.timestampMs).toBe(T + 5_000);
+    const replay = replayEventOf(trade, 9);
+    expect({ atMs: replay.atMs, visibleAtMs: replay.visibleAtMs }).toEqual({ atMs: T + 5_000, visibleAtMs: T + 6_200 });
+    const migrate = migrateEventFromRow(launchRow({ migrated_at: new Date(T + 9_000), migrated_slot: 140n, pool: "PoolRow" }));
+    expect(migrate && replayEventOf(migrate, 9).visibleAtMs).toBe(T + 9_000 + DEFAULT_OBSERVATION.defaultDelayMs);
   });
 
   it("maps venue codes and attaches the pool only to pool trades", () => {
@@ -107,7 +123,13 @@ describe("replay rows", () => {
     expect(curve.pool).toBeNull();
     expect(curve.realTokenReserves).toBeNull();
     expect(curve.realQuoteReserves).toBe(5n);
-    expect(curve.tx).toEqual({ signature: "tradeSig", slot: 112, seq: 44, eventIndex: 1, receivedAtMs: T + 5_000 });
+    expect(curve.tx).toEqual({
+      signature: "tradeSig",
+      slot: 112,
+      seq: 44,
+      eventIndex: 1,
+      receivedAtMs: T + 5_000 + DEFAULT_OBSERVATION.defaultDelayMs
+    });
     const pool = tradeEventFromRow(tradeRow({ venue: 1 }));
     expect(pool.venue).toBe("pool");
     expect(pool.pool).toBe("PoolRow");

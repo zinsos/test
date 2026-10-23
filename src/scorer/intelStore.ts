@@ -20,8 +20,14 @@ interface IntelRow {
 export interface HubFacts {
   address: Pubkey;
   entityKind: string | null;
-  fanout: number;
+  fundingBursts: number;
   flagged: boolean;
+}
+
+export const FUNDING_BURST_MS = 120_000;
+
+export function fundingBurstKey(intel: Pick<WalletIntel, "wallet" | "fundedAtMs">): string {
+  return intel.fundedAtMs === null ? `wallet:${intel.wallet}` : `burst:${Math.floor(intel.fundedAtMs / FUNDING_BURST_MS)}`;
 }
 
 function msOrNull(value: Date | null): number | null {
@@ -113,16 +119,18 @@ export async function loadHubFacts(db: Db, addresses: readonly Pubkey[]): Promis
   if (addresses.length === 0) {
     return facts;
   }
-  const result = await db.query<{ address: string; kind: string | null; fanout: number; flagged: boolean }>(
+  const result = await db.query<{ address: string; kind: string | null; bursts: number; flagged: boolean }>(
     `SELECT f.address,
             (SELECT k.kind FROM known_entities k WHERE k.address = f.address) AS kind,
-            (SELECT count(*)::int FROM wallet_intel w WHERE w.funder = f.address) AS fanout,
+            (SELECT count(DISTINCT CASE WHEN w.funded_at IS NULL THEN 'wallet:' || w.wallet
+                                        ELSE 'burst:' || floor(extract(epoch FROM w.funded_at) * 1000 / $2)::bigint END)::int
+               FROM wallet_intel w WHERE w.funder = f.address) AS bursts,
             COALESCE((SELECT w2.is_hub FROM wallet_intel w2 WHERE w2.wallet = f.address), FALSE) AS flagged
        FROM unnest($1::text[]) AS f(address)`,
-    [addresses]
+    [addresses, FUNDING_BURST_MS]
   );
   for (const row of result.rows) {
-    facts.set(row.address, { address: row.address, entityKind: row.kind, fanout: row.fanout, flagged: row.flagged });
+    facts.set(row.address, { address: row.address, entityKind: row.kind, fundingBursts: row.bursts, flagged: row.flagged });
   }
   return facts;
 }

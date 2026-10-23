@@ -8,6 +8,7 @@ import { createScorerModule } from "../src/scorer/index.js";
 import type { IntelRpc } from "../src/scorer/intel.js";
 import { ScoringModel } from "../src/scorer/model.js";
 import { overlayStored, ScorerService, type ScorerMode } from "../src/scorer/service.js";
+import { DEFAULT_WEIGHTS } from "../src/scorer/weights.js";
 import type {
   DevHistoryProvider,
   DevHistorySummary,
@@ -320,7 +321,7 @@ describe("ScorerService replay mode", () => {
     expect(scorer.intel).toBeNull();
     expect(scorer.store).toBeNull();
     await scorer.start();
-    expect(scorer.service.currentModel().version).toBe("hand-v1");
+    expect(scorer.service.currentModel().version).toBe(DEFAULT_WEIGHTS.version);
     const scores: LaunchScore[] = [];
     bus.on("score", (score) => scores.push(score));
     bus.emit("chain", builder.createEvent);

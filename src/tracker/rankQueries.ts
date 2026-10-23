@@ -2,6 +2,7 @@ import { SOL_QUOTE } from "../core/constants.js";
 import type { Pubkey, TradeVenue } from "../core/types.js";
 import { toNumber, type Db } from "../db/pool.js";
 import { VENUE_CODES } from "../recorder/recorder.js";
+import { LINKING_ENTITY_KINDS } from "../scorer/intel.js";
 import type { MintContext, WalletFacts, WalletTrade } from "./types.js";
 
 export interface CandidateRow {
@@ -195,13 +196,15 @@ async function walletSet(db: Db, sql: string, params: unknown[]): Promise<Set<Pu
   return new Set(result.rows.map((row) => row.wallet));
 }
 
-export function devLinkedWallets(db: Db, wallets: readonly Pubkey[], asOfMs: number): Promise<Set<Pubkey>> {
+export function devLinkedWallets(db: Db, wallets: readonly Pubkey[], asOfMs: number, creationSlotWindow = 1): Promise<Set<Pubkey>> {
   return walletSet(
     db,
     `SELECT w AS wallet FROM unnest($1::text[]) AS w
      WHERE EXISTS (SELECT 1 FROM launches l WHERE l.dev_wallet = w AND l.created_at < $2)
-        OR EXISTS (SELECT 1 FROM launches l WHERE l.creator = w AND l.created_at < $2)`,
-    [wallets, new Date(asOfMs)]
+        OR EXISTS (SELECT 1 FROM launches l JOIN trades t ON t.launch_id = l.id
+                    WHERE l.creator = w AND l.created_at < $2 AND t.wallet = w AND t.is_buy
+                      AND t.slot <= l.create_slot + $3 AND t.block_time < $2)`,
+    [wallets, new Date(asOfMs), creationSlotWindow]
   );
 }
 
@@ -209,11 +212,12 @@ export function devFundedWallets(db: Db, wallets: readonly Pubkey[], asOfMs: num
   return walletSet(
     db,
     `SELECT DISTINCT wi.wallet FROM wallet_intel wi
-     WHERE wi.wallet = ANY($1::text[]) AND wi.funder IS NOT NULL AND NOT wi.is_hub
+     WHERE wi.wallet = ANY($1::text[]) AND wi.funder IS NOT NULL
        AND wi.checked_at < $2 AND COALESCE(wi.funded_at, wi.checked_at) < $2
-       AND (EXISTS (SELECT 1 FROM launches l WHERE l.dev_wallet = wi.funder AND l.created_at < $2)
-         OR EXISTS (SELECT 1 FROM launches l WHERE l.creator = wi.funder AND l.created_at < $2))`,
-    [wallets, new Date(asOfMs)]
+       AND NOT EXISTS (SELECT 1 FROM wallet_intel hub WHERE hub.wallet = wi.funder AND hub.is_hub)
+       AND NOT EXISTS (SELECT 1 FROM known_entities k WHERE k.address = wi.funder AND k.added_at < $2 AND k.kind <> ALL($3::text[]))
+       AND EXISTS (SELECT 1 FROM launches l WHERE l.dev_wallet = wi.funder AND l.created_at < $2)`,
+    [wallets, new Date(asOfMs), [...LINKING_ENTITY_KINDS]]
   );
 }
 
@@ -222,8 +226,7 @@ export function devFunderWallets(db: Db, wallets: readonly Pubkey[], asOfMs: num
     db,
     `SELECT DISTINCT wi.funder AS wallet FROM wallet_intel wi
      WHERE wi.funder = ANY($1::text[]) AND wi.checked_at < $2 AND COALESCE(wi.funded_at, wi.checked_at) < $2
-       AND (EXISTS (SELECT 1 FROM launches l WHERE l.dev_wallet = wi.wallet AND l.created_at < $2)
-         OR EXISTS (SELECT 1 FROM launches l WHERE l.creator = wi.wallet AND l.created_at < $2))`,
+       AND EXISTS (SELECT 1 FROM launches l WHERE l.dev_wallet = wi.wallet AND l.created_at < $2)`,
     [wallets, new Date(asOfMs)]
   );
 }
@@ -256,6 +259,7 @@ export async function knownEntityKinds(db: Db, wallets: readonly Pubkey[], asOfM
 export interface FactWindow {
   fromMs: number;
   asOfMs: number;
+  creationSlotWindow?: number;
 }
 
 export async function loadWalletFacts(
@@ -265,7 +269,7 @@ export async function loadWalletFacts(
   tooActive: ReadonlySet<Pubkey>
 ): Promise<Map<Pubkey, WalletFacts>> {
   const [linked, funded, funders, insiders, entities] = await Promise.all([
-    devLinkedWallets(db, wallets, window.asOfMs),
+    devLinkedWallets(db, wallets, window.asOfMs, window.creationSlotWindow),
     devFundedWallets(db, wallets, window.asOfMs),
     devFunderWallets(db, wallets, window.asOfMs),
     insiderLaunchCounts(db, wallets, window.fromMs, window.asOfMs),

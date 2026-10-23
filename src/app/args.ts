@@ -48,9 +48,14 @@ export const COMMANDS: readonly CommandSpec[] = [
       { ...TO_OPTION, required: true },
       { name: "label", kind: "string", description: "label stored on the strategy run" },
       CONFIG_OPTION,
-      { name: "weights", kind: "string", description: "scorer weights file or stored weights version (default: active weights)" },
+      {
+        name: "weights",
+        kind: "string",
+        description: "scorer weights file or stored weights version (default: the active, file or hand weights fitted before --from)"
+      },
+      { name: "allow-in-sample", kind: "boolean", description: "allow default weights fitted on data from the backtest window or later" },
       { name: "walk-forward", kind: "boolean", description: "rank wallets at every rerank interval inside the window first" },
-      { name: "include-incomplete", kind: "boolean", description: "also replay launches recorded with ingest gaps" },
+      { name: "include-incomplete", kind: "boolean", description: "keep entering launches after their data became incomplete" },
       { name: "json", kind: "boolean", description: "print the full summary as JSON after the report" }
     ]
   },
@@ -121,6 +126,14 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: "recompute-outcomes",
     summary: "relabel launch outcomes after changing recorder.outcome settings",
     options: [FROM_OPTION, TO_OPTION, CONFIG_OPTION]
+  },
+  {
+    name: "prune-data",
+    summary: "free disk space: drop trades, scores and holder snapshots of launches older than the kept window",
+    options: [
+      { name: "keep-days", kind: "number", required: true, description: "days of recorded data to keep (at least 100 keeps 90-day wallet rankings intact)" },
+      { name: "dry-run", kind: "boolean", description: "only report what would be deleted" }
+    ]
   },
   { name: "help", summary: "show this help", options: [] }
 ];

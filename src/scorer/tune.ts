@@ -3,7 +3,7 @@ import { labelValue, type DatasetLabelName, type DatasetRow } from "./dataset.js
 import { FEATURE_NAMES, NON_PREDICTIVE_FEATURES } from "./featureNames.js";
 import { fitLogistic, predictLogistic } from "./logistic.js";
 import { ScoringModel } from "./model.js";
-import type { FeatureWeight, WeightsFile } from "./weights.js";
+import { DEFAULT_WEIGHTS, type FeatureWeight, type WeightsFile } from "./weights.js";
 
 export type Direction = "higher_riskier" | "lower_riskier" | "none";
 
@@ -17,6 +17,7 @@ export interface TuneOptions {
   maxWeight?: number;
   version?: string;
   zClip?: number;
+  soloFrom?: WeightsFile;
 }
 
 export interface FeatureReport {
@@ -355,13 +356,16 @@ export function tune(rows: readonly DatasetRow[], label: DatasetLabelName, optio
   names.forEach((name, index) => coefficients.set(name, fit.coefficients[index] ?? 0));
   const maxAbs = Math.max(1e-12, ...[...coefficients.values()].map(Math.abs));
   const weightFeatures: Record<string, FeatureWeight> = {};
+  const soloBase = options.soloFrom ?? DEFAULT_WEIGHTS;
   const finalReports: FeatureReport[] = reports.map((report) => {
     const coefficient = coefficients.get(report.feature) ?? null;
     const usedInModel = coefficient !== null;
     const increasing = coefficient !== null && Math.abs(coefficient) > 1e-12 ? coefficient > 0 : report.direction !== "lower_riskier";
     const shape = riskShape(train, report.feature, increasing, baseRate);
     const suggestedWeight = usedInModel ? round((maxWeight * Math.abs(coefficient ?? 0)) / maxAbs, 2) : 0;
-    weightFeatures[report.feature] = { ...shape, weight: suggestedWeight };
+    const solo = increasing ? soloBase.features[report.feature]?.solo : undefined;
+    weightFeatures[report.feature] =
+      solo === undefined ? { ...shape, weight: suggestedWeight } : { ...shape, weight: suggestedWeight, solo };
     return { ...report, coefficient, usedInModel, suggestedWeight };
   });
   finalReports.sort((a, b) => (b.orientedAuc ?? -1) - (a.orientedAuc ?? -1));

@@ -72,6 +72,7 @@ export const ScorerConfigSchema = z.object({
       cacheTtlHours: z.number().positive().default(72),
       hubFanoutThreshold: z.number().int().positive().default(40),
       maxWalletsPerLaunch: z.number().int().positive().default(25),
+      minClusterCoverage: Fraction.default(0.6),
       timeoutMs: z.number().int().positive().default(8000)
     })
     .prefault({}),
@@ -110,6 +111,7 @@ export const TrackerConfigSchema = z.object({
       minWallets: z.number().int().positive().default(3),
       maxRiskScore: z.number().min(0).max(100).default(55),
       waitForScoreMs: z.number().int().nonnegative().default(5000),
+      maxScoreAgeSec: z.number().nonnegative().default(30),
       maxLaunchAgeSec: z.number().positive().default(3600)
     })
     .prefault({})
@@ -144,7 +146,7 @@ export const ExecutionConfigSchema = z.object({
   useJito: z.boolean().default(false),
   jitoTipLamports: z.number().int().nonnegative().default(1_000_000),
   baseFeeLamports: z.number().int().nonnegative().default(5_000),
-  ataRentLamports: z.number().int().nonnegative().default(2_039_280),
+  ataRentLamports: z.number().int().nonnegative().default(1_513_840),
   refundAtaOnClose: z.boolean().default(true),
   extraPlatformFeeBps: z.number().int().nonnegative().default(0),
   defaultProtocolFeeBps: z.number().int().nonnegative().default(95),

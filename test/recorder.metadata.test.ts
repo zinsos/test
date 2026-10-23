@@ -4,7 +4,10 @@ import { SystemClock } from "../src/core/clock.js";
 import type { LaunchCreatedEvent } from "../src/core/types.js";
 import type { Db } from "../src/db/pool.js";
 import { MarketState } from "../src/market/state.js";
+import { VirtualClock } from "../src/core/clock.js";
 import {
+  blockedHostReason,
+  isPrivateAddress,
   MetadataFetcher,
   normalizeGateway,
   parseMetadata,
@@ -262,5 +265,112 @@ describe("metadata fetcher", () => {
     stopped.start();
     await stopped.stop();
     expect(stopped.enqueue({ launchId: 1, mint: "M", uri: "https://x" })).toBe(false);
+  });
+
+  it("stops reading a metadata body as soon as it exceeds the size limit", async () => {
+    const { db } = fakeDb();
+    const chunk = new TextEncoder().encode("a".repeat(16 * 1024));
+    let pulled = 0;
+    const fetchImpl: FetchLike = async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            pulled += chunk.byteLength;
+            controller.enqueue(chunk);
+          }
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    const fetcher = new MetadataFetcher({ db, clock: new SystemClock(), config: { ...metadataConfig, maxRetries: 0 }, fetchImpl, maxBytes: 64 * 1024 });
+    fetcher.start();
+    await expect(fetcher.fetchWithRetries("https://meta.example/endless.json")).rejects.toThrow(/too large/);
+    expect(pulled).toBeLessThanOrEqual(64 * 1024 + 2 * chunk.byteLength);
+  });
+
+  it("refuses plain http, private addresses and internal hosts without fetching", async () => {
+    const { db } = fakeDb();
+    const urls: string[] = [];
+    const fetchImpl: FetchLike = async (url) => {
+      urls.push(url);
+      return jsonResponse({ name: "x" });
+    };
+    const fetcher = new MetadataFetcher({ db, clock: new SystemClock(), config: { ...metadataConfig, maxRetries: 0 }, fetchImpl });
+    fetcher.start();
+    for (const uri of [
+      "http://meta.example/a.json",
+      "https://169.254.169.254/latest/meta-data/",
+      "https://10.1.2.3/a.json",
+      "https://100.64.0.9/a.json",
+      "https://[::1]/a.json",
+      "https://localhost/a.json",
+      "https://snypra.railway.internal:8080/api/positions",
+      "https://postgres/a.json"
+    ]) {
+      await expect(fetcher.fetchWithRetries(uri), uri).rejects.toThrow(/refused|unsupported protocol/);
+    }
+    expect(urls).toEqual([]);
+    expect(blockedHostReason("ipfs.io")).toBeNull();
+    expect(isPrivateAddress("::ffff:127.0.0.1")).toBe(true);
+    expect(isPrivateAddress("172.20.1.1")).toBe(true);
+    expect(isPrivateAddress("8.8.8.8")).toBe(false);
+  });
+
+  it("refuses hosts that resolve to private addresses and redirects to internal hosts", async () => {
+    const { db } = fakeDb();
+    const urls: string[] = [];
+    const fetchImpl: FetchLike = async (url) => {
+      urls.push(url);
+      if (url.includes("redirect-internal")) {
+        return new Response(null, { status: 302, headers: { location: "https://metadata.railway.internal/secret" } });
+      }
+      if (url.includes("redirect-public")) {
+        return new Response(null, { status: 301, headers: { location: "/final.json" } });
+      }
+      return jsonResponse({ name: "ok", twitter: "https://x.com/ok" });
+    };
+    const resolveHost = async (host: string): Promise<string[]> => (host === "rebind.example" ? ["93.184.216.34", "127.0.0.1"] : ["93.184.216.34"]);
+    const fetcher = new MetadataFetcher({ db, clock: new SystemClock(), config: { ...metadataConfig, maxRetries: 0 }, fetchImpl, resolveHost });
+    fetcher.start();
+    await expect(fetcher.fetchWithRetries("https://rebind.example/a.json")).rejects.toThrow(/refused host/);
+    await expect(fetcher.fetchWithRetries("https://cdn.example/redirect-internal.json")).rejects.toThrow(/refused internal host/);
+    expect((await fetcher.fetchWithRetries("https://cdn.example/redirect-public.json")).twitter).toBe("https://x.com/ok");
+    expect(urls).toEqual([
+      "https://cdn.example/redirect-internal.json",
+      "https://cdn.example/redirect-public.json",
+      "https://cdn.example/final.json"
+    ]);
+  });
+
+  it("sweeps launches whose metadata was never fetched and skips jobs already queued", async () => {
+    const queries: string[] = [];
+    const db = {
+      query: async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes("metadata_fetched_at IS NULL")) {
+          return { rows: [{ id: "7", mint: "SweptMint", uri: "https://meta.example/7.json" }, { id: "8", mint: "QueuedMint", uri: "https://meta.example/8.json" }], rowCount: 2 };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+    } as unknown as Db;
+    const fetched: string[] = [];
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchImpl: FetchLike = async (url) => {
+      fetched.push(url);
+      await gate;
+      return jsonResponse({ name: "x" });
+    };
+    const clock = new VirtualClock(0);
+    const fetcher = new MetadataFetcher({ db, clock, config: { ...metadataConfig, concurrency: 1 }, fetchImpl, sweepIntervalMs: 60_000 });
+    fetcher.start();
+    fetcher.enqueue({ launchId: 8, mint: "QueuedMint", uri: "https://meta.example/8.json" });
+    await clock.advanceTo(0);
+    expect(fetcher.stats()).toMatchObject({ swept: 1, queued: 1, active: 1 });
+    release();
+    await fetcher.drain();
+    expect(fetched.sort()).toEqual(["https://meta.example/7.json", "https://meta.example/8.json"]);
+    await fetcher.stop();
   });
 });

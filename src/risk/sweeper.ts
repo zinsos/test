@@ -13,6 +13,7 @@ import type { SweeperConfig } from "../config/strategy.js";
 import type { Clock, TimerHandle } from "../core/clock.js";
 import { BASE_SIGNATURE_FEE_LAMPORTS, DEFAULT_PUBKEY } from "../core/constants.js";
 import { moduleLogger } from "../core/logger.js";
+import { hashString } from "../core/rng.js";
 import type { Db } from "../db/pool.js";
 import { solToLamports } from "./money.js";
 
@@ -45,15 +46,22 @@ export interface SweepResult {
   error: string | null;
 }
 
+export interface SweepLease {
+  release(): Promise<void>;
+}
+
+export type SweepLock = () => Promise<SweepLease | null>;
+
 export interface HotColdSweeperOptions {
   connection: SweeperConnection;
   hotKeypair: Keypair;
   coldAddress: string;
   config: SweeperConfig;
-  db: Pick<Db, "query">;
+  db: Pick<Db, "query" | "connect">;
   clock: Clock;
   dryRun: boolean;
   isBusy: () => boolean;
+  lock?: SweepLock;
   commitment?: Commitment;
   initialDelayMs?: number;
   networkFeeLamports?: bigint;
@@ -93,6 +101,40 @@ export function validateColdAddress(coldAddress: string, hot: PublicKey): Public
     throw new SweeperConfigError("cold wallet address is a program derived address, not a wallet");
   }
   return cold;
+}
+
+export function sweepLockKey(hot: PublicKey): number {
+  return hashString(`snypra-edge:sweeper:${hot.toBase58()}`) | 0;
+}
+
+export function advisorySweepLock(db: Pick<Db, "connect">, hot: PublicKey): SweepLock {
+  const key = sweepLockKey(hot);
+  return async () => {
+    const client = await db.connect();
+    let locked = false;
+    try {
+      const result = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_lock($1) AS locked", [key]);
+      locked = result.rows[0]?.locked === true;
+    } finally {
+      if (!locked) {
+        client.release();
+      }
+    }
+    if (!locked) {
+      return null;
+    }
+    return {
+      release: async () => {
+        try {
+          await client.query("SELECT pg_advisory_unlock($1)", [key]);
+          client.release();
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      }
+    };
+  };
 }
 
 export function hotFloorLamports(config: SweeperConfig): bigint {
@@ -170,6 +212,7 @@ export class HotColdSweeper {
   private readonly options: HotColdSweeperOptions;
   private readonly commitment: Commitment;
   private readonly networkFee: bigint;
+  private readonly lock: SweepLock;
   private timer: TimerHandle | null = null;
   private running: Promise<SweepResult> | null = null;
   private stopped = true;
@@ -180,6 +223,7 @@ export class HotColdSweeper {
     this.cold = validateColdAddress(options.coldAddress, this.hot);
     this.commitment = options.commitment ?? "confirmed";
     this.networkFee = options.networkFeeLamports ?? BASE_SIGNATURE_FEE_LAMPORTS;
+    this.lock = options.lock ?? advisorySweepLock(options.db, this.hot);
     if (options.config.intervalMinutes <= 0) {
       throw new SweeperConfigError("intervalMinutes must be positive");
     }
@@ -260,6 +304,25 @@ export class HotColdSweeper {
     if (this.options.isBusy()) {
       return this.result("busy", null, 0n);
     }
+    let lease: SweepLease | null;
+    try {
+      lease = await this.lock();
+    } catch (error) {
+      log.warn({ err: error }, "sweep lock unavailable");
+      return this.result("error", null, 0n, { error: errorText(error) });
+    }
+    if (!lease) {
+      log.info({ hot: this.hot.toBase58() }, "another process is sweeping this hot wallet; skipped");
+      return this.result("in_progress", null, 0n);
+    }
+    try {
+      return await this.sweepHoldingLock();
+    } finally {
+      await lease.release().catch((error: unknown) => log.warn({ err: error }, "sweep lock release failed"));
+    }
+  }
+
+  private async sweepHoldingLock(): Promise<SweepResult> {
     let balance: bigint;
     try {
       balance = BigInt(await this.options.connection.getBalance(this.hot, this.commitment));

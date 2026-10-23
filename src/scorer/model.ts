@@ -21,6 +21,13 @@ interface ModelEntry {
   weight: number;
   points: Array<[number, number]>;
   missingRisk: number;
+  solo: number;
+}
+
+export interface RawScore {
+  score: number;
+  contributions: Record<string, number>;
+  soloFeature: string | null;
 }
 
 export function riskAt(points: ReadonlyArray<readonly [number, number]>, x: number): number {
@@ -79,6 +86,10 @@ export function hardBlockFlags(features: FeatureVector, hardBlocks: HardBlockCon
   return flags;
 }
 
+export function soloFlag(feature: string): string {
+  return `solo_${feature}`;
+}
+
 function round(value: number, digits: number): number {
   const factor = 10 ** digits;
   return Math.round(value * factor) / factor;
@@ -91,12 +102,13 @@ export class ScoringModel {
   constructor(weights: WeightsFile) {
     this.weights = parseWeights(weights);
     this.entries = Object.entries(this.weights.features)
-      .filter(([, spec]) => spec.weight > 0)
+      .filter(([, spec]) => spec.weight > 0 || (spec.solo ?? 0) > 0)
       .map(([name, spec]) => ({
         name,
         weight: spec.weight,
         points: [...spec.points].sort((a, b) => a[0] - b[0]),
-        missingRisk: spec.missingRisk
+        missingRisk: spec.missingRisk,
+        solo: spec.solo ?? 0
       }));
   }
 
@@ -112,10 +124,13 @@ export class ScoringModel {
     return this.entries.map((entry) => entry.name);
   }
 
-  rawScore(features: FeatureVector): { score: number; contributions: Record<string, number> } {
+  weightedMean(features: FeatureVector): { score: number; contributions: Record<string, number> } {
     const parts: Array<{ name: string; weight: number; risk: number }> = [];
     let totalWeight = 0;
     for (const entry of this.entries) {
+      if (entry.weight <= 0) {
+        continue;
+      }
       const value = features[entry.name];
       const missing = !usable(value);
       const weight = missing ? entry.weight / 2 : entry.weight;
@@ -136,13 +151,37 @@ export class ScoringModel {
     return { score: Math.min(100, Math.max(0, score)), contributions };
   }
 
+  strongestSolo(features: FeatureVector): { feature: string; score: number } | null {
+    let best: { feature: string; score: number } | null = null;
+    for (const entry of this.entries) {
+      const value = features[entry.name];
+      if (entry.solo <= 0 || !usable(value)) {
+        continue;
+      }
+      const score = entry.solo * riskAt(entry.points, value);
+      if (score > (best?.score ?? 0)) {
+        best = { feature: entry.name, score };
+      }
+    }
+    return best;
+  }
+
+  rawScore(features: FeatureVector): RawScore {
+    const mean = this.weightedMean(features);
+    const solo = this.strongestSolo(features);
+    if (solo && solo.score > mean.score) {
+      return { score: Math.min(100, solo.score), contributions: mean.contributions, soloFeature: solo.feature };
+    }
+    return { ...mean, soloFeature: null };
+  }
+
   score(features: FeatureVector, hardBlocks: HardBlockConfig): ModelScore {
-    const { score, contributions } = this.rawScore(features);
-    const flags = hardBlockFlags(features, hardBlocks);
+    const { score, contributions, soloFeature } = this.rawScore(features);
+    const hardFlags = hardBlockFlags(features, hardBlocks);
     return {
       score: round(score, 2),
-      hardBlocked: flags.length > 0,
-      flags,
+      hardBlocked: hardFlags.length > 0,
+      flags: soloFeature ? [...hardFlags, soloFlag(soloFeature)] : hardFlags,
       contributions,
       weightsVersion: this.version
     };

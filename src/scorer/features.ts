@@ -215,14 +215,16 @@ function deepFeatures(basis: Basis): DeepOutcome {
   const freshLimit = basis.ctx.config.deepIntel.freshMaxPriorTxs;
   const fresh = known.filter((entry) => !entry.priorTxCapped && (entry.priorTxCount ?? Infinity) <= freshLimit);
   const anyDevIntel = basis.devs.some((dev) => hasIntelData(intel.get(dev)));
+  const coverage = wallets.length > 0 ? covered.length / wallets.length : null;
   const features: FeatureVector = {
     ...NULL_DEEP,
-    intel_coverage: wallets.length > 0 ? covered.length / wallets.length : null,
+    intel_coverage: coverage,
     fresh_wallet_ratio: known.length > 0 ? fresh.length / known.length : null
   };
   if (covered.length === 0 && !anyDevIntel) {
     return { features, clusters: [], devFundedBuyers: [] };
   }
+  const absenceIsKnown = coverage === null || coverage >= basis.ctx.config.deepIntel.minClusterCoverage;
   const result = buildFundingClusters({
     buyers: wallets,
     devWallets: basis.devs,
@@ -230,10 +232,14 @@ function deepFeatures(basis: Basis): DeepOutcome {
     ...(basis.ctx.isHub ? { isHub: basis.ctx.isHub } : {})
   });
   const clusters = clusterSummaries(basis, result.clusters);
-  features.largest_cluster_size = clusters.reduce((max, cluster) => Math.max(max, cluster.buyers.length), 0);
-  features.largest_cluster_share = clusters.reduce((max, cluster) => Math.max(max, cluster.heldShare), 0);
-  features.cluster_count = clusters.length;
-  features.dev_funded_buyers = result.devFundedBuyers.length;
+  if (absenceIsKnown || clusters.length > 0) {
+    features.largest_cluster_size = clusters.reduce((max, cluster) => Math.max(max, cluster.buyers.length), 0);
+    features.largest_cluster_share = clusters.reduce((max, cluster) => Math.max(max, cluster.heldShare), 0);
+    features.cluster_count = clusters.length;
+  }
+  if (absenceIsKnown || result.devFundedBuyers.length > 0) {
+    features.dev_funded_buyers = result.devFundedBuyers.length;
+  }
   return { features, clusters, devFundedBuyers: result.devFundedBuyers };
 }
 

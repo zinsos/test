@@ -8,6 +8,7 @@ import { loadRiskState } from "../src/risk/persistence.js";
 import { closePosition } from "../src/trader/accounting.js";
 import { withNextFillSeq } from "../src/trader/ids.js";
 import {
+  countOpenPositions,
   findOpenRun,
   killResetRequestsAfter,
   latestKillResetRequestId,
@@ -214,6 +215,41 @@ describe.skipIf(!hasTestDatabase)("PgTradingStore", () => {
     expect(requestId).toBeGreaterThan(before);
     expect(await killResetRequestsAfter(db, first.runId, before)).toEqual([{ id: requestId, reason: "operator" }]);
     expect(await killResetRequestsAfter(db, first.runId, requestId)).toEqual([]);
+    await store.stop();
+  });
+
+  it("keeps pending live entries restorable, never lets them overwrite a real position, and deletes them once discarded", async () => {
+    const db = database.db;
+    const store = new PgTradingStore({ db });
+    const runId = await store.createRun({ mode: "live", label: null, config: {}, dataFrom: null, dataTo: null });
+    const otherRuns = await countOpenPositions(db, "live");
+    const pendingMeta = { orderKey: "k", pendingEntry: { quoteBudget: "100000000", settleAfterMs: T0 + 1 } };
+    const pending = position(runId, `${runId}-pending`, { mode: "live", status: "pending", tokensHeld: 0n, entryCost: 0n, meta: pendingMeta });
+    const opened = position(runId, `${runId}-opened`, { mode: "live" });
+    const dropped = position(runId, `${runId}-dropped`, { mode: "live", status: "pending", tokensHeld: 0n, meta: pendingMeta });
+    store.savePosition(pending);
+    store.savePosition({ ...opened, status: "pending", tokensHeld: 0n, meta: pendingMeta });
+    store.savePosition(dropped);
+    await store.flush();
+    expect(await countOpenPositions(db, "live")).toBe(otherRuns + 3);
+    store.savePosition(opened);
+    store.discardPendingPosition(dropped.id);
+    await store.flush();
+    store.savePosition({ ...opened, status: "pending", tokensHeld: 0n, meta: pendingMeta });
+    await store.flush();
+    store.discardPendingPosition(opened.id);
+    await store.flush();
+    const restored = await loadOpenPositions(db, runId);
+    expect(restored.map((entry) => [entry.id, entry.status]).sort()).toEqual(
+      [
+        [opened.id, "open"],
+        [pending.id, "pending"]
+      ].sort()
+    );
+    expect(restored.find((entry) => entry.id === pending.id)?.meta.pendingEntry).toEqual(pendingMeta.pendingEntry);
+    expect(restored.find((entry) => entry.id === opened.id)?.tokensHeld).toBe(1_000_000n);
+    expect(await countOpenPositions(db, "live")).toBe(otherRuns + 2);
+    expect(store.stats().writeErrors).toBe(0);
     await store.stop();
   });
 });

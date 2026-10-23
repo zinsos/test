@@ -1,36 +1,42 @@
 {
-  "version": "hand-v1",
-  "label": "hand-set defaults: bundles and funding clusters first, then dev, concentration, flow, metadata",
+  "version": "hand-v2",
+  "label": "hand-set defaults: bundles and funding clusters first, then dev, concentration, flow, metadata; strong single red flags score on their own",
   "features": {
     "bundle_bought_share": {
       "weight": 18,
       "points": [[0, 0], [0.02, 0.25], [0.05, 0.6], [0.1, 0.9], [0.2, 1]],
-      "missingRisk": 0.3
+      "missingRisk": 0.3,
+      "solo": 85
     },
     "bundle_share": {
       "weight": 14,
       "points": [[0, 0], [0.02, 0.2], [0.05, 0.55], [0.1, 0.85], [0.2, 1]],
-      "missingRisk": 0.3
+      "missingRisk": 0.3,
+      "solo": 85
     },
     "creation_slot_buyers": {
       "weight": 10,
       "points": [[0, 0], [1, 0.2], [2, 0.45], [4, 0.8], [6, 1]],
-      "missingRisk": 0.3
+      "missingRisk": 0.3,
+      "solo": 70
     },
     "largest_cluster_share": {
       "weight": 18,
       "points": [[0, 0], [0.02, 0.2], [0.05, 0.5], [0.1, 0.8], [0.2, 1]],
-      "missingRisk": 0.4
+      "missingRisk": 0.4,
+      "solo": 85
     },
     "largest_cluster_size": {
       "weight": 12,
       "points": [[0, 0], [2, 0.45], [3, 0.7], [5, 0.9], [8, 1]],
-      "missingRisk": 0.4
+      "missingRisk": 0.4,
+      "solo": 85
     },
     "dev_funded_buyers": {
       "weight": 12,
       "points": [[0, 0], [1, 0.6], [2, 0.85], [3, 1]],
-      "missingRisk": 0.35
+      "missingRisk": 0.35,
+      "solo": 80
     },
     "cluster_count": {
       "weight": 2,
@@ -40,17 +46,20 @@
     "dev_sold_fraction": {
       "weight": 10,
       "points": [[0, 0], [0.05, 0.3], [0.25, 0.75], [0.5, 0.95], [1, 1]],
-      "missingRisk": 0.3
+      "missingRisk": 0.3,
+      "solo": 80
     },
     "dev_share": {
       "weight": 8,
       "points": [[0, 0], [0.02, 0.1], [0.05, 0.35], [0.1, 0.7], [0.2, 1]],
-      "missingRisk": 0.4
+      "missingRisk": 0.4,
+      "solo": 75
     },
     "dev_rug_rate": {
       "weight": 8,
       "points": [[0, 0], [0.2, 0.2], [0.5, 0.65], [0.8, 1]],
-      "missingRisk": 0.35
+      "missingRisk": 0.35,
+      "solo": 75
     },
     "dev_initial_share": {
       "weight": 2,
@@ -75,12 +84,14 @@
     "fresh_wallet_ratio": {
       "weight": 6,
       "points": [[0, 0], [0.2, 0.15], [0.4, 0.45], [0.6, 0.75], [0.8, 1]],
-      "missingRisk": 0.4
+      "missingRisk": 0.4,
+      "solo": 60
     },
     "top10_share": {
       "weight": 5,
       "points": [[0.1, 0], [0.2, 0.2], [0.3, 0.5], [0.45, 0.85], [0.6, 1]],
-      "missingRisk": 0.5
+      "missingRisk": 0.5,
+      "solo": 60
     },
     "wash_ratio": {
       "weight": 3,

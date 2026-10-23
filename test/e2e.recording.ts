@@ -9,7 +9,7 @@ import { createScorerModule } from "../src/scorer/index.js";
 import { decodeResultOf, ScenarioIntelRpc, simulateScenario, type Scenario } from "./e2e.market.js";
 
 const HOUR_MS = 3_600_000;
-const STREAM_LAG_MS = 400;
+export const STREAM_LAG_MS = 400;
 
 export interface RecordingResult {
   transactions: number;
@@ -43,7 +43,12 @@ export async function recordScenario(db: Db, scenario: Scenario, config: Strateg
   let events = 0;
   for (const tx of transactions) {
     await clock.advanceTo(tx.atMs + STREAM_LAG_MS);
-    pipeline.handleBatch(decodeResultOf(tx), { signature: tx.signature, slot: tx.slot, seq: tx.events[0]?.tx.seq ?? 0, receivedAtMs: clock.nowMs() });
+    pipeline.handleBatch(decodeResultOf(tx, clock.nowMs()), {
+      signature: tx.signature,
+      slot: tx.slot,
+      seq: tx.events[0]?.tx.seq ?? 0,
+      receivedAtMs: clock.nowMs()
+    });
     events += tx.events.length;
   }
   const finalizeBy = scenario.lastLaunchMs + (config.recorder.outcome.finalizeAfterHours + 1) * HOUR_MS;

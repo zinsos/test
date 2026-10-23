@@ -1,13 +1,14 @@
 import { startAnalyticsServer } from "../analytics/index.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
-import type { StrategyConfig } from "../config/strategy.js";
+import type { ScorerConfig, StrategyConfig } from "../config/strategy.js";
 import { Bus } from "../core/bus.js";
 import { SystemClock, type Clock } from "../core/clock.js";
 import { moduleLogger } from "../core/logger.js";
 import type { Signal } from "../core/types.js";
 import { runMigrations } from "../db/migrate.js";
 import type { Db } from "../db/pool.js";
+import { waitForDatabase } from "../db/wait.js";
 import { createIngestModule, type IngestModule, type StreamSource } from "../ingest/index.js";
 import type { MarketState } from "../market/state.js";
 import { createRecorderModule, type RecorderModule } from "../recorder/index.js";
@@ -32,6 +33,30 @@ import { TradingLock } from "./tradingLock.js";
 
 const log = moduleLogger("app");
 const MINUTE_MS = 60_000;
+const MIN_DASHBOARD_TOKEN_LENGTH = 24;
+const PLACEHOLDER_DASHBOARD_TOKEN = "change-me-to-a-long-random-string";
+
+export function dashboardTokenProblem(token: string | undefined): string | null {
+  const value = token?.trim() ?? "";
+  if (value.length === 0) {
+    return "DASHBOARD_TOKEN is not set";
+  }
+  if (value === PLACEHOLDER_DASHBOARD_TOKEN) {
+    return "DASHBOARD_TOKEN is still the .env.example placeholder";
+  }
+  if (value.length < MIN_DASHBOARD_TOKEN_LENGTH) {
+    return `DASHBOARD_TOKEN is shorter than ${MIN_DASHBOARD_TOKEN_LENGTH} characters`;
+  }
+  return null;
+}
+
+export function fetchesWalletIntel(modules: ReadonlySet<ModuleName>): boolean {
+  return modules.has("recorder") || modules.has("scorer");
+}
+
+export function storedIntelOnly(config: ScorerConfig): ScorerConfig {
+  return { ...config, deepIntel: { ...config.deepIntel, minBuyersForDeep: Number.MAX_SAFE_INTEGER } };
+}
 
 export interface LiveAppOptions {
   env: Env;
@@ -47,6 +72,8 @@ export interface LiveAppOptions {
   balanceIntervalMs?: number;
   killResetPollMs?: number;
   lockRetryMs?: number;
+  databaseWaitMs?: number;
+  allowOpenDashboard?: boolean;
   abort?: () => boolean;
 }
 
@@ -137,7 +164,16 @@ function createComponents(
   const recorder = modules.has("recorder") ? createRecorderModule({ db, rpc, bus, market, clock, config, env }) : null;
   const scorer =
     modules.has("scorer") || modules.has("tracker") || trading
-      ? createScorerModule({ db, rpc, bus, market, clock, config: config.scorer, mode: "live", persistScores: modules.has("scorer") })
+      ? createScorerModule({
+          db,
+          rpc,
+          bus,
+          market,
+          clock,
+          config: fetchesWalletIntel(modules) ? config.scorer : storedIntelOnly(config.scorer),
+          mode: "live",
+          persistScores: modules.has("scorer")
+        })
       : null;
   if (!scorer) {
     return { recorder, scorer, tracker: null, ownRegistry: null };
@@ -183,6 +219,17 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
     return stopping;
   };
   try {
+    if (modules.has("dashboard") && !options.allowOpenDashboard) {
+      const problem = dashboardTokenProblem(env.DASHBOARD_TOKEN);
+      if (problem) {
+        throw new Error(`${problem}: set a long random DASHBOARD_TOKEN before serving the dashboard, it exposes trades, positions and wallets`);
+      }
+    }
+    await waitForDatabase(db, {
+      clock,
+      abort: () => stopping !== null || (options.abort?.() ?? false),
+      maxWaitMs: options.databaseWaitMs
+    });
     if (options.migrate ?? true) {
       const applied = await runMigrations(db);
       if (applied.length > 0) {
@@ -194,6 +241,9 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
     const rpc = options.rpc !== undefined ? options.rpc : createRpc(env);
     if (!rpc && (modules.has("recorder") || modules.has("scorer") || modules.has("tracker"))) {
       log.warn("RPC_HTTP_URL is not set: wallet intel, RPC holder snapshots and wallet backfills are off");
+    }
+    if (rpc && !fetchesWalletIntel(modules) && modules.has("trader")) {
+      log.info("this service reads wallet intel stored by the recorder/scorer service and makes no wallet-intel RPC calls");
     }
     let tradingParts: TradingParts | null = null;
     let observer: SignalObserver | null = null;
@@ -243,7 +293,13 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           extraHealth: () => statsSnapshot(),
           settings: { maxRisk: config.scorer.maxRisk }
         })
-      : await startHealthServer({ db, port, startedAtMs, nowMs: () => clock.nowMs() });
+      : await startHealthServer({
+          db,
+          port,
+          startedAtMs,
+          nowMs: () => clock.nowMs(),
+          ready: recorder ? () => (ingest?.pipeline.stats().batches ?? 0) > 0 : undefined
+        });
     stoppables.push({ name: "http", stop: () => http.close() });
 
     if (modules.has("trader") && tracker) {

@@ -198,6 +198,42 @@ describe("computeFeatures", () => {
     expect(result.features.largest_cluster_size).toBeNull();
   });
 
+  it("treats cluster absence as unknown when only part of the early buyers have intel", () => {
+    const builder = new LaunchBuilder({ mint: "PartialCoverageMint" });
+    builder.buy("DevWallet", SOL / 2n, { slot: builder.createdSlot });
+    for (let index = 0; index < 5; index += 1) {
+      builder.buy(`linked${index}`, SOL / 2n, { atMs: builder.createdAtMs + 3_000 + index * 500 });
+    }
+    for (let index = 0; index < 10; index += 1) {
+      builder.buy(`organic${index}`, SOL / 5n, { atMs: builder.createdAtMs + 6_000 + index * 900 });
+    }
+    const nowMs = builder.createdAtMs + 30_000;
+    const devOnly = computeFeatures(builder.launch, { nowMs, config, intel: new Map([["DevWallet", intelEntry("DevWallet")]]) });
+    expect(devOnly.features.intel_coverage).toBe(0);
+    for (const name of ["largest_cluster_size", "largest_cluster_share", "cluster_count", "dev_funded_buyers"]) {
+      expect(devOnly.features[name]).toBeNull();
+    }
+    const none = computeFeatures(builder.launch, { nowMs, config, intel: null });
+    const model = ScoringModel.default();
+    expect(model.score(devOnly.features, config.hardBlocks).score).toBeGreaterThanOrEqual(model.score(none.features, config.hardBlocks).score);
+    const organicOnly = new Map<string, WalletIntel>(
+      Array.from({ length: 5 }, (_, index) => [`organic${index}`, intelEntry(`organic${index}`)] as const)
+    );
+    const partial = computeFeatures(builder.launch, { nowMs, config, intel: organicOnly });
+    expect(partial.features.intel_coverage).toBeCloseTo(1 / 3, 6);
+    expect(partial.features.largest_cluster_size).toBeNull();
+    const linkedTwo = new Map(organicOnly);
+    linkedTwo.set("linked0", intelEntry("linked0", { funder: "Master" }));
+    linkedTwo.set("linked1", intelEntry("linked1", { funder: "Master" }));
+    const found = computeFeatures(builder.launch, { nowMs, config, intel: linkedTwo });
+    expect(found.features.largest_cluster_size).toBe(2);
+    expect(found.features.dev_funded_buyers).toBeNull();
+    const everyone = new Map<string, WalletIntel>([...builder.launch.wallets.keys()].map((wallet) => [wallet, intelEntry(wallet)]));
+    const clean = computeFeatures(builder.launch, { nowMs, config, intel: everyone });
+    expect(clean.features.largest_cluster_size).toBe(0);
+    expect(clean.features.dev_funded_buyers).toBe(0);
+  });
+
   it("passes dev history and copycat context through", () => {
     const builder = organicLaunch({}, 3);
     const result = computeFeatures(builder.launch, {

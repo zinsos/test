@@ -165,6 +165,19 @@ describe.skipIf(!hasTestDatabase)("analytics queries", () => {
     expect(wallets.run?.tracked).toBe(3);
     expect(wallets.wallets.map((wallet) => wallet.wallet)).toEqual([walletAt(1), walletAt(3), walletAt(2)]);
     expect(wallets.wallets[0]?.pnl30dSol).toBeCloseTo(1.5, 9);
+    const walkForward = await database.db.query<{ id: bigint }>(
+      `INSERT INTO wallet_rank_runs (as_of, params, candidates, tracked) VALUES (now(), '{"label": "walk-forward"}'::jsonb, 1, 1) RETURNING id`
+    );
+    try {
+      await database.db.query(`INSERT INTO wallet_ranks (run_id, wallet, rank, score, tracked) VALUES ($1, 'BacktestOnly', 1, 1, TRUE)`, [
+        walkForward.rows[0]?.id.toString()
+      ]);
+      const unchanged = await trackedWallets(database.db);
+      expect(unchanged.run?.runId).toBe(wallets.run?.runId);
+      expect(unchanged.wallets.map((wallet) => wallet.wallet)).not.toContain("BacktestOnly");
+    } finally {
+      await database.db.query("DELETE FROM wallet_rank_runs WHERE id = $1", [walkForward.rows[0]?.id.toString()]);
+    }
   });
 
   it("calibrates the scorer by bucket and by pass or block", async () => {

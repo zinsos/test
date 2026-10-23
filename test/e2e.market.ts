@@ -640,8 +640,9 @@ export function simulateScenario(scenario: Scenario): SimTransaction[] {
   return all;
 }
 
-export function decodeResultOf(tx: SimTransaction): DecodeResult {
-  return { events: tx.events, truncated: false, incomplete: 0, unknown: 0 };
+export function decodeResultOf(tx: SimTransaction, receivedAtMs?: number): DecodeResult {
+  const events = receivedAtMs === undefined ? tx.events : tx.events.map((event) => ({ ...event, tx: { ...event.tx, receivedAtMs } }));
+  return { events, truncated: false, incomplete: 0, unknown: 0 };
 }
 
 function signatureList(wallet: Pubkey, profile: WalletProfile, limit: number): SignatureInfo[] {

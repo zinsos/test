@@ -32,6 +32,7 @@ export class SerialBatchWriter {
   }
 
   start(): void {
+    this.writer.resume();
     if (this.timer) {
       return;
     }

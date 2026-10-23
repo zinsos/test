@@ -135,6 +135,21 @@ describe("tune", () => {
     expect(result.splitAtMs).not.toBeNull();
   });
 
+  it("carries solo terms over for features that stay higher-is-riskier", () => {
+    const rows = syntheticRows(1_500, "tune-solo");
+    const base = parseWeights({
+      version: "base",
+      features: {
+        bundle_share: { weight: 1, points: [[0, 0], [1, 1]], solo: 77 },
+        unique_buyers_per_min: { weight: 1, points: [[0, 1], [60, 0]], solo: 66 }
+      }
+    });
+    const result = tune(rows, "rugged", { soloFrom: base });
+    expect(result.suggestedWeights.features.bundle_share?.solo).toBe(77);
+    expect(result.suggestedWeights.features.dev_share?.solo).toBeUndefined();
+    expect(tune(rows, "rugged").suggestedWeights.features.bundle_share?.solo).toBe(85);
+  });
+
   it("learns a lower-is-riskier shape", () => {
     const rng = createRng("lower");
     const rows = syntheticRows(2_000, "tune-c").map((row) => {

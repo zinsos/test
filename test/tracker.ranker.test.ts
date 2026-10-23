@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultStrategyConfig, type TrackerConfig } from "../src/config/strategy.js";
 import { toNumber } from "../src/db/pool.js";
+import { markHubs } from "../src/scorer/intelStore.js";
+import { loadWalletFacts } from "../src/tracker/rankQueries.js";
 import { chunkCandidates, rankWallets, type RankedWallet, type RankRunResult } from "../src/tracker/ranker.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 import {
@@ -12,6 +14,7 @@ import {
   insertLaunchScore,
   insertTrades,
   slotAt,
+  SOL,
   type HistorySpec,
   type LaunchSpec,
   type TradeSpec
@@ -210,6 +213,18 @@ describe.skipIf(!hasTestDatabase)("rankWallets", () => {
       { mint: "LaterLaunch", createdAtMs: ASOF + 2 * DAY, dev: "GOOD3" }
     );
     const ids = await scenario.write(db, ASOF - 3 * DAY);
+    await insertTrades(db, [
+      {
+        launchId: ids.get("CreatorLaunch") ?? 0,
+        wallet: "CREATOR",
+        atMs: ASOF - 40 * DAY,
+        slot: slotAt(ASOF - 40 * DAY),
+        isBuy: true,
+        tokenAmount: 1_000_000n,
+        userQuote: 1_000_000_000n,
+        signature: "creator-self-buy"
+      }
+    ]);
     await insertHistory(
       db,
       scenario.trips
@@ -375,5 +390,50 @@ describe.skipIf(!hasTestDatabase)("rankWallets", () => {
     const second = await rankWallets(db, { asOfMs: ASOF, config, bundleSlotWindow: 1, maxTradesPerWallet: 100, persist: false });
     expect(second.runId).toBeNull();
     expect(fingerprint(second)).toEqual(fingerprint(first));
+  });
+});
+
+describe.skipIf(!hasTestDatabase)("ranking exclusions resist a spoofed creator", () => {
+  let database: TestDatabase;
+  const AT = ASOF - 10 * DAY;
+  const window = { fromMs: ASOF - 90 * DAY, asOfMs: ASOF, creationSlotWindow: 1 };
+
+  beforeAll(async () => {
+    database = await createTestDatabase("tracker_creator_spoof");
+    const ids = await insertLaunches(database.db, [
+      { mint: "GriefMint", createdAtMs: AT, dev: "GrieferSigner", creator: "SmartWallet" },
+      { mint: "ServiceMint", createdAtMs: AT, dev: "LaunchService", creator: "RealDev" },
+      { mint: "TributeMint", createdAtMs: AT, dev: "PranksterSigner", creator: "ExchangeHot" },
+      { mint: "SignerMint", createdAtMs: AT, dev: "DevSigner" }
+    ]);
+    await insertTrades(database.db, [
+      { launchId: ids.get("GriefMint") ?? 0, wallet: "SmartWallet", atMs: AT + 30_000, isBuy: true, tokenAmount: 1_000n, userQuote: SOL, signature: "smart-buy" },
+      { launchId: ids.get("ServiceMint") ?? 0, wallet: "RealDev", atMs: AT, slot: slotAt(AT), isBuy: true, tokenAmount: 1_000n, userQuote: SOL, signature: "dev-buy" }
+    ]);
+    await markHubs(database.db, ["ExchangeHot"]);
+    await insertKnownEntity(database.db, "ExchangeLabeled", "exchange", AT - DAY);
+    await insertLaunches(database.db, [{ mint: "LabeledTribute", createdAtMs: AT, dev: "ExchangeLabeled" }]);
+    await insertIntel(database.db, "FundedByHub", "ExchangeHot", AT + 1_000, AT - DAY);
+    await insertIntel(database.db, "FundedByLabeled", "ExchangeLabeled", AT + 1_000, AT - DAY);
+    await insertIntel(database.db, "FundedBySigner", "DevSigner", AT + 1_000, AT - DAY);
+    await insertIntel(database.db, "FundedByCreatorOnly", "SmartWallet", AT + 1_000, AT - DAY);
+  });
+
+  afterAll(async () => {
+    await database.drop();
+  });
+
+  it("links a wallet to a launch only when it signed the create or bought it in the creation window", async () => {
+    const facts = await loadWalletFacts(database.db, ["SmartWallet", "RealDev", "DevSigner", "ExchangeHot"], window, new Set());
+    expect(facts.get("SmartWallet")?.devLinked).toBe(false);
+    expect(facts.get("RealDev")?.devLinked).toBe(true);
+    expect(facts.get("DevSigner")?.devLinked).toBe(true);
+    expect(facts.get("ExchangeHot")?.devLinked).toBe(false);
+  });
+
+  it("does not mark wallets dev funded through a hub or labelled exchange or a spoofed creator", async () => {
+    const wallets = ["FundedByHub", "FundedByLabeled", "FundedBySigner", "FundedByCreatorOnly"];
+    const facts = await loadWalletFacts(database.db, wallets, window, new Set());
+    expect(wallets.map((wallet) => facts.get(wallet)?.devFunded)).toEqual([false, false, true, false]);
   });
 });

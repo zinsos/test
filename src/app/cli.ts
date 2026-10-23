@@ -3,7 +3,7 @@ import { moduleLogger } from "../core/logger.js";
 import { parseArgv, usageText, UsageError, type ParsedArgs } from "./args.js";
 import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, type CliIo, type CommandContext } from "./commandContext.js";
 import { backtestCommand } from "./commands/backtest.js";
-import { migrateCommand, recomputeOutcomesCommand, resetKillCommand, sweepCommand } from "./commands/ops.js";
+import { migrateCommand, pruneDataCommand, recomputeOutcomesCommand, resetKillCommand, sweepCommand } from "./commands/ops.js";
 import { reportCommand } from "./commands/report.js";
 import { exportDatasetCommand, tuneScorerCommand } from "./commands/scorer.js";
 import { startCommand } from "./commands/start.js";
@@ -24,7 +24,8 @@ export const COMMAND_HANDLERS: Readonly<Record<string, CommandHandler>> = {
   report: reportCommand,
   sweep: sweepCommand,
   "reset-kill": resetKillCommand,
-  "recompute-outcomes": recomputeOutcomesCommand
+  "recompute-outcomes": recomputeOutcomesCommand,
+  "prune-data": pruneDataCommand
 };
 
 function messageOf(error: unknown): string {

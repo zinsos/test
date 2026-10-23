@@ -54,6 +54,7 @@ interface BackfillState {
   coveredFromMs: number | null;
   coveredToMs: number | null;
   exhausted: boolean;
+  retryOnce: Set<string>;
 }
 
 interface StateRow {
@@ -62,6 +63,31 @@ interface StateRow {
   covered_from: Date | null;
   covered_to: Date | null;
   exhausted: boolean;
+  last_error: string | null;
+}
+
+type FetchFailure = "fetch_error" | "not_found";
+
+interface FetchOutcome {
+  trades: HistoryTrade[];
+  failure: FetchFailure | null;
+}
+
+const RETRY_MARKER = "retry:";
+
+function retryMarker(signatures: ReadonlySet<string>): string | null {
+  return signatures.size > 0 ? `${RETRY_MARKER}${[...signatures].join(",")}` : null;
+}
+
+function parseRetryMarker(lastError: string | null): Set<string> {
+  if (!lastError?.startsWith(RETRY_MARKER)) {
+    return new Set();
+  }
+  return new Set(lastError.slice(RETRY_MARKER.length).split(",").filter((signature) => signature.length > 0));
+}
+
+function emptyState(): BackfillState {
+  return { oldestSignature: null, newestSignature: null, coveredFromMs: null, coveredToMs: null, exhausted: false, retryOnce: new Set() };
 }
 
 interface WalletRun {
@@ -93,7 +119,7 @@ const HISTORY_COLUMNS = [
 
 export async function loadBackfillState(db: Db, wallet: Pubkey): Promise<BackfillState | null> {
   const result = await db.query<StateRow>(
-    `SELECT oldest_signature, newest_signature, covered_from, covered_to, exhausted
+    `SELECT oldest_signature, newest_signature, covered_from, covered_to, exhausted, last_error
      FROM wallet_backfill_state WHERE wallet = $1`,
     [wallet]
   );
@@ -106,7 +132,8 @@ export async function loadBackfillState(db: Db, wallet: Pubkey): Promise<Backfil
     newestSignature: row.newest_signature,
     coveredFromMs: row.covered_from?.getTime() ?? null,
     coveredToMs: row.covered_to?.getTime() ?? null,
-    exhausted: row.exhausted
+    exhausted: row.exhausted,
+    retryOnce: parseRetryMarker(row.last_error)
   };
 }
 
@@ -139,7 +166,7 @@ async function saveBackfillState(
       progress.scanned,
       progress.found,
       state.exhausted,
-      progress.error
+      progress.error ?? retryMarker(state.retryOnce)
     ]
   );
 }
@@ -192,13 +219,13 @@ export async function writeHistoryTrades(db: Db, trades: readonly HistoryTrade[]
   return written;
 }
 
-async function storedSignatures(db: Db, signatures: readonly string[]): Promise<Set<string>> {
+async function storedSignatures(db: Db, wallet: Pubkey, signatures: readonly string[]): Promise<Set<string>> {
   if (signatures.length === 0) {
     return new Set();
   }
   const result = await db.query<{ signature: string }>(
-    `SELECT DISTINCT signature FROM wallet_history_trades WHERE signature = ANY($1::text[])`,
-    [signatures]
+    `SELECT DISTINCT signature FROM wallet_history_trades WHERE wallet = $2 AND signature = ANY($1::text[])`,
+    [signatures, wallet]
   );
   return new Set(result.rows.map((row) => row.signature));
 }
@@ -221,49 +248,81 @@ async function mapLimit<T>(items: readonly T[], limit: number, worker: (item: T)
   await Promise.all(runners);
 }
 
-async function fetchTrades(run: WalletRun, signature: string): Promise<HistoryTrade[]> {
+async function fetchTrades(run: WalletRun, signature: string): Promise<FetchOutcome> {
   try {
     const tx = await run.rpc.getParsedTransaction(signature, "low");
     run.consecutiveErrors = 0;
     if (!tx) {
-      bump(run.result, "not_found");
-      return [];
+      return { trades: [], failure: "not_found" };
     }
     run.result.transactionsFetched += 1;
     const input = transactionInputFromParsed(signature, tx);
     if (!input) {
       bump(run.result, "failed_tx");
-      return [];
+      return { trades: [], failure: null };
     }
     const extraction = extractWalletTrades(input, run.wallet);
     for (const [reason, count] of Object.entries(extraction.skipped) as Array<[HistorySkipReason, number]>) {
       bump(run.result, reason, count);
     }
-    return extraction.trades;
+    return { trades: extraction.trades, failure: null };
   } catch (error) {
     run.consecutiveErrors += 1;
-    bump(run.result, "fetch_error");
     log.debug({ err: error, wallet: run.wallet, signature }, "history transaction fetch failed");
     if (run.consecutiveErrors >= run.options.maxConsecutiveErrors) {
+      bump(run.result, "fetch_error");
       throw error;
     }
-    return [];
+    return { trades: [], failure: "fetch_error" };
   }
 }
 
-async function processSignatures(run: WalletRun, page: readonly SignatureInfo[]): Promise<void> {
+async function processSignatures(run: WalletRun, page: readonly SignatureInfo[]): Promise<Set<string>> {
   run.result.signaturesSeen += page.length;
   const succeeded = page.filter((info) => info.err === null || info.err === undefined);
   bump(run.result, "failed_tx", page.length - succeeded.length);
-  const stored = await storedSignatures(run.db, succeeded.map((info) => info.signature));
+  const stored = await storedSignatures(run.db, run.wallet, succeeded.map((info) => info.signature));
   bump(run.result, "already_stored", stored.size);
   const pending = succeeded.filter((info) => !stored.has(info.signature));
   const found: HistoryTrade[] = [];
+  const retry: string[] = [];
   await mapLimit(pending, run.options.txConcurrency, async (info) => {
-    found.push(...(await fetchTrades(run, info.signature)));
+    const outcome = await fetchTrades(run, info.signature);
+    if (outcome.failure) {
+      retry.push(info.signature);
+    }
+    found.push(...outcome.trades);
   });
+  const failed = new Set<string>();
+  for (const signature of retry) {
+    const outcome = await fetchTrades(run, signature);
+    if (outcome.failure) {
+      bump(run.result, outcome.failure);
+      failed.add(signature);
+    }
+    found.push(...outcome.trades);
+  }
   run.result.tradesFound += found.length;
   run.result.tradesWritten += await writeHistoryTrades(run.db, found);
+  return failed;
+}
+
+function newFailures(state: BackfillState, page: readonly SignatureInfo[], failed: ReadonlySet<string>): Set<string> {
+  const blocking = new Set<string>();
+  for (const info of page) {
+    if (!failed.has(info.signature)) {
+      state.retryOnce.delete(info.signature);
+    } else if (state.retryOnce.has(info.signature)) {
+      state.retryOnce.delete(info.signature);
+      log.warn({ signature: info.signature }, "history transaction failed twice, giving up on it");
+    } else {
+      blocking.add(info.signature);
+    }
+  }
+  for (const signature of blocking) {
+    state.retryOnce.add(signature);
+  }
+  return blocking;
 }
 
 function blockTimeMs(info: SignatureInfo): number | null {
@@ -289,11 +348,16 @@ async function catchUpForward(run: WalletRun, state: BackfillState): Promise<voi
   let before: string | undefined;
   let newest: SignatureInfo | null = null;
   let complete = false;
+  const scanned: SignatureInfo[] = [];
+  const blocking = new Set<string>();
   while (run.budget > 0 && !run.options.shouldStop()) {
     const requested = Math.min(run.options.pageSize, run.budget);
     const page = await fetchPage(run, before === undefined ? { until: state.newestSignature } : { before, until: state.newestSignature });
     newest = newest ?? page[0] ?? null;
-    await processSignatures(run, page);
+    for (const signature of newFailures(state, page, await processSignatures(run, page))) {
+      blocking.add(signature);
+    }
+    scanned.push(...page);
     run.budget -= page.length;
     const last = page[page.length - 1];
     if (page.length < requested || !last) {
@@ -308,6 +372,15 @@ async function catchUpForward(run: WalletRun, state: BackfillState): Promise<voi
   if (!complete) {
     run.result.forwardGap = true;
     log.warn({ wallet: run.wallet, maxSignatures: run.options.maxSignatures }, "signature budget ran out before reaching the last scanned signature");
+  }
+  const oldestBlocked = scanned.reduce((found, info, index) => (blocking.has(info.signature) ? index : found), -1);
+  if (oldestBlocked >= 0) {
+    const resumeAfter = scanned[oldestBlocked + 1];
+    if (resumeAfter) {
+      state.newestSignature = resumeAfter.signature;
+      state.coveredToMs = blockTimeMs(resumeAfter) ?? state.coveredToMs;
+    }
+    return;
   }
   state.newestSignature = newest.signature;
   state.coveredToMs = blockTimeMs(newest) ?? state.coveredToMs;
@@ -331,8 +404,17 @@ async function scanBackward(run: WalletRun, state: BackfillState, fresh: boolean
       state.coveredToMs = blockTimeMs(first);
     }
     const inRange = page.filter((info) => (blockTimeMs(info) ?? Number.POSITIVE_INFINITY) >= run.options.sinceMs);
-    await processSignatures(run, inRange);
+    const blocking = newFailures(state, inRange, await processSignatures(run, inRange));
     run.budget -= page.length;
+    if (blocking.size > 0) {
+      const resumeAfter = inRange[inRange.findIndex((info) => blocking.has(info.signature)) - 1];
+      if (resumeAfter) {
+        state.oldestSignature = resumeAfter.signature;
+        state.coveredFromMs = blockTimeMs(resumeAfter) ?? state.coveredFromMs;
+      }
+      await saveProgress(run, state, null);
+      break;
+    }
     const lastInRange = inRange[inRange.length - 1];
     if (lastInRange) {
       state.oldestSignature = lastInRange.signature;
@@ -386,10 +468,7 @@ export async function backfillWallet(
   };
   const existing = await loadBackfillState(db, wallet);
   const fresh = existing === null || existing.newestSignature === null;
-  const state: BackfillState =
-    existing && !fresh
-      ? existing
-      : { oldestSignature: null, newestSignature: null, coveredFromMs: null, coveredToMs: null, exhausted: false };
+  const state: BackfillState = existing && !fresh ? existing : { ...emptyState(), retryOnce: existing?.retryOnce ?? new Set() };
   try {
     if (!fresh) {
       await catchUpForward(run, state);

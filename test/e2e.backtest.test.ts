@@ -16,7 +16,7 @@ import type { ClosedTrade } from "../src/core/types.js";
 import { ReplayLogSource } from "../src/ingest/replaySource.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 import { buildScenario, decodeResultOf, ScenarioIntelRpc, simulateScenario, type LaunchKind, type Scenario } from "./e2e.market.js";
-import { recordScenario, type RecordingResult } from "./e2e.recording.js";
+import { recordScenario, STREAM_LAG_MS, type RecordingResult } from "./e2e.recording.js";
 
 const HOUR_MS = 3_600_000;
 
@@ -36,6 +36,7 @@ interface BacktestJson {
 }
 
 interface SignalRow {
+  at: Date;
   mint: string;
   acted: boolean;
   skip_reason: string | null;
@@ -76,6 +77,8 @@ describe.skipIf(!hasTestDatabase)("end to end: recorded market, wallet ranking a
   let configDir: string;
   let kinds: Map<string, LaunchKind>;
   let rankStartRun = 0;
+  let rankMidRun = 0;
+  let rankMidMs = 0;
   let rankAfterRun = 0;
   let paper: BacktestJson;
   let paperAgain: BacktestJson;
@@ -126,7 +129,7 @@ describe.skipIf(!hasTestDatabase)("end to end: recorded market, wallet ranking a
 
   const signalsOf = async (runId: number): Promise<SignalRow[]> => {
     const result = await database.db.query<SignalRow>(
-      "SELECT mint, acted, skip_reason, wallets, meta FROM signals WHERE run_id = $1 ORDER BY at, id",
+      "SELECT at, mint, acted, skip_reason, wallets, meta FROM signals WHERE run_id = $1 ORDER BY at, id",
       [runId]
     );
     return result.rows;
@@ -151,6 +154,18 @@ describe.skipIf(!hasTestDatabase)("end to end: recorded market, wallet ranking a
     expect(rankStart.code).toBe(0);
     const startRun = await database.db.query<{ id: string }>("SELECT id FROM wallet_rank_runs ORDER BY id DESC LIMIT 1");
     rankStartRun = Number(startRun.rows[0]?.id);
+    rankMidMs = scenario.windowStartMs + Math.round((scenario.windowEndMs - scenario.windowStartMs) / 2);
+    const midRun = await database.db.query<{ id: string }>(
+      "INSERT INTO wallet_rank_runs (as_of, params, candidates, tracked) SELECT $1, params, candidates, tracked FROM wallet_rank_runs WHERE id = $2 RETURNING id",
+      [new Date(rankMidMs), rankStartRun]
+    );
+    rankMidRun = Number(midRun.rows[0]?.id);
+    await database.db.query(
+      `INSERT INTO wallet_ranks
+       SELECT * FROM jsonb_populate_recordset(NULL::wallet_ranks,
+         (SELECT jsonb_agg(jsonb_set(to_jsonb(r), '{run_id}', to_jsonb($2::bigint))) FROM wallet_ranks r WHERE r.run_id = $1))`,
+      [rankStartRun, rankMidRun]
+    );
     const rankAfter = await cli(["rank-wallets", "--as-of", String(scenario.windowEndMs + HOUR_MS), "--config", writeConfig("rank", base)]);
     expect(rankAfter.code).toBe(0);
     const afterRun = await database.db.query<{ id: string }>("SELECT id FROM wallet_rank_runs ORDER BY id DESC LIMIT 1");
@@ -241,7 +256,7 @@ describe.skipIf(!hasTestDatabase)("end to end: recorded market, wallet ranking a
       expect(afterWindow).toContain(wallet);
     }
     const asOf = await database.db.query<{ id: string; as_of: Date }>("SELECT id, as_of FROM wallet_rank_runs ORDER BY id");
-    expect(asOf.rows.map((row) => row.as_of.getTime())).toEqual([scenario.windowStartMs, scenario.windowEndMs + HOUR_MS]);
+    expect(asOf.rows.map((row) => row.as_of.getTime())).toEqual([scenario.windowStartMs, rankMidMs, scenario.windowEndMs + HOUR_MS]);
   });
 
   it("trades the window with positions and fills persisted, and analytics agrees with the run summary", async () => {
@@ -300,11 +315,20 @@ describe.skipIf(!hasTestDatabase)("end to end: recorded market, wallet ranking a
     const signals = await signalsOf(paper.runId);
     expect(signals.length).toBeGreaterThan(0);
     const late = new Set(scenario.late);
-    for (const signal of signals) {
+    const before = signals.filter((signal) => signal.at.getTime() < rankMidMs);
+    const after = signals.filter((signal) => signal.at.getTime() >= rankMidMs);
+    expect(before.length).toBeGreaterThan(0);
+    expect(after.length).toBeGreaterThan(0);
+    for (const signal of before) {
       expect(signal.meta.trackedVersion).toBe(`run:${rankStartRun}`);
+    }
+    for (const signal of after) {
+      expect(signal.meta.trackedVersion).toBe(`run:${rankMidRun}`);
+    }
+    for (const signal of signals) {
       expect(signal.wallets.filter((wallet) => late.has(wallet))).toEqual([]);
     }
-    expect(paper.trackedVersionAtEnd).toBe(`run:${rankStartRun}`);
+    expect(paper.trackedVersionAtEnd).toBe(`run:${rankMidRun}`);
     const lateRunners = new Set(windowMints(["lateRunner"]));
     expect(signals.filter((signal) => lateRunners.has(signal.mint))).toEqual([]);
   });
@@ -321,14 +345,15 @@ describe.skipIf(!hasTestDatabase)("end to end: recorded market, wallet ranking a
     expect(zeroCost.trades.expectancySol).toBeGreaterThan(paper.trades.expectancySol);
   });
 
-  it("trades the same window identically when the live paper trader service streams it", async () => {
+  it("trades the same window identically when the live paper trader service streams it with the recorded receive latency", async () => {
     const clock = new VirtualClock(scenario.windowStartMs);
+    const traderRpc = new ScenarioIntelRpc(scenario.profiles);
     const app = await startLiveApp({
       env: loadEnv({ DATABASE_URL: database.url, MODULES: "trader", TRADING_MODE: "paper", RPC_WS_URL: "ws://127.0.0.1:9", LOG_LEVEL: "warn" }),
       config: base,
       clock,
       db: database.db,
-      rpc: new ScenarioIntelRpc(scenario.profiles) as unknown as RpcClient,
+      rpc: traderRpc as unknown as RpcClient,
       source: new ReplayLogSource({ clock, transactions: [] }),
       port: 0
     });
@@ -338,14 +363,20 @@ describe.skipIf(!hasTestDatabase)("end to end: recorded market, wallet ranking a
     expect(app.runId).not.toBeNull();
     const window = simulateScenario(scenario).filter((tx) => tx.atMs >= scenario.windowStartMs && tx.atMs < scenario.windowEndMs);
     for (const tx of window) {
-      await clock.advanceTo(tx.atMs);
-      pipeline?.handleBatch(decodeResultOf(tx), { signature: tx.signature, slot: tx.slot, seq: tx.events[0]?.tx.seq ?? 0, receivedAtMs: tx.atMs });
+      await clock.advanceTo(tx.atMs + STREAM_LAG_MS);
+      pipeline?.handleBatch(decodeResultOf(tx, clock.nowMs()), {
+        signature: tx.signature,
+        slot: tx.slot,
+        seq: tx.events[0]?.tx.seq ?? 0,
+        receivedAtMs: clock.nowMs()
+      });
       await tracker?.signals.idle();
     }
     await clock.advanceTo(scenario.windowEndMs);
     expect(app.trader?.openPositions()).toEqual([]);
     const liveRunId = app.runId ?? 0;
     await app.stop("parity");
+    expect({ signatures: traderRpc.signatureCalls, transactions: traderRpc.transactionCalls }).toEqual({ signatures: 0, transactions: 0 });
     const live = await loadClosedTrades(database.db, { runId: liveRunId, mode: "paper" });
     const backtested = await loadClosedTrades(database.db, { runId: paper.runId, mode: "backtest" });
     expect(live.length).toBe(paper.trades.n);

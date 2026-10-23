@@ -90,7 +90,7 @@ export function createScorerModule(options: ScorerModuleOptions): ScorerModule {
       await service.stop();
       detachTrending?.();
       detachTrending = null;
-      await intel?.drain();
+      await intel?.stop();
       await store?.stop();
     },
     reloadWeights

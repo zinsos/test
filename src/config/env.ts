@@ -1,15 +1,43 @@
 import { z } from "zod";
 
-const booleanFromString = z
-  .union([z.boolean(), z.string()])
-  .transform((value) => (typeof value === "boolean" ? value : ["1", "true", "yes", "on"].includes(value.toLowerCase())));
+const FLAG_WORDS: ReadonlyMap<string, boolean> = new Map([
+  ["1", true],
+  ["true", true],
+  ["yes", true],
+  ["on", true],
+  ["0", false],
+  ["false", false],
+  ["no", false],
+  ["off", false]
+]);
+
+function strictFlag<T extends boolean | undefined>(fallback: T) {
+  return z
+    .union([z.boolean(), z.string()])
+    .optional()
+    .transform((value, ctx): boolean | T => {
+      if (typeof value === "boolean") {
+        return value;
+      }
+      const word = (value ?? "").trim().toLowerCase();
+      if (word.length === 0) {
+        return fallback;
+      }
+      const parsed = FLAG_WORDS.get(word);
+      if (parsed === undefined) {
+        ctx.addIssue({ code: "custom", message: `expected true/false, 1/0, yes/no or on/off, got ${JSON.stringify(value)}` });
+        return z.NEVER;
+      }
+      return parsed;
+    });
+}
 
 const ModuleName = z.enum(["recorder", "scorer", "tracker", "trader", "dashboard"]);
 export type ModuleName = z.infer<typeof ModuleName>;
 
 const EnvSchema = z.object({
   DATABASE_URL: z.string().optional(),
-  DATABASE_SSL: booleanFromString.optional(),
+  DATABASE_SSL: strictFlag(undefined),
   DB_MAX_CONNECTIONS: z.coerce.number().int().positive().default(10),
   RPC_HTTP_URL: z.string().url().optional(),
   RPC_WS_URL: z.string().optional(),
@@ -27,7 +55,7 @@ const EnvSchema = z.object({
     )
     .pipe(z.array(ModuleName)),
   TRADING_MODE: z.enum(["paper", "live"]).default("paper"),
-  LIVE_DRY_RUN: booleanFromString.default(true),
+  LIVE_DRY_RUN: strictFlag(true),
   STRATEGY_CONFIG: z.string().default("config/strategy.json"),
   HOT_WALLET_SECRET_KEY: z.string().optional(),
   COLD_WALLET_ADDRESS: z.string().optional(),

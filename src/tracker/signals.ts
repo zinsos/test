@@ -22,7 +22,8 @@ export type SignalRejectReason =
   | "low_buyer_rate"
   | "low_buy_sell_ratio"
   | "not_sol_quoted"
-  | "mcap_out_of_band";
+  | "mcap_out_of_band"
+  | "buyers_exited";
 
 export type RejectionListener = (signal: Signal, reason: SignalRejectReason) => void;
 
@@ -57,6 +58,8 @@ export interface SignalEngineStats {
   evaluations: number;
   accepted: number;
   rejected: number;
+  cooldownRepeats: number;
+  repeatedRejections: number;
 }
 
 interface MintActivity {
@@ -66,6 +69,7 @@ interface MintActivity {
   lastActivityMs: number;
   evaluating: boolean;
   recheckAtMs: number | null;
+  reportedPrechecks: Set<SignalRejectReason>;
 }
 
 interface ScoreLookup {
@@ -86,7 +90,7 @@ function featureValue(score: LaunchScore, name: string): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function scoreMeta(score: LaunchScore | null): Record<string, unknown> {
+function scoreMeta(score: LaunchScore | null, nowMs: number): Record<string, unknown> {
   if (!score) {
     return { scoreAvailable: false };
   }
@@ -94,6 +98,7 @@ function scoreMeta(score: LaunchScore | null): Record<string, unknown> {
     scoreAvailable: true,
     scoreCheckpointSec: score.checkpointSec,
     scoreComputedAtMs: score.computedAtMs,
+    scoreAgeMs: nowMs - score.computedAtMs,
     scoreFlags: score.flags,
     scoreHardBlocked: score.hardBlocked,
     weightsVersion: score.weightsVersion
@@ -119,7 +124,15 @@ export class SignalEngine {
   private unsubscribers: Array<() => void> = [];
   private stopped = false;
   private eventsSincePrune = 0;
-  private readonly counters = { trackedBuys: 0, smartExits: 0, evaluations: 0, accepted: 0, rejected: 0 };
+  private readonly counters = {
+    trackedBuys: 0,
+    smartExits: 0,
+    evaluations: 0,
+    accepted: 0,
+    rejected: 0,
+    cooldownRepeats: 0,
+    repeatedRejections: 0
+  };
 
   constructor(options: SignalEngineOptions) {
     this.clock = options.clock;
@@ -228,7 +241,8 @@ export class SignalEngine {
       exits: new Map(),
       lastActivityMs: atMs,
       evaluating: false,
-      recheckAtMs: null
+      recheckAtMs: null,
+      reportedPrechecks: new Set()
     };
     this.activity.set(mint, created);
     return created;
@@ -274,11 +288,16 @@ export class SignalEngine {
     this.counters.smartExits += 1;
   }
 
-  private buyersInWindow(activity: MintActivity, triggerAtMs: number): TrackedBuy[] {
+  private buyersInWindow(activity: MintActivity, triggerAtMs: number, holdingAtMs: number = triggerAtMs): TrackedBuy[] {
     const windowStart = triggerAtMs - this.convergence.windowSec * 1000;
     return [...activity.buyers.values()]
-      .filter((buyer) => buyer.atMs >= windowStart && buyer.atMs <= triggerAtMs)
+      .filter((buyer) => buyer.atMs >= windowStart && buyer.atMs <= triggerAtMs && !this.exitedBy(activity, buyer.wallet, holdingAtMs))
       .sort((a, b) => a.atMs - b.atMs);
+  }
+
+  private exitedBy(activity: MintActivity, wallet: Pubkey, atMs: number): boolean {
+    const exitAtMs = activity.exits.get(wallet);
+    return exitAtMs !== undefined && exitAtMs <= atMs;
   }
 
   private considerConvergence(launch: LaunchState, activity: MintActivity, triggerAtMs: number): void {
@@ -297,11 +316,24 @@ export class SignalEngine {
     const draft = this.draftSignal("smart_convergence", launch, nowMs, buyers, { windowSec: this.convergence.windowSec });
     const precheck = this.convergencePrecheck(launch, nowMs);
     if (precheck) {
-      this.reject(draft, precheck);
+      this.rejectOncePerMint(activity, draft, precheck);
       return;
     }
     activity.evaluating = true;
-    this.track(this.evaluateConvergence(launch, activity, draft));
+    this.track(this.evaluateConvergence(launch, activity, draft, triggerAtMs));
+  }
+
+  private rejectOncePerMint(activity: MintActivity, signal: Signal, reason: SignalRejectReason): void {
+    if (reason === "cooldown") {
+      this.counters.cooldownRepeats += 1;
+      return;
+    }
+    if (activity.reportedPrechecks.has(reason)) {
+      this.counters.repeatedRejections += 1;
+      return;
+    }
+    activity.reportedPrechecks.add(reason);
+    this.reject(signal, reason);
   }
 
   private convergencePrecheck(launch: LaunchState, nowMs: number): SignalRejectReason | null {
@@ -333,7 +365,7 @@ export class SignalEngine {
     return null;
   }
 
-  private async evaluateConvergence(launch: LaunchState, activity: MintActivity, draft: Signal): Promise<void> {
+  private async evaluateConvergence(launch: LaunchState, activity: MintActivity, draft: Signal, triggerAtMs: number): Promise<void> {
     let accepted = false;
     this.counters.evaluations += 1;
     try {
@@ -342,22 +374,27 @@ export class SignalEngine {
         return;
       }
       const decidedAtMs = this.clock.nowMs();
+      const holders = this.buyersInWindow(activity, triggerAtMs, decidedAtMs);
       const signal: Signal = {
         ...draft,
         atMs: decidedAtMs,
         slot: launch.lastSlot,
         riskScore: lookup.score?.score ?? null,
+        wallets: holders.map((buyer) => buyer.wallet),
         meta: {
           ...draft.meta,
-          ...scoreMeta(lookup.score),
+          ...scoreMeta(lookup.score, decidedAtMs),
           scoreWaitMs: lookup.waitedMs,
           launchAgeSec: launch.ageMs(decidedAtMs) / 1000,
           mcapMultiple: launch.mcapMultiple(),
           mcapSol: launch.mcapSol()
         }
       };
-      const reason = this.convergenceVerdict(launch, lookup.score, decidedAtMs);
-      if (reason) {
+      const reason =
+        holders.length < this.convergence.minWallets ? "buyers_exited" : this.convergenceVerdict(launch, lookup.score, decidedAtMs);
+      if (reason === "cooldown") {
+        this.counters.cooldownRepeats += 1;
+      } else if (reason) {
         this.reject(signal, reason);
       } else {
         this.accept(signal);
@@ -378,8 +415,9 @@ export class SignalEngine {
   private async scoreFor(mint: Pubkey): Promise<ScoreLookup> {
     const startedAtMs = this.clock.nowMs();
     const latest = this.scores.latest(mint);
-    if (latest && latest.computedAtMs <= startedAtMs) {
-      return { score: latest, waitedMs: 0 };
+    const usable = latest && latest.computedAtMs <= startedAtMs ? latest : null;
+    if (usable && startedAtMs - usable.computedAtMs <= this.convergence.maxScoreAgeSec * 1000) {
+      return { score: usable, waitedMs: 0 };
     }
     if (this.convergence.waitForScoreMs <= 0) {
       return { score: null, waitedMs: 0 };
@@ -431,9 +469,11 @@ export class SignalEngine {
       uniqueBuyersPerMin: featureValue(score, "unique_buyers_per_min"),
       buySellCountRatio: featureValue(score, "buy_sell_count_ratio")
     });
-    const signal: Signal = { ...draft, riskScore: score.score, meta: { ...draft.meta, ...scoreMeta(score) } };
+    const signal: Signal = { ...draft, riskScore: score.score, meta: { ...draft.meta, ...scoreMeta(score, nowMs) } };
     const reason = this.momentumVerdict(launch, score, nowMs);
-    if (reason) {
+    if (reason === "cooldown") {
+      this.counters.cooldownRepeats += 1;
+    } else if (reason) {
       this.reject(signal, reason);
     } else {
       this.accept(signal);

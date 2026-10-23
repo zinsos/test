@@ -11,6 +11,13 @@ export interface RankRunInfo {
   asOfMs: number;
 }
 
+export const LIVE_RANK_LABEL = "live";
+export const WALK_FORWARD_RANK_LABEL = "walk-forward";
+
+export const PUBLISHED_RUN_SQL = `COALESCE(params->>'label', '') <> '${WALK_FORWARD_RANK_LABEL}'`;
+
+const AVAILABLE_AT_SQL = `CASE WHEN jsonb_typeof(params->'historyKnownBeforeMs') = 'null' THEN GREATEST(as_of, ran_at) ELSE as_of END`;
+
 export interface TrackedWalletRegistryOptions {
   db: Db | null;
   clock?: Clock | null;
@@ -24,12 +31,17 @@ export interface StaticTrackedWallet {
 }
 
 interface PreloadedRun extends RankRunInfo {
+  availableAtMs: number;
   wallets: TrackedWallet[];
 }
 
 interface RunRow {
   id: unknown;
   as_of: Date;
+}
+
+interface AvailableRunRow extends RunRow {
+  available_at: Date;
 }
 
 interface RankRow {
@@ -41,7 +53,7 @@ interface RankRow {
 
 export async function latestRunAsOf(db: Db, asOfMs: number): Promise<RankRunInfo | null> {
   const result = await db.query<RunRow>(
-    `SELECT id, as_of FROM wallet_rank_runs WHERE as_of <= $1 ORDER BY as_of DESC, id DESC LIMIT 1`,
+    `SELECT id, as_of FROM wallet_rank_runs WHERE as_of <= $1 AND ${PUBLISHED_RUN_SQL} ORDER BY as_of DESC, id DESC LIMIT 1`,
     [new Date(asOfMs)]
   );
   const row = result.rows[0];
@@ -49,7 +61,9 @@ export async function latestRunAsOf(db: Db, asOfMs: number): Promise<RankRunInfo
 }
 
 export async function latestRun(db: Db): Promise<RankRunInfo | null> {
-  const result = await db.query<RunRow>(`SELECT id, as_of FROM wallet_rank_runs ORDER BY as_of DESC, id DESC LIMIT 1`);
+  const result = await db.query<RunRow>(
+    `SELECT id, as_of FROM wallet_rank_runs WHERE ${PUBLISHED_RUN_SQL} ORDER BY as_of DESC, id DESC LIMIT 1`
+  );
   const row = result.rows[0];
   return row ? { runId: toNumber(row.id), asOfMs: row.as_of.getTime() } : null;
 }
@@ -83,6 +97,17 @@ export async function loadTrackedWallets(db: Db, runIds: readonly number[]): Pro
   return byRun;
 }
 
+function newestAsOfSoFar(runs: readonly PreloadedRun[]): number[] {
+  const best: number[] = [];
+  runs.forEach((run, index) => {
+    const previous = best[index - 1] ?? -1;
+    const current = runs[previous];
+    const newer = !current || run.asOfMs > current.asOfMs || (run.asOfMs === current.asOfMs && run.runId > current.runId);
+    best.push(newer ? index : previous);
+  });
+  return best;
+}
+
 export class TrackedWalletRegistry implements TrackedWalletProvider {
   private readonly db: Db | null;
   private readonly clock: Clock | null;
@@ -91,6 +116,7 @@ export class TrackedWalletRegistry implements TrackedWalletProvider {
   private run: RankRunInfo | null = null;
   private versionTag = "none";
   private preloaded: PreloadedRun[] = [];
+  private inForce: number[] = [];
   private preloadedIndex = -1;
   private refreshTimer: TimerHandle | null = null;
   private refreshing: Promise<RankRunInfo | null> | null = null;
@@ -162,25 +188,35 @@ export class TrackedWalletRegistry implements TrackedWalletProvider {
     return run;
   }
 
-  async preloadRuns(range: { fromMs: number; toMs: number }): Promise<number> {
+  async preloadRuns(range: { fromMs: number; toMs: number }, onlyRunIds: readonly number[] | null = null): Promise<number> {
     const db = this.requireDb();
-    const result = await db.query<RunRow>(
-      `SELECT id, as_of FROM wallet_rank_runs
-       WHERE as_of <= $2 AND (as_of >= $1 OR id = (
-         SELECT id FROM wallet_rank_runs WHERE as_of < $1 ORDER BY as_of DESC, id DESC LIMIT 1))
-       ORDER BY as_of, id`,
-      [new Date(range.fromMs), new Date(range.toMs)]
+    const scope = onlyRunIds === null ? PUBLISHED_RUN_SQL : "id = ANY($3::bigint[])";
+    const result = await db.query<AvailableRunRow>(
+      `WITH runs AS (
+         SELECT id, as_of, ${AVAILABLE_AT_SQL} AS available_at FROM wallet_rank_runs WHERE ${scope}
+       )
+       SELECT id, as_of, available_at FROM runs
+       WHERE available_at <= $2 AND (available_at >= $1 OR id = (
+         SELECT id FROM runs WHERE available_at < $1 ORDER BY as_of DESC, id DESC LIMIT 1))
+       ORDER BY available_at, as_of, id`,
+      [new Date(range.fromMs), new Date(range.toMs), ...(onlyRunIds === null ? [] : [onlyRunIds.map(String)])]
     );
-    const runs = result.rows.map((row) => ({ runId: toNumber(row.id), asOfMs: row.as_of.getTime() }));
+    const runs = result.rows.map((row) => ({
+      runId: toNumber(row.id),
+      asOfMs: row.as_of.getTime(),
+      availableAtMs: row.available_at.getTime()
+    }));
     const wallets = await loadTrackedWallets(db, runs.map((run) => run.runId));
     this.preloaded = runs.map((run) => ({ ...run, wallets: wallets.get(run.runId) ?? [] }));
+    this.inForce = newestAsOfSoFar(this.preloaded);
     this.preloadedIndex = -1;
     this.replace([], null, "none");
     return this.preloaded.length;
   }
 
   setAsOf(asOfMs: number): boolean {
-    const index = this.preloadedIndexAt(asOfMs);
+    const available = this.preloadedIndexAt(asOfMs);
+    const index = available >= 0 ? (this.inForce[available] ?? -1) : -1;
     if (index === this.preloadedIndex) {
       return false;
     }
@@ -240,7 +276,7 @@ export class TrackedWalletRegistry implements TrackedWalletProvider {
     while (low < high) {
       const mid = (low + high) >> 1;
       const run = this.preloaded[mid];
-      if (run && run.asOfMs <= asOfMs) {
+      if (run && run.availableAtMs <= asOfMs) {
         low = mid + 1;
       } else {
         high = mid;

@@ -25,8 +25,9 @@ import { createTrackerModule } from "../tracker/index.js";
 import { closedTradeOf } from "../trader/accounting.js";
 import { PgTradingStore } from "../trader/store.js";
 import { Trader } from "../trader/trader.js";
-import { applyReplayEvent, BacktestLoader, scheduleIncomplete, type LoaderCounts } from "./loader.js";
+import { applyReplayEvent, BacktestLoader, scheduleIncomplete, type LoaderCounts, type ObservationModel } from "./loader.js";
 import { RollingStoredFeatures } from "./storedScores.js";
+import { selectBacktestWeights, type SkippedWeights, type WeightsProvenance } from "./weights.js";
 
 const log = moduleLogger("backtest");
 const MINUTE_MS = 60_000;
@@ -59,7 +60,9 @@ export interface BacktestOptions {
   walkForward?: boolean;
   model?: ScoringModel | null;
   weightsFile?: string | null;
+  allowInSampleWeights?: boolean;
   windowMs?: number;
+  observation?: ObservationModel;
   storedChunkMs?: number;
   settleMs?: number;
   evictEveryMs?: number;
@@ -90,6 +93,8 @@ export interface BacktestSummary {
   fromMs: number;
   toMs: number;
   weightsVersion: string;
+  weights: WeightsProvenance;
+  skippedWeights: SkippedWeights[];
   trackedVersionAtEnd: string;
   counts: BacktestCounts;
   exitReasons: Record<string, number>;
@@ -162,8 +167,21 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
     toMs,
     includeIncomplete: options.includeIncomplete ?? false,
     tradeQuoteMints: config.signals.quoteMints,
-    windowMs: options.windowMs
+    windowMs: options.windowMs,
+    observation: options.observation
   });
+  const weights = await selectBacktestWeights(db, {
+    fromMs,
+    weightsFile: options.weightsFile ?? null,
+    explicit: options.model ?? null,
+    allowInSample: options.allowInSampleWeights ?? false
+  });
+  for (const skipped of weights.skipped) {
+    log.warn({ ...skipped, fromMs }, "skipping scorer weights fitted on data from the backtest window or later");
+  }
+  if (weights.provenance.inSample) {
+    log.warn({ ...weights.provenance, fromMs }, "backtest scores with weights fitted on data from the backtest window or later: results are in-sample");
+  }
   const runId = await store.createRun({
     mode: "backtest",
     label,
@@ -173,7 +191,8 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
         includeIncomplete: options.includeIncomplete ?? false,
         walkForward: options.walkForward ?? false,
         weightsFile: options.weightsFile ?? null,
-        weightsVersion: options.model?.version ?? null
+        weightsVersion: weights.model.version,
+        weights: weights.provenance
       }
     },
     dataFrom: new Date(fromMs),
@@ -202,8 +221,8 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
     config: config.scorer,
     mode: "replay",
     storedFeatures: stored.lookup(),
-    model: options.model ?? null,
-    weightsFile: options.weightsFile ?? null,
+    model: weights.model,
+    weightsFile: null,
     persistScores: false
   });
   let trader: Trader | null = null;
@@ -267,24 +286,25 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
     let lastProgressMs = fromMs;
     for await (const window of loader.windows()) {
       for (const replay of window) {
-        if (stored.needsAdvance(replay.atMs)) {
-          await stored.advanceTo(replay.atMs);
+        const visibleAtMs = replay.visibleAtMs;
+        if (stored.needsAdvance(visibleAtMs)) {
+          await stored.advanceTo(visibleAtMs);
         }
         const due = clock.nextDueMs();
-        if (replay.atMs > clock.nowMs() || (due !== null && due <= replay.atMs)) {
-          await clock.advanceTo(replay.atMs);
+        if (visibleAtMs > clock.nowMs() || (due !== null && due <= visibleAtMs)) {
+          await clock.advanceTo(visibleAtMs);
         }
         applyReplayEvent(market, replay);
         scheduleIncomplete(clock, market, replay);
         bus.emit("chain", replay.event);
         events += 1;
         await tracker.signals.idle();
-        if (replay.atMs - lastEvictMs >= evictEveryMs) {
+        if (clock.nowMs() - lastEvictMs >= evictEveryMs) {
           market.evict(clock.nowMs(), (launch) => activeTrader.hasOpenPosition(launch.mint));
-          lastEvictMs = replay.atMs;
+          lastEvictMs = clock.nowMs();
         }
-        if (options.onProgress && replay.atMs - lastProgressMs >= progressEveryMs) {
-          lastProgressMs = replay.atMs;
+        if (options.onProgress && clock.nowMs() - lastProgressMs >= progressEveryMs) {
+          lastProgressMs = clock.nowMs();
           options.onProgress({
             virtualNowMs: clock.nowMs(),
             fromMs,
@@ -319,6 +339,8 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
     trader: activeTrader,
     signalStats: tracker.signals.stats(),
     weightsVersion: scorer.service.currentModel().version,
+    weights: weights.provenance,
+    skippedWeights: weights.skipped,
     trackedVersion: tracker.registry.version(),
     storedScoreLaunches: stored.size
   });
@@ -350,6 +372,8 @@ interface SummaryInput {
   trader: Trader;
   signalStats: { accepted: number; rejected: number };
   weightsVersion: string;
+  weights: WeightsProvenance;
+  skippedWeights: SkippedWeights[];
   trackedVersion: string;
   storedScoreLaunches: number;
 }
@@ -364,6 +388,8 @@ function buildSummary(input: SummaryInput): BacktestSummary {
     fromMs: input.fromMs,
     toMs: input.toMs,
     weightsVersion: input.weightsVersion,
+    weights: input.weights,
+    skippedWeights: input.skippedWeights,
     trackedVersionAtEnd: input.trackedVersion,
     counts: {
       ...input.loaderCounts,

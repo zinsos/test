@@ -22,11 +22,14 @@ export {
 export {
   MetadataFetchError,
   MetadataFetcher,
+  blockedHostReason,
+  isPrivateAddress,
   launchMetadataOf,
   normalizeGateway,
   parseMetadata,
   rewriteIpfsUrl,
   type FetchLike,
+  type HostResolver,
   type MetadataConfig,
   type MetadataFetcherOptions,
   type MetadataJob,
@@ -90,6 +93,7 @@ export interface RecorderModuleOptions {
   config: StrategyConfig;
   env: Pick<Env, "METADATA_GATEWAY">;
   fetchImpl?: FetchLike;
+  metadataSweepMs?: number | null;
   service?: Partial<Omit<RecorderServiceOptions, "db" | "bus" | "market" | "clock" | "config" | "registry">>;
   marketEviction?: MarketEvictionOptions;
 }
@@ -131,7 +135,8 @@ export function createRecorderModule(options: RecorderModuleOptions): RecorderMo
     market: options.market,
     config: recorderConfig.metadata,
     gatewayOverride: options.env.METADATA_GATEWAY,
-    fetchImpl: options.fetchImpl
+    fetchImpl: options.fetchImpl,
+    sweepIntervalMs: options.metadataSweepMs ?? 5 * 60_000
   });
   const finalizer = new OutcomeFinalizer({
     db: options.db,

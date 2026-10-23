@@ -4,10 +4,14 @@ import type { ParsedInstruction, ParsedTransaction, SignatureInfo } from "../src
 import { VirtualClock } from "../src/core/clock.js";
 import { SYSTEM_PROGRAM_ID } from "../src/core/constants.js";
 import { fundingTransfer, incomingTransfers, transferToWallet } from "../src/scorer/funding.js";
+import { Bus } from "../src/core/bus.js";
+import { buildFundingClusters } from "../src/scorer/clusters.js";
+import { createScorerModule } from "../src/scorer/index.js";
 import { isHubFromFacts, WalletIntelService, type IntelRpc } from "../src/scorer/intel.js";
-import type { IntelRequest } from "../src/scorer/types.js";
+import { ScoringModel } from "../src/scorer/model.js";
+import type { IntelRequest, WalletIntel } from "../src/scorer/types.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
-import { scorerConfig, SOL, T0 } from "./scorer.fixtures.js";
+import { newMarket, scorerConfig, SOL, T0 } from "./scorer.fixtures.js";
 
 interface FixtureTx {
   signature: string;
@@ -106,6 +110,10 @@ class FakeRpc implements IntelRpc {
 
 function fundingTx(signature: string, from: string, to: string, lamports: bigint, slot = 1_000): ParsedTransaction {
   return syntheticTx(signature, slot, [systemInstruction("transfer", { source: from, destination: to, lamports: Number(lamports) })]);
+}
+
+function fundingTxAt(signature: string, from: string, to: string, lamports: bigint, atMs: number): ParsedTransaction {
+  return { ...fundingTx(signature, from, to, lamports), blockTime: Math.floor(atMs / 1000) };
 }
 
 function request(wallet: string, buySignature = "buy"): IntelRequest {
@@ -260,8 +268,8 @@ describe("WalletIntelService without a database", () => {
   it("flags funders with large in-memory fan-out as hubs", async () => {
     const rpc = new FakeRpc();
     const wallets = ["h1", "h2", "h3"];
-    for (const wallet of wallets) {
-      rpc.addHistory(wallet, [fundingTx(`fund-${wallet}`, "BigFunder", wallet, SOL)]);
+    for (const [index, wallet] of wallets.entries()) {
+      rpc.addHistory(wallet, [fundingTxAt(`fund-${wallet}`, "BigFunder", wallet, SOL, T0 - (index + 1) * 3_600_000)]);
     }
     const hubConfig = scorerConfig({ deepIntel: { ...config.deepIntel, hubFanoutThreshold: 3 } });
     const service = new WalletIntelService({ db: null, rpc, clock: new VirtualClock(T0), config: hubConfig });
@@ -272,6 +280,108 @@ describe("WalletIntelService without a database", () => {
     expect(service.isHub("BigFunder")).toBe(true);
   });
 
+  it("finds the funder of a zero-history wallet inside its own buy transaction", async () => {
+    const rpc = new FakeRpc();
+    const wallets = ["Fresh0", "Fresh1", "Fresh2", "Fresh3", "Fresh4"];
+    for (const wallet of wallets) {
+      const buy = syntheticTx(`buy-${wallet}`, 2_000, [
+        systemInstruction("transfer", { source: "BundleMaster", destination: wallet, lamports: Number(SOL) }),
+        { programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", data: "buy" }
+      ]);
+      rpc.addHistory(wallet, [buy]);
+    }
+    const service = new WalletIntelService({ db: null, rpc, clock: new VirtualClock(T0), config });
+    const intel = await service.ensure(
+      wallets.map((wallet) => request(wallet, `buy-${wallet}`)),
+      T0 + 5_000
+    );
+    expect(intel.get("Fresh0")).toMatchObject({ funder: "BundleMaster", fundingSignature: "buy-Fresh0", priorTxCount: 0, fundingSlot: 2_000 });
+    expect(rpc.transactionCalls).toBe(wallets.length);
+    const clusters = buildFundingClusters({ buyers: wallets, devWallets: ["DevWallet"], intel });
+    expect(clusters.clusters[0]?.buyers).toHaveLength(5);
+  });
+
+  it("re-checks a wallet that looked fresh before an earlier buy and keeps its known funder", async () => {
+    const rpc = new FakeRpc();
+    rpc.addHistory("Sniper", [syntheticTx("buy-A", 900, []), fundingTx("funding", "SniperFunder", "Sniper", SOL, 800)]);
+    const clock = new VirtualClock(T0);
+    const service = new WalletIntelService({ db: null, rpc, clock, config });
+    const first = await service.ensure([request("Sniper", "buy-A")], T0 + 5_000);
+    expect(first.get("Sniper")).toMatchObject({ priorTxCount: 1, funder: "SniperFunder" });
+    await service.ensure([request("Sniper", "buy-A")], T0 + 5_000);
+    expect(rpc.signatureCalls).toBe(1);
+    const later = Array.from({ length: 40 }, (_, index) => syntheticTx(`trade-${index}`, 2_000 - index, []));
+    rpc.addHistory("Sniper", [syntheticTx("buy-B", 3_000, []), ...later, syntheticTx("buy-A", 900, []), fundingTx("funding", "SniperFunder", "Sniper", SOL, 800)]);
+    await clock.advanceTo(T0 + 20 * 3_600_000);
+    const second = await service.ensure([request("Sniper", "buy-B")], clock.nowMs() + 5_000);
+    expect(second.get("Sniper")).toMatchObject({ checkedBeforeSignature: "buy-B", priorTxCapped: true, funder: "SniperFunder" });
+    expect(rpc.signatureCalls).toBe(2);
+    const veteran = await service.ensure([request("Sniper", "buy-C")], clock.nowMs() + 5_000);
+    expect(veteran.get("Sniper")?.checkedBeforeSignature).toBe("buy-B");
+    expect(rpc.signatureCalls).toBe(2);
+  });
+
+  it("does not turn a serial bundler's master into a hub when it funds wallets in bursts", async () => {
+    const rpc = new FakeRpc();
+    const clock = new VirtualClock(T0);
+    const service = new WalletIntelService({ db: null, rpc, clock, config });
+    let ninth: Map<string, WalletIntel> = new Map();
+    for (let launch = 0; launch < 9; launch += 1) {
+      const wallets = Array.from({ length: 5 }, (_, index) => `L${launch}W${index}`);
+      for (const [index, wallet] of wallets.entries()) {
+        rpc.addHistory(wallet, [fundingTxAt(`fund-${wallet}`, "SerialMaster", wallet, SOL, clock.nowMs() - 60_000 + index * 2_000)]);
+      }
+      ninth = await service.ensure(wallets.map((wallet) => request(wallet, `buy-${wallet}`)), clock.nowMs() + 5_000);
+      await clock.advanceTo(clock.nowMs() + 15 * 60_000);
+    }
+    expect(ninth.get("L8W0")?.funderIsHub).toBe(false);
+    expect(service.isHub("SerialMaster")).toBe(false);
+    const clusters = buildFundingClusters({ buyers: [...ninth.keys()], devWallets: ["DevWallet"], intel: ninth });
+    expect(clusters.clusters[0]?.buyers).toHaveLength(5);
+  });
+
+  it("stops promptly with lookups in flight and starts no new ones", async () => {
+    let calls = 0;
+    const hanging: IntelRpc = {
+      getSignaturesForAddress: () => {
+        calls += 1;
+        return new Promise(() => undefined);
+      },
+      getParsedTransaction: () => new Promise(() => undefined)
+    };
+    const clock = new VirtualClock(T0);
+    const service = new WalletIntelService({ db: null, rpc: hanging, clock, config });
+    const pending = service.ensure([request("Slow")], T0 + 1_000);
+    await clock.advanceTo(T0 + 1_000);
+    expect((await pending).size).toBe(0);
+    await service.stop();
+    expect(await service.ensure([request("Other")], T0 + 2_000)).toEqual(new Map());
+    expect(calls).toBe(1);
+    expect(service.stats().skipped).toBe(1);
+  });
+
+  it("stops the scorer module without waiting for wallet intel rpc calls", async () => {
+    const hanging: IntelRpc = {
+      getSignaturesForAddress: () => new Promise(() => undefined),
+      getParsedTransaction: () => new Promise(() => undefined)
+    };
+    const clock = new VirtualClock(T0);
+    const scorer = createScorerModule({
+      db: null,
+      rpc: hanging,
+      bus: new Bus(),
+      market: newMarket(),
+      clock,
+      config,
+      mode: "live",
+      model: ScoringModel.default()
+    });
+    await scorer.start();
+    void scorer.intel?.ensure([request("SlowWallet")], T0 + 8_000);
+    await clock.advanceTo(T0 + 8_000);
+    await expect(scorer.stop()).resolves.toBeUndefined();
+  });
+
   it("skips lookups without rpc or beyond the in-flight cap", async () => {
     const service = new WalletIntelService({ db: null, rpc: null, clock: new VirtualClock(T0), config });
     expect((await service.ensure([request("x")], T0 + 1_000)).size).toBe(0);
@@ -279,11 +389,11 @@ describe("WalletIntelService without a database", () => {
   });
 
   it("decides hubs from entity kinds, flags and fan-out", () => {
-    expect(isHubFromFacts({ address: "a", entityKind: "exchange", fanout: 0, flagged: false }, 0, 40)).toBe(true);
-    expect(isHubFromFacts({ address: "a", entityKind: "bundler", fanout: 500, flagged: true }, 0, 40)).toBe(false);
-    expect(isHubFromFacts({ address: "a", entityKind: null, fanout: 39, flagged: false }, 0, 40)).toBe(false);
-    expect(isHubFromFacts({ address: "a", entityKind: null, fanout: 40, flagged: false }, 0, 40)).toBe(true);
-    expect(isHubFromFacts({ address: "a", entityKind: null, fanout: 0, flagged: true }, 0, 40)).toBe(true);
+    expect(isHubFromFacts({ address: "a", entityKind: "exchange", fundingBursts: 0, flagged: false }, 0, 40)).toBe(true);
+    expect(isHubFromFacts({ address: "a", entityKind: "bundler", fundingBursts: 500, flagged: true }, 0, 40)).toBe(false);
+    expect(isHubFromFacts({ address: "a", entityKind: null, fundingBursts: 39, flagged: false }, 0, 40)).toBe(false);
+    expect(isHubFromFacts({ address: "a", entityKind: null, fundingBursts: 40, flagged: false }, 0, 40)).toBe(true);
+    expect(isHubFromFacts({ address: "a", entityKind: null, fundingBursts: 0, flagged: true }, 0, 40)).toBe(true);
     expect(isHubFromFacts(undefined, 45, 40)).toBe(true);
     expect(isHubFromFacts(undefined, 1, 40)).toBe(false);
   });
@@ -333,7 +443,7 @@ describe.skipIf(!hasTestDatabase)("WalletIntelService with a database", () => {
     expect(result.get("KnownEarlier")?.funder).toBe("EarlyFunder");
     expect(rpc.signatureCalls).toBe(0);
     const later = new WalletIntelService({ db: database.db, rpc, clock: new VirtualClock(T0 + 120_000), config });
-    const known = await later.ensure([request("KnownLater")], T0 + 125_000, { fetch: false });
+    const known = await later.ensure([request("KnownLater", "b")], T0 + 125_000, { fetch: false });
     expect(known.get("KnownLater")?.funder).toBe("LateFunder");
     expect(rpc.signatureCalls).toBe(0);
   });
@@ -378,5 +488,23 @@ describe.skipIf(!hasTestDatabase)("WalletIntelService with a database", () => {
     await service.drain();
     const flagged = await database.db.query("SELECT is_hub, checked_before_signature FROM wallet_intel WHERE wallet = 'Distributor'");
     expect(flagged.rows[0]).toEqual({ is_hub: true, checked_before_signature: null });
+  });
+
+  it("counts stored fundees funded in one burst once when deciding hubs", async () => {
+    for (let index = 0; index < 6; index += 1) {
+      await database.db.query(
+        "INSERT INTO wallet_intel (wallet, funder, funded_at, prior_tx_count, checked_before_signature, checked_at) VALUES ($1, 'BurstMaster', $2, 0, 'x', $3)",
+        [`burst${index}`, new Date(T0 - 300_000 + index * 5_000), new Date(T0)]
+      );
+    }
+    const rpc = new FakeRpc();
+    rpc.addHistory("nextBundle", [fundingTx("nb", "BurstMaster", "nextBundle", SOL)]);
+    const hubConfig = scorerConfig({ deepIntel: { ...config.deepIntel, hubFanoutThreshold: 5 } });
+    const service = new WalletIntelService({ db: database.db, rpc, clock: new VirtualClock(T0), config: hubConfig });
+    const result = await service.ensure([request("nextBundle")], T0 + 5_000);
+    expect(result.get("nextBundle")?.funderIsHub).toBe(false);
+    await service.drain();
+    const flagged = await database.db.query("SELECT count(*)::int AS n FROM wallet_intel WHERE wallet = 'BurstMaster' AND is_hub");
+    expect(flagged.rows[0]?.n).toBe(0);
   });
 });

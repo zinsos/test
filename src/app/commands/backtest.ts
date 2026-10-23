@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { formatTradeReport } from "../../backtest/report.js";
 import { runBacktest, type BacktestProgress, type BacktestSummary } from "../../backtest/runner.js";
+import type { SkippedWeights, WeightsProvenance } from "../../backtest/weights.js";
 import { jsonSafe, type Db } from "../../db/pool.js";
 import { ScoringModel } from "../../scorer/model.js";
 import { loadWeightsFile, loadWeightsVersion } from "../../scorer/weights.js";
@@ -26,6 +27,24 @@ export function progressLine(progress: BacktestProgress): string {
   const span = Math.max(1, progress.toMs - progress.fromMs);
   const pct = Math.min(100, Math.max(0, ((progress.virtualNowMs - progress.fromMs) / span) * 100));
   return `backtest ${pct.toFixed(0)}% at ${isoDay(progress.virtualNowMs)}: ${progress.events} events, ${progress.openPositions} open, ${progress.closedTrades} closed`;
+}
+
+function trainingText(fromMs: number | null, toMs: number | null): string {
+  return `${fromMs === null ? "the start" : isoDay(fromMs)} to ${toMs === null ? "?" : isoDay(toMs)}`;
+}
+
+export function weightsText(weights: WeightsProvenance): string {
+  if (weights.trainedToMs === null) {
+    return `${weights.version} (${weights.source}, not fitted on recorded data)`;
+  }
+  const trained = trainingText(weights.trainedFromMs, weights.trainedToMs);
+  return weights.inSample
+    ? `${weights.version} (${weights.source}, fitted on ${trained}: IN-SAMPLE, results are optimistic)`
+    : `${weights.version} (${weights.source}, fitted on ${trained})`;
+}
+
+export function skippedWeightsText(skipped: SkippedWeights): string {
+  return `skipped ${skipped.source} weights ${skipped.version}: fitted on ${trainingText(skipped.trainedFromMs, skipped.trainedToMs)}, which overlaps or follows the backtest window (pass --weights ${skipped.version} or --allow-in-sample to use them)`;
 }
 
 function exitReasonText(reasons: Record<string, number>): string {
@@ -56,7 +75,7 @@ export function formatBacktestReport(summary: BacktestSummary): string {
       ],
       ["exits", exitReasonText(summary.exitReasons)],
       ["closed at end", `${counts.closedAtEnd} positions closed at the last quote`],
-      ["weights", summary.weightsVersion],
+      ["weights", weightsText(summary.weights)],
       ["wallets", summary.trackedVersionAtEnd],
       ["risk", riskText],
       ["fingerprint", summary.fingerprint.slice(0, 16)]
@@ -84,8 +103,15 @@ export async function backtestCommand(ctx: CommandContext): Promise<number> {
       walkForward: flagOption(ctx.options, "walk-forward"),
       model,
       weightsFile: model ? null : config.scorer.weightsFile,
+      allowInSampleWeights: flagOption(ctx.options, "allow-in-sample"),
       onProgress: (progress) => ctx.io.err(progressLine(progress))
     });
+    for (const skipped of result.summary.skippedWeights) {
+      ctx.io.err(`warning: ${skippedWeightsText(skipped)}`);
+    }
+    if (result.summary.weights.inSample) {
+      ctx.io.err(`warning: scoring with in-sample weights ${weightsText(result.summary.weights)}`);
+    }
     ctx.io.out(formatBacktestReport(result.summary));
     if (flagOption(ctx.options, "json")) {
       ctx.io.out(JSON.stringify(jsonSafe(result.summary), null, 2));

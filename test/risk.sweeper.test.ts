@@ -29,10 +29,16 @@ interface SweepRowsResult {
 }
 
 function fakeDb(behaviour?: () => Promise<SweepRowsResult>) {
+  const lockClient = {
+    query: vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [{ locked: true }] })),
+    release: vi.fn()
+  };
   return {
     query: vi.fn(async (_sql: string, _params?: unknown[]): Promise<SweepRowsResult> =>
       behaviour ? behaviour() : { rows: [{ id: 7n }] }
-    )
+    ),
+    connect: vi.fn(async () => lockClient),
+    lockClient
   };
 }
 
@@ -68,7 +74,7 @@ type FakeConnection = ReturnType<typeof fakeConnection>;
 interface BuildOptions extends Partial<Omit<HotColdSweeperOptions, "connection" | "db">> {
   connection: FakeConnection;
   db?: FakeDb;
-  realDb?: Pick<Db, "query">;
+  realDb?: Pick<Db, "query" | "connect">;
 }
 
 function build(options: BuildOptions) {
@@ -85,7 +91,7 @@ function build(options: BuildOptions) {
     isBusy: () => false,
     ...rest,
     hotKeypair,
-    db: realDb ?? (db as unknown as Pick<Db, "query">),
+    db: realDb ?? (db as unknown as Pick<Db, "query" | "connect">),
     connection: connection as unknown as SweeperConnection
   });
   return { sweeper, clock, db, hotKeypair, cold: options.coldAddress ?? cold };
@@ -307,6 +313,21 @@ describe("hot to cold sweeper", () => {
     expect((await first).status).toBe("confirmed");
   });
 
+  it("takes the hot wallet sweep lock around a sweep and skips while another process holds it", async () => {
+    const connection = fakeConnection(6 * SOL);
+    const held = build({ connection, lock: async () => null });
+    expect((await held.sweeper.tick()).status).toBe("in_progress");
+    expect(connection.getBalance).not.toHaveBeenCalled();
+    const released = vi.fn(async () => undefined);
+    const failing = build({ connection: fakeConnection(6 * SOL, { send: async () => Promise.reject(new Error("boom")) }), lock: async () => ({ release: released }) });
+    expect((await failing.sweeper.tick()).status).toBe("failed");
+    expect(released).toHaveBeenCalledTimes(1);
+    const { sweeper, db } = build({ connection: fakeConnection(6 * SOL) });
+    expect((await sweeper.tick()).status).toBe("confirmed");
+    expect(db.lockClient.query.mock.calls.map(([sql]) => sql)).toEqual(["SELECT pg_try_advisory_lock($1) AS locked", "SELECT pg_advisory_unlock($1)"]);
+    expect(db.lockClient.release).toHaveBeenCalledTimes(1);
+  });
+
   it("runs on the clock schedule and stops cleanly", async () => {
     const connection = fakeConnection(5 * SOL);
     const { sweeper, clock } = build({ connection, config: sweeperConfig({ intervalMinutes: 30 }), initialDelayMs: 1000 });
@@ -364,5 +385,41 @@ describe.skipIf(!hasTestDatabase)("hot to cold sweeper with postgres", () => {
     expect(duplicate).toBeNull();
     const count = await database.db.query<{ count: number }>("SELECT COUNT(*)::int AS count FROM sweeps");
     expect(count.rows[0]?.count).toBe(2);
+  });
+
+  it("lets only one of two processes sweep the same hot wallet, so the floor holds", async () => {
+    let balance = 6n * BigInt(SOL);
+    let entered: () => void = () => undefined;
+    let release: () => void = () => undefined;
+    const reading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const send = async (): Promise<string> => {
+      balance -= sweepAmountLamports(balance, sweeperConfig(), FEE) + FEE;
+      return "sent";
+    };
+    const serviceChain = fakeConnection(0, {
+      balance: async () => {
+        entered();
+        await gate;
+        return Number(balance);
+      },
+      send
+    });
+    const cliChain = fakeConnection(0, { balance: async () => Number(balance), send });
+    const hotKeypair = Keypair.generate();
+    const service = build({ connection: serviceChain, realDb: database.db, hotKeypair });
+    const cli = build({ connection: cliChain, realDb: database.db, hotKeypair });
+    const first = service.sweeper.tick();
+    await reading;
+    expect((await cli.sweeper.tick()).status).toBe("in_progress");
+    expect(cliChain.getBalance).not.toHaveBeenCalled();
+    release();
+    expect((await first).status).toBe("confirmed");
+    expect(balance).toBeGreaterThanOrEqual(hotFloorLamports(sweeperConfig()));
+    expect((await cli.sweeper.tick()).status).toBe("below_minimum");
   });
 });

@@ -12,7 +12,7 @@ Everything here serves one of those three goals. It all lives in one TypeScript 
 
 | # | Component | What it does | Code | Main tables |
 |---|-----------|--------------|------|-------------|
-| 1 | **Launch data recorder** | Subscribes to Pump and PumpSwap logs over a websocket and decodes every launch, trade, completion and migration. Stores holder snapshots at 30s, 1m, 5m and 15m, plus metadata (socials) and outcome labels: rugged, died, migrated, survived 15m, peak and market caps at each checkpoint. Records websocket gaps, so incomplete launches can be left out of analysis. | `src/ingest`, `src/recorder` | `launches`, `trades` (daily partitions), `holder_snapshots`, `launch_outcomes`, `ingest_gaps` |
+| 1 | **Launch data recorder** | Subscribes to Pump and PumpSwap logs over a websocket and decodes every launch, trade, completion and migration. Stores holder snapshots at 30s, 1m, 5m and 15m, plus metadata (socials) and outcome labels: rugged, died, migrated, survived 15m, peak and market caps at each checkpoint. Records websocket gaps, restart holes and dropped writes, with the time each launch's data became incomplete. | `src/ingest`, `src/recorder` | `launches`, `trades` (daily partitions), `holder_snapshots`, `launch_outcomes`, `ingest_gaps`, `recorder_checkpoints` |
 | 2 | **Launch risk scorer** | Scores every launch from 0 (clean) to 100 (toxic) at 10s, 30s, 60s and 120s. Looks at dev share and dev selling, creation-slot bundles, funding clusters (who funded the early buyers), fresh wallets, the dev's past launches, concentration, order flow, socials and copycats. Hard blocks catch the obvious rugs. Weights can be re-fit from recorded outcomes. | `src/scorer` | `launch_scores`, `wallet_intel`, `scorer_weights` |
 | 3 | **Smart wallet tracker** | Ranks wallets weekly by realized round-trip PnL over 30 and 90 days. Excludes devs, insiders, bundlers, bots, snipers and one-hit wonders. Fires a `smart_convergence` signal when several tracked wallets buy the same launch within a window. An optional `score_momentum` signal can also be turned on. | `src/tracker` | `wallet_rank_runs`, `wallet_ranks`, `wallet_history_trades`, `signals` |
 | 4 | **Realistic execution model** | The paper executor fills against the real curve or pool math at the moment the order would land. It models latency, jitter, failed transactions, retries, slippage limits, protocol, creator, LP and platform fees, priority fees, Jito tips and token account rent. The live executor builds transactions with the official pump.fun SDKs and parses the real fills. | `src/execution` | `fills` |
@@ -24,30 +24,40 @@ The trader (`src/trader`) connects them: signal, then risk check, then executor,
 
 ## How it is deployed
 
-The recommended setup is two Railway services built from this repository, plus the Railway Postgres plugin:
+The simplest setup, and the recommended one for paper trading from a phone, is **one Railway service** built from this repository plus the Railway Postgres plugin:
 
 | Service | `MODULES` | Role |
 |---------|-----------|------|
-| **A: data** | `recorder,scorer,tracker,dashboard` | Records everything, writes `launch_scores` for SNYPRA's buy-blockers, ranks wallets weekly, serves the dashboard and API. It also writes the signals it sees to `signals` with no run attached. |
-| **B: trading** | `trader` with `TRADING_MODE=paper` | Has its own signal engine and scorer (it does not write scores), and trades paper or live. It restores open positions after a restart. |
+| **snypra-edge** | `recorder,scorer,tracker,trader,dashboard` with `TRADING_MODE=paper` | Records everything, writes `launch_scores` for SNYPRA's buy-blockers, ranks wallets, trades paper and serves the dashboard and API. Recorder, scorer and trader share one stream and one in-memory market, so the trader sees exactly what the recorder stores and the backtest replays it with the same timing. |
 
-Each service opens its own websocket stream and keeps its own in-memory market state, so neither depends on the other being up. They share only Postgres. Service B reads the wallet rankings that A writes.
+Splitting into two services is optional. It isolates the trader from the recorder's load, at the cost of a second stream:
 
-Only one trader per mode can run at a time. When Railway rolls a deploy, it starts the new container before stopping the old one. The new trader answers `/healthz` straight away but waits on a Postgres advisory lock until the old one has shut down, so the two never trade at the same time.
+| Service | `MODULES` | Role |
+|---------|-----------|------|
+| **A: data** | `recorder,scorer,tracker,dashboard` | Everything above except trading. It also writes the signals it sees to `signals` with no run attached. |
+| **B: trading** | `trader` with `TRADING_MODE=paper` or `live` | Has its own signal engine and scorer (it does not write scores) and trades. It reads the wallet rankings and the wallet intel that A stores and makes no wallet-intel RPC calls itself, so its RPC key is left for orders and confirmations. |
+
+Each service opens its own websocket stream and keeps its own in-memory market state. They share only Postgres. Every service restores open positions after a restart.
+
+Deploys and restarts:
+
+- **Restart policy.** `railway.json` restarts the service whenever it exits (`ALWAYS`), so a crash loop during a long Postgres outage cannot exhaust a retry budget.
+- **Postgres outages.** On start the service waits up to 10 minutes for Postgres, with backoff, before it gives up and lets Railway restart it.
+- **Overlapping deploys.** Railway starts the new container, waits for `/healthz`, then keeps the old one running for 20 more seconds (`overlapSeconds`) before draining it for 50 seconds. A service that records answers `/healthz` with 503 until its stream has delivered data.
+- **Recorder handover.** Every recorder writes its stream position to `recorder_checkpoints`. When a new recorder starts streaming, it checks whether an earlier recorder covered the slots up to its first event. Only a real hole (a crash, or a stop followed by a late start) is recorded as a `restart` gap, and only launches that were being tracked during the hole are marked incomplete, from the time of the hole. Aggregates count each stored trade once, even while two recorders overlap.
+- **Trading lock.** Only one trader per mode can run at a time. The new trader answers `/healthz` straight away but waits on a Postgres advisory lock until the old one has shut down, so the two never trade at the same time.
 
 ### Railway step by step
 
 1. Create a project and add the **Postgres** plugin.
-2. Add a service from this repo. `railway.json` already sets the build (`npm run build`), the start command (`node dist/src/main.js start`), the `/healthz` health check and a 50 second draining window so in-flight orders can finish.
+2. Add a service from this repo. `railway.json` already sets the build (`npm run build`), the start command (`node dist/src/main.js start`), the `/healthz` health check, the restart policy, a 20 second overlap and a 50 second draining window so in-flight orders can finish.
 3. Set its variables (see `.env.example` for all of them):
    - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
    - `RPC_HTTP_URL`, and `RPC_WS_URL` if your provider uses a separate websocket URL
-   - `MODULES=recorder,scorer,tracker,dashboard`
-   - `DASHBOARD_TOKEN` set to a long random string
+   - `MODULES=recorder,scorer,tracker,trader,dashboard` and `TRADING_MODE=paper`
+   - `DASHBOARD_TOKEN` set to at least 24 random characters (for example the output of `openssl rand -hex 24`). A service with the dashboard refuses to start without it, because the API exposes trades, positions and wallets.
    - Generate a public domain for it so you can open the dashboard.
-4. Add a second service from the same repo with:
-   - `DATABASE_URL`, `RPC_HTTP_URL`, `RPC_WS_URL`
-   - `MODULES=trader`, `TRADING_MODE=paper`
+4. Optional split: set `MODULES=recorder,scorer,tracker,dashboard` on the first service and add a second service from the same repo with `DATABASE_URL`, `RPC_HTTP_URL`, `RPC_WS_URL`, `MODULES=trader` and `TRADING_MODE=paper`.
 5. Migrations run automatically on start. You can also run `node dist/src/main.js migrate`.
 6. To change strategy knobs, edit `config/strategy.json` and redeploy, or point `STRATEGY_CONFIG` at another file.
 
@@ -56,7 +66,7 @@ Local run: `npm ci`, start Postgres, `cp .env.example .env`, edit it, then `npx 
 ### RPC requirements
 
 - **Websocket**: needs `logsSubscribe` with a `mentions` filter on both Pump (`6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`) and PumpSwap (`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`). The stream reconnects with backoff, detects stalls and records every gap.
-- **HTTP**: used for wallet intel (`getSignaturesForAddress`, `getTransaction` with `maxSupportedTransactionVersion: 1`), RPC holder snapshots, wallet backfills, balance checks and live trading.
+- **HTTP**: used for wallet intel (`getSignaturesForAddress`, `getTransaction` with `maxSupportedTransactionVersion: 1`), RPC holder snapshots, wallet backfills, balance checks and live trading. Wallet intel is fetched only by services that run `recorder` or `scorer`: up to 25 early buyers per launch, each one signature page plus up to 5 transactions, so budget about 150 calls for an active launch and far fewer for the many launches that never reach 5 buyers.
 - **Plan**: pump.fun produces tens of thousands of launches and a few million log notifications a day. Public endpoints rate-limit and drop websocket notifications, so use a paid RPC (Helius, Triton, QuickNode or similar).
 - **Rate limits**: tune `RPC_MAX_RPS` and `RPC_MAX_CONCURRENCY` to your plan. Watch `stream.gaps` and `stream.lagMs` in the health line and on the dashboard's Recorder tab.
 
@@ -73,8 +83,8 @@ Rough sizes per day at current pump.fun volume:
 
 That is roughly 1.5 to 2 GB a day, so plan for **20 to 30 GB for the first two weeks**.
 
-- Measure the real figure after a day with `SELECT pg_size_pretty(pg_database_size(current_database()));`.
-- `trades` is partitioned by day (`trades_YYYYMMDD`). Partitions older than the 90-day ranking window can be dropped with `DROP TABLE trades_20261001;`.
+- Measure the real figure after a day with `SELECT pg_size_pretty(pg_database_size(current_database()));`. Postgres stops accepting writes when the volume is full, and SNYPRA's buy-blockers go stale with it, so size the Railway volume for your retention: about 200 GB for 100 days.
+- Nothing is deleted automatically. `prune-data --keep-days 100 --dry-run` shows what would go, and `prune-data --keep-days 100` drops whole days of `trades` partitions and the `launch_scores` and `holder_snapshots` of launches created before the kept window. Launch rows and outcomes stay, so dev history keeps working. Keep at least 100 days so the 90-day wallet rankings and your backtest windows still have their data.
 
 ## Rollout plan
 
@@ -82,13 +92,13 @@ The order matters. Each step produces the evidence the next one needs.
 
 | When | What | Commands |
 |------|------|----------|
-| Weeks 1 to 2 | **Record.** Deploy service A only. Check the dashboard's Recorder tab daily: gaps, outcome coverage, trades per launch. | `start` (service A) |
+| Weeks 1 to 2 | **Record.** Deploy with `MODULES=recorder,scorer,tracker,dashboard`. Check the dashboard's Recorder tab daily: gaps, outcome coverage, trades per launch. | `start` |
 | End of week 2 | **Rank wallets and fetch their history.** | `rank-wallets`, then `backfill-wallets --top 200`, then `rank-wallets` again |
 | | **Tune the scorer** on the first 10 days, then backtest on the last 4 days. Testing on data the weights never saw keeps the result honest. | `tune-scorer --checkpoint 30 --label rugged --to 2026-11-10` (the new weights are stored but not active), then `backtest --from 2026-11-10 --to 2026-11-14 --weights <version printed by tune-scorer> --walk-forward`, then `export-dataset --checkpoint 30 --out scorer.csv` for SNYPRA's optimizer |
 | | **Activate the weights** if the backtest's expectancy interval and the dashboard's Scorer calibration look right. Restart the services so they load the new weights. | `tune-scorer ... --activate` |
-| Weeks 3 to 6 | **Paper trade.** Deploy service B with `TRADING_MODE=paper` until you have **300 or more closed trades**. Fix the strategy using the breakdowns and the `cut` and `scale` hints: risk buckets, hours, exit reasons. | `report --mode paper` |
-| Then | **Live, dry run.** Set `TRADING_MODE=live`, `LIVE_DRY_RUN=true` and a hot wallet key. Every order is built and simulated against the chain, never sent. Check the logs for `dry run simulated` with `ok: true` on both a bonding-curve coin and a migrated (PumpSwap) coin. | `start` (service B) |
-| Then | **Live, small.** Set `LIVE_DRY_RUN=false` with a small `risk.startingBankrollSol` and a small hot wallet balance. Every live position also opens a paper shadow position, so the two can be compared on the same signals. | `start` (service B) |
+| Weeks 3 to 6 | **Paper trade.** Add `trader` to `MODULES` with `TRADING_MODE=paper` (or deploy the optional trading service) until you have **300 or more closed trades**. Fix the strategy using the breakdowns and the `cut` and `scale` hints: risk buckets, hours, exit reasons. | `report --mode paper` |
+| Then | **Live, dry run.** Set `TRADING_MODE=live`, `LIVE_DRY_RUN=true` and a hot wallet key. Every order is built and simulated against the chain, never sent. Check the logs for `dry run simulated` with `ok: true` on both a bonding-curve coin and a migrated (PumpSwap) coin. | `start` |
+| Then | **Live, small.** Set `LIVE_DRY_RUN=false` with a small `risk.startingBankrollSol` and a small hot wallet balance. Every live position also opens a paper shadow position, so the two can be compared on the same signals. | `start` |
 | Weekly | **Compare live against paper.** On the dashboard's Paper vs Live tab, check the mean PnL gap with its interval, the entry and exit fill gaps in bps and the failed-fill rates. If paper is too optimistic, raise `execution.latencySlots`, `failureRate` or the fees until paper matches live, then re-read your paper results with the new settings. | `report --mode live` |
 
 Do not size up on a small sample. `report` and the dashboard print how many more trades are needed before the expectancy interval excludes zero.
@@ -101,7 +111,7 @@ Run commands with `node dist/src/main.js <command>`, or `npx tsx src/main.ts <co
 |---------|---------|
 | `start` | Run the services listed in `MODULES`. Shuts down cleanly on SIGINT and SIGTERM: stops the stream, finishes in-flight orders, flushes writers and closes the database. |
 | `migrate` | Apply database migrations. |
-| `backtest --from 2026-10-01 --to 2026-10-15 [--label x] [--config f] [--weights file-or-version] [--walk-forward] [--include-incomplete] [--json]` | Replay a date range (UTC, `--to` exclusive). It records a `strategy_runs` row with mode `backtest`, prints the report and stores the summary on the run. |
+| `backtest --from 2026-10-01 --to 2026-10-15 [--label x] [--config f] [--weights file-or-version] [--allow-in-sample] [--walk-forward] [--include-incomplete] [--json]` | Replay a date range (UTC, `--to` exclusive). It records a `strategy_runs` row with mode `backtest`, prints the report and stores the summary on the run. |
 | `tune-scorer --checkpoint 30 --label rugged [--from --to] [--activate] [--write-file] [--version name]` | Fit weights against `rugged`, `died`, `survived_15m` or `migrated`. Prints feature AUCs and validation AUC, then stores the new version. |
 | `export-dataset --checkpoint 30 --out scorer.csv [--from --to] [--quote SOL]` | Write one row per launch with every feature and outcome label, for SNYPRA's optimizer. Use `--out -` for stdout. |
 | `rank-wallets [--as-of 2026-10-15]` | Rank wallets now, or as of a past time using only data before it. |
@@ -110,10 +120,13 @@ Run commands with `node dist/src/main.js <command>`, or `npx tsx src/main.ts <co
 | `sweep [--dry-run]` | One manual sweep from hot to cold. Live open positions block it. |
 | `reset-kill --run 12 [--reason "..."]` | Clear the drawdown kill switch. A running trader picks the reset up within 30 seconds. |
 | `recompute-outcomes [--from --to]` | Relabel outcomes after changing `recorder.outcome` settings. Defaults to the last 30 days. |
+| `prune-data --keep-days 100 [--dry-run]` | Free disk space: drop trade partitions, launch scores and holder snapshots older than the kept window. |
 
 How a backtest works:
 
-- **Data.** It replays launches created in the window, their trades, completions and migrations, in block order. Launches with ingest gaps are skipped unless `--include-incomplete` is set. The live trader matches this: after a stream gap it does not enter launches created before the gap (skip reason `incomplete_data`).
+- **Data.** It replays every launch created in the window, with its trades, completions and migrations, in block order. A launch whose data became incomplete (a stream gap, a recorder restart hole or a dropped write) is replayed in full but not entered from the moment its data became incomplete (skip reason `incomplete_data`), unless `--include-incomplete` is set. The live trader matches this: after a stream gap it does not enter launches created before the gap. Launches are never dropped because they were still alive when a gap happened.
+- **Timing.** Each event becomes visible at the time the recorder received it (`trades.received_at`, `launches.observed_at`), never at the whole block second, so signals, fills and exits wait for the same stream latency they faced live. Rows recorded before receive times were stored use the block time plus 1.5 seconds.
+- **Scorer weights.** Without `--weights`, the backtest uses the active weights, then `scorer.weightsFile`, then the hand-set defaults, skipping any weights fitted on data from the backtest window or later (the training range stored by `tune-scorer`, or the save time when no range was given). The report shows which weights were used and their training range. `--weights` or `--allow-in-sample` uses in-sample weights anyway, and the report then marks them `IN-SAMPLE`.
 - **Shared code.** It runs the live scorer (replay mode), signal engine, paper executor, exit engine, risk manager and trader.
 - **Time.** A virtual clock drives everything, so latency, score checkpoints, time stops and daily limits behave as they would live.
 - **No lookahead.**
@@ -171,6 +184,7 @@ How a backtest works:
 - **Kill switch.** Trips at `risk.killSwitchDrawdownFraction` and flattens everything when `risk.flattenOnKill` is true. Resetting it is manual: `reset-kill --run <id>`. The daily loss halt resets at `risk.dayResetUtcHour`.
 - **Unconfirmed fills.** The live executor never resends a transaction whose fate is unknown. It reconciles the signature later, so a slow confirmation cannot become a double buy. If a fill stays unknown, the log says to check the wallet.
 - **Hot wallet balance.** It is polled every 15 seconds, and sizing never exceeds what the wallet holds minus the fee reserve.
+- **A trader that is down manages nothing.** While the trading process is stopped, open positions get no stop loss, trailing stop or time stop. Railway restarts it after any exit, and on start it waits up to 10 minutes for Postgres and then restores its open positions. If the dashboard or Railway shows the trader down for longer, check the open positions and the hot wallet by hand.
 
 ## PUMP-quoted launches
 
@@ -194,7 +208,7 @@ Open the service A domain with `?token=<DASHBOARD_TOKEN>` once. The page stores 
 - **Launches:** tap a mint for its score sheet
 - **Wallets**
 
-`/healthz` needs no token.
+`/healthz` needs no token. Every other route needs `DASHBOARD_TOKEN`, and the service will not start the dashboard without a token of at least 24 characters.
 
 ## Development
 

@@ -250,7 +250,7 @@ describe.skipIf(!hasTestDatabase)("end to end: websocket stream to recorder and 
     firstRun = launches;
   }, 60_000);
 
-  it("is idempotent when a restarted process receives the same stream again", async () => {
+  it("is idempotent and records no restart gap when a cleanly restarted process receives the same stream again", async () => {
     const running = await startRecorder(database, node, rpc);
     const received = 0;
     await receiveAll(running, received);
@@ -261,12 +261,11 @@ describe.skipIf(!hasTestDatabase)("end to end: websocket stream to recorder and 
     const launches = await launchRows(database);
     expect(launches.size).toBe(firstRun.size);
     for (const [mint, before] of firstRun) {
-      const after = launches.get(mint);
-      expect({ ...after, data_complete: null }, mint).toEqual({ ...before, data_complete: null });
-      expect(after?.data_complete).toBe(false);
+      expect(launches.get(mint), mint).toEqual(before);
     }
     const restarts = await count(database, "SELECT count(*)::int AS n FROM ingest_gaps WHERE reason = 'restart'");
-    expect(restarts).toBe(2);
+    expect(restarts).toBe(1);
+    expect(running.app.recorder?.stats().recorder).toMatchObject({ restartsCovered: 1, restartGaps: 0 });
     expect(node.connectionsOpened).toBe(2);
   }, 60_000);
 });

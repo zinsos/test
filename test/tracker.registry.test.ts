@@ -137,3 +137,73 @@ describe.skipIf(!hasTestDatabase)("tracked wallet registry", () => {
     expect(clock.pendingCount()).toBe(0);
   });
 });
+
+describe.skipIf(!hasTestDatabase)("rank run availability and scope", () => {
+  let database: TestDatabase;
+  const HOUR = 3_600_000;
+  const AS_OF = Date.UTC(2026, 9, 12);
+
+  async function run(asOfMs: number, ranAtMs: number, params: Record<string, unknown>, wallets: string[]): Promise<number> {
+    const inserted = await database.db.query<{ id: bigint }>(
+      `INSERT INTO wallet_rank_runs (as_of, ran_at, params, candidates, tracked) VALUES ($1, $2, $3, $4, $4) RETURNING id`,
+      [new Date(asOfMs), new Date(ranAtMs), JSON.stringify(params), wallets.length]
+    );
+    const runId = Number(inserted.rows[0]?.id ?? 0);
+    for (const [index, wallet] of wallets.entries()) {
+      await database.db.query(`INSERT INTO wallet_ranks (run_id, wallet, rank, score, tracked) VALUES ($1, $2, $3, 1, true)`, [runId, wallet, index + 1]);
+    }
+    return runId;
+  }
+
+  beforeAll(async () => {
+    database = await createTestDatabase("tracker_registry_scope");
+  });
+
+  afterAll(async () => {
+    await database.drop();
+  });
+
+  it("switches to a live rerank only once it was written and to a point-in-time run at its as_of", async () => {
+    const live = { label: "live", historyKnownBeforeMs: null };
+    const quick = await run(AS_OF, AS_OF + 5 * 60_000, live, ["QuickA"]);
+    const backfilled = await run(AS_OF, AS_OF + 4 * HOUR, live, ["BackfilledA"]);
+    const pointInTime = await run(AS_OF + 2 * HOUR, AS_OF + 30 * DAY, { label: "cli-as-of", historyKnownBeforeMs: AS_OF + 2 * HOUR }, ["AsOfA"]);
+    const registry = new TrackedWalletRegistry({ db: database.db });
+    expect(await registry.preloadRuns({ fromMs: AS_OF - DAY, toMs: AS_OF + DAY })).toBe(3);
+    registry.setAsOf(AS_OF + 60_000);
+    expect(registry.count()).toBe(0);
+    registry.setAsOf(AS_OF + HOUR);
+    expect(registry.currentRun()?.runId).toBe(quick);
+    registry.setAsOf(AS_OF + 3 * HOUR);
+    expect(registry.currentRun()?.runId).toBe(pointInTime);
+    registry.setAsOf(AS_OF + 5 * HOUR);
+    expect(registry.currentRun()?.runId).toBe(pointInTime);
+    expect(registry.isTracked("BackfilledA")).toBe(false);
+    registry.setAsOf(AS_OF + HOUR);
+    expect(registry.currentRun()?.runId).toBe(quick);
+    expect(backfilled).toBeGreaterThan(quick);
+    await database.db.query("DELETE FROM wallet_rank_runs WHERE id = $1", [pointInTime]);
+    await registry.preloadRuns({ fromMs: AS_OF + 3 * HOUR, toMs: AS_OF + DAY });
+    registry.setAsOf(AS_OF + 3 * HOUR);
+    expect(registry.currentRun()?.runId).toBe(quick);
+    registry.setAsOf(AS_OF + 5 * HOUR);
+    expect(registry.currentRun()?.runId).toBe(backfilled);
+  });
+
+  it("keeps walk-forward runs away from live readers and preloads them only when asked for", async () => {
+    await database.db.query("TRUNCATE wallet_rank_runs CASCADE");
+    const published = await run(AS_OF, AS_OF, { label: "live", historyKnownBeforeMs: null }, ["LiveA"]);
+    const walkForward = await run(AS_OF + DAY, AS_OF + 40 * DAY, { label: "walk-forward", historyKnownBeforeMs: AS_OF + DAY }, ["WalkA"]);
+    expect((await latestRun(database.db))?.runId).toBe(published);
+    expect((await latestRunAsOf(database.db, AS_OF + 2 * DAY))?.runId).toBe(published);
+    const live = await TrackedWalletRegistry.loadAsOf(database.db, AS_OF + 2 * DAY);
+    expect(live.isTracked("WalkA")).toBe(false);
+    const backtest = new TrackedWalletRegistry({ db: database.db });
+    expect(await backtest.preloadRuns({ fromMs: AS_OF, toMs: AS_OF + 2 * DAY })).toBe(1);
+    expect(await backtest.preloadRuns({ fromMs: AS_OF, toMs: AS_OF + 2 * DAY }, [walkForward])).toBe(1);
+    backtest.setAsOf(AS_OF + 2 * DAY);
+    expect(backtest.currentRun()?.runId).toBe(walkForward);
+    backtest.setAsOf(AS_OF);
+    expect(backtest.count()).toBe(0);
+  });
+});

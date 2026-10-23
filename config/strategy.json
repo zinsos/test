@@ -66,6 +66,7 @@
       "cacheTtlHours": 72,
       "hubFanoutThreshold": 40,
       "maxWalletsPerLaunch": 25,
+      "minClusterCoverage": 0.6,
       "timeoutMs": 8000
     },
     "copycat": {
@@ -97,6 +98,7 @@
       "minWallets": 3,
       "maxRiskScore": 55,
       "waitForScoreMs": 5000,
+      "maxScoreAgeSec": 30,
       "maxLaunchAgeSec": 3600
     }
   },

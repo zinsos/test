@@ -153,8 +153,23 @@ describe("composite wallet score", () => {
       Array.from({ length: 10 }, (_, index) => trip({ closedDaysAgo: 1 + index, pnlSol: 0.5 })),
       SHORT
     );
-    const expected = perfect.winRateLower * DEFAULT_SCORE_WEIGHTS.profitFactorCap * Math.log1p(perfect.realizedPnlSol);
+    const expected = perfect.winRateLower * DEFAULT_SCORE_WEIGHTS.profitFactorCap * Math.log1p(perfect.pnlExBestSol);
     expect(confidenceAdjustedEdge(perfect, DEFAULT_SCORE_WEIGHTS)).toBeCloseTo(expected, 10);
+  });
+
+  it("sizes the edge by pnl without the best trade so one big hit plus dust cannot outrank steady profit", () => {
+    const lottery = [
+      trip({ closedDaysAgo: 2, pnlSol: 100 }),
+      trip({ closedDaysAgo: 3, pnlSol: -0.05 }),
+      ...Array.from({ length: 13 }, (_, index) => trip({ closedDaysAgo: 5 + index, pnlSol: 0.01 }))
+    ];
+    const steady = Array.from({ length: 60 }, (_, index) => trip({ closedDaysAgo: 1 + (index % 28), pnlSol: index % 3 === 2 ? -0.5 : 1 }));
+    const lotteryShort = computeWindowStats(lottery, SHORT);
+    const lotteryScore = compositeWalletScore(lotteryShort, computeWindowStats(lottery, LONG));
+    const steadyScore = compositeWalletScore(computeWindowStats(steady, SHORT), computeWindowStats(steady, LONG));
+    expect(lotteryShort.pnlExBestSol).toBeGreaterThan(0);
+    expect(lotteryShort.realizedPnlSol).toBeGreaterThan(computeWindowStats(steady, SHORT).realizedPnlSol);
+    expect(steadyScore).toBeGreaterThan(5 * lotteryScore);
   });
 
   it("weights the recent window above the long window", () => {

@@ -50,6 +50,7 @@ export class BatchWriter {
   }
 
   start(): void {
+    this.resume();
     if (this.timer) {
       return;
     }
@@ -62,6 +63,10 @@ export class BatchWriter {
   async stop(): Promise<void> {
     this.beginStop();
     await this.flush();
+  }
+
+  resume(): void {
+    this.stopping = false;
   }
 
   beginStop(): void {

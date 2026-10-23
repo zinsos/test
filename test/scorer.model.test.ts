@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { exceedsRisk, hardBlockFlags, loadScoringModel, riskAt, ScoringModel } from "../src/scorer/model.js";
+import { computeFeatures } from "../src/scorer/features.js";
+import { exceedsRisk, hardBlockFlags, loadScoringModel, riskAt, ScoringModel, soloFlag } from "../src/scorer/model.js";
 import { DEFAULT_WEIGHTS, formatWeights, loadWeightsFile, parseWeights, type WeightsFile } from "../src/scorer/weights.js";
 import { FEATURE_NAMES } from "../src/scorer/featureNames.js";
-import { scorerConfig } from "./scorer.fixtures.js";
+import type { WalletIntel } from "../src/scorer/types.js";
+import { intelEntry, LaunchBuilder, scorerConfig, SOL } from "./scorer.fixtures.js";
 
 const hardBlocks = scorerConfig().hardBlocks;
 
@@ -152,6 +154,117 @@ describe("ScoringModel", () => {
   });
 });
 
+describe("solo terms", () => {
+  const soloWeights: WeightsFile = {
+    version: "solo-v1",
+    features: {
+      a: { weight: 3, points: [[0, 0], [1, 1]], missingRisk: 0.5, solo: 80 },
+      b: { weight: 1, points: [[0, 0], [1, 1]], missingRisk: 1 },
+      c: { weight: 0, points: [[0, 0], [1, 1]], missingRisk: 1, solo: 50 }
+    }
+  };
+  const model = new ScoringModel(soloWeights);
+
+  it("scores the strongest single red flag when it beats the weighted mean and names it in the flags", () => {
+    const result = model.score({ a: 1, b: 0, c: 0 }, hardBlocks);
+    expect(result.score).toBe(80);
+    expect(result.flags).toEqual([soloFlag("a")]);
+    expect(result.hardBlocked).toBe(false);
+    expect(result.contributions).toEqual({ a: 75, b: 0 });
+  });
+
+  it("keeps the weighted mean when it is higher and scales the solo term by risk", () => {
+    expect(model.score({ a: 1, b: 1, c: 1 }, hardBlocks)).toMatchObject({ score: 100, flags: [] });
+    expect(model.score({ a: 0.5, b: 0, c: 0 }, hardBlocks)).toMatchObject({ score: 40, flags: [soloFlag("a")] });
+  });
+
+  it("never applies a solo term to a missing feature", () => {
+    const result = model.score({ a: null, b: 0, c: null }, hardBlocks);
+    expect(result.flags).toEqual([]);
+    expect(result.score).toBeCloseTo((100 * 1.5 * 0.5) / 2.5, 2);
+  });
+
+  it("lets a zero-weight feature act only through its solo term", () => {
+    const result = model.score({ a: 0, b: 0, c: 1 }, hardBlocks);
+    expect(result.score).toBe(50);
+    expect(result.flags).toEqual([soloFlag("c")]);
+    expect(Object.keys(result.contributions).sort()).toEqual(["a", "b"]);
+  });
+
+  it("keeps hard blocks and solo flags apart", () => {
+    const blocked = ScoringModel.default().score({ bundle_share: 0.4 }, hardBlocks);
+    expect(blocked.hardBlocked).toBe(true);
+    expect(blocked.flags).toEqual(["hard_bundle_share", soloFlag("bundle_share")]);
+  });
+});
+
+describe("default weights on single red flags", () => {
+  const config = scorerConfig();
+  const defaults = ScoringModel.default();
+
+  function launch(bundleWallets: number, perWallet: bigint, organic: number): LaunchBuilder {
+    const builder = new LaunchBuilder({ mint: `Solo${bundleWallets}x${perWallet}x${organic}` });
+    builder.buy("DevWallet", SOL / 2n, { slot: builder.createdSlot });
+    for (let index = 0; index < bundleWallets; index += 1) {
+      builder.buy(`bundle${index}`, perWallet, { slot: builder.createdSlot, atMs: builder.createdAtMs });
+    }
+    for (let index = 0; index < organic; index += 1) {
+      builder.buy(`organic${index}`, SOL / 5n, { atMs: builder.createdAtMs + 2_000 + index * 900 });
+    }
+    return builder;
+  }
+
+  function cleanIntel(builder: LaunchBuilder): Map<string, WalletIntel> {
+    return new Map([...builder.launch.wallets.keys()].map((wallet) => [wallet, intelEntry(wallet)]));
+  }
+
+  function scoreAt30s(builder: LaunchBuilder, intel: Map<string, WalletIntel> | null) {
+    const result = computeFeatures(builder.launch, { nowMs: builder.createdAtMs + 30_000, config, intel });
+    return { features: result.features, score: defaults.score(result.features, config.hardBlocks) };
+  }
+
+  it("blocks a 5-wallet creation-slot bundle without wallet intel on the bundle alone", () => {
+    const { features, score } = scoreAt30s(launch(5, SOL / 2n, 25), null);
+    expect(features.creation_slot_buyers).toBe(5);
+    expect(features.bundle_share).toBeLessThan(config.hardBlocks.bundleShareAbove);
+    expect(score.hardBlocked).toBe(false);
+    expect(score.score).toBeGreaterThan(config.maxRisk);
+    expect(score.flags.some((flag) => flag.startsWith("solo_bundle"))).toBe(true);
+  });
+
+  it("blocks 5 and 8 wallet bundles even when every wallet has clean deep intel", () => {
+    for (const [wallets, perWallet] of [[5, SOL / 2n], [8, SOL]] as const) {
+      const builder = launch(wallets, perWallet, 25);
+      const { score } = scoreAt30s(builder, cleanIntel(builder));
+      expect(score.hardBlocked).toBe(false);
+      expect(exceedsRisk(score, config.maxRisk)).toBe(true);
+    }
+  });
+
+  it("keeps clean organic launches well below maxRisk with or without intel", () => {
+    const builder = launch(0, 0n, 25);
+    for (const intel of [null, cleanIntel(builder)]) {
+      const { score } = scoreAt30s(builder, intel);
+      expect(score.score).toBeLessThan(config.maxRisk - 20);
+      expect(score.hardBlocked).toBe(false);
+    }
+  });
+
+  it("lets saturated bundle features alone exceed maxRisk when everything else is clean", () => {
+    const vector: Record<string, number> = {};
+    for (const [name, spec] of Object.entries(DEFAULT_WEIGHTS.features)) {
+      const cleanest = [...spec.points].sort((a, b) => a[1] - b[1])[0];
+      vector[name] = cleanest ? cleanest[0] : 0;
+    }
+    vector.bundle_bought_share = 0.24;
+    vector.bundle_share = 0.24;
+    vector.creation_slot_buyers = 10;
+    const score = defaults.score(vector, config.hardBlocks);
+    expect(score.hardBlocked).toBe(false);
+    expect(score.score).toBeGreaterThan(config.maxRisk);
+  });
+});
+
 describe("weights files", () => {
   it("rejects malformed weights", () => {
     expect(() => parseWeights({ version: "x", features: { a: { weight: -1, points: [[0, 0]] } } })).toThrow();
@@ -159,6 +272,8 @@ describe("weights files", () => {
     expect(() => parseWeights({ version: "x", features: { a: { weight: 1, points: [[0, 2]] } } })).toThrow();
     expect(() => parseWeights({ features: {} })).toThrow();
     expect(parseWeights({ version: "x", features: { a: { weight: 1, points: [[0, 0]] } } }).features.a?.missingRisk).toBe(0.5);
+    expect(() => parseWeights({ version: "x", features: { a: { weight: 1, points: [[0, 0]], solo: 101 } } })).toThrow();
+    expect(parseWeights({ version: "x", features: { a: { weight: 1, points: [[0, 0]] } } }).features.a?.solo).toBeUndefined();
   });
 
   it("formats points compactly and round-trips", () => {
@@ -169,7 +284,7 @@ describe("weights files", () => {
 
   it("ships a valid config/scorer-weights.json and loads it", async () => {
     const file = await loadWeightsFile("config/scorer-weights.json");
-    expect(file).not.toBeNull();
+    expect(file).toEqual(DEFAULT_WEIGHTS);
     expect(Object.keys(file?.features ?? {}).length).toBeGreaterThan(15);
     const loaded = await loadScoringModel({ filePath: "config/scorer-weights.json" });
     expect(loaded.source).toBe("file");

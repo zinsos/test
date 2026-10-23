@@ -57,7 +57,8 @@ export const TRADES_TABLE_SPEC: BatchTableSpec = {
     "virtual_quote",
     "real_token",
     "real_quote",
-    "ix_name"
+    "ix_name",
+    "received_at"
   ],
   conflict: "ON CONFLICT DO NOTHING",
   returning: "launch_id, is_buy"
@@ -118,6 +119,10 @@ export function tradeBlockTimeMs(event: { timestampMs: number; tx: { receivedAtM
   return event.timestampMs > 0 ? event.timestampMs : event.tx.receivedAtMs;
 }
 
+function receivedAt(event: { tx: { receivedAtMs: number } }): Date | null {
+  return event.tx.receivedAtMs > 0 ? new Date(event.tx.receivedAtMs) : null;
+}
+
 export function tradeRow(launchId: number, event: TradeEvent): unknown[] {
   return [
     launchId,
@@ -142,11 +147,12 @@ export function tradeRow(launchId: number, event: TradeEvent): unknown[] {
     event.virtualQuoteReserves,
     event.realTokenReserves,
     event.realQuoteReserves,
-    event.ixName === null ? null : cleanText(event.ixName, 64)
+    event.ixName === null ? null : cleanText(event.ixName, 64),
+    receivedAt(event)
   ];
 }
 
-function launchInsertParams(event: LaunchCreatedEvent, observedAtMs: number): unknown[] {
+function launchInsertParams(event: LaunchCreatedEvent, nowMs: number): unknown[] {
   return [
     event.mint,
     event.bondingCurve,
@@ -165,7 +171,7 @@ function launchInsertParams(event: LaunchCreatedEvent, observedAtMs: number): un
     event.tx.signature,
     event.tx.slot,
     new Date(tradeBlockTimeMs(event)),
-    new Date(observedAtMs),
+    receivedAt(event) ?? new Date(nowMs),
     event.tokenTotalSupply.toString(),
     event.virtualTokenReserves.toString(),
     event.virtualQuoteReserves.toString(),
@@ -342,6 +348,10 @@ export class RecorderService {
     }
     this.running = true;
     this.stopping = false;
+    this.firstPosition = null;
+    this.lastPosition = null;
+    this.restartChecked = false;
+    this.legacyCoverage = null;
     await this.registry.load();
     await this.checkpoints.register(this.clock.nowMs());
     if (this.manageTradePartitions) {
@@ -502,8 +512,13 @@ export class RecorderService {
     if (resumed.length === 0) {
       return;
     }
+    const createdAtMs = resumed.map((aggregate) => this.registry.get(aggregate.mint)?.createdAtMs ?? 0);
     try {
-      const wallets = await loadLaunchWallets(this.db, resumed.map((aggregate) => aggregate.launchId));
+      const wallets = await loadLaunchWallets(
+        this.db,
+        resumed.map((aggregate) => aggregate.launchId),
+        Math.min(...createdAtMs) - HOUR_MS
+      );
       for (const aggregate of resumed) {
         aggregate.seedWallets(wallets.get(aggregate.launchId) ?? []);
       }

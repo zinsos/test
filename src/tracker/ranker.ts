@@ -9,7 +9,8 @@ import {
   loadWalletFacts,
   mergeTradeSources,
   selectCandidates,
-  type CandidateRow
+  type CandidateRow,
+  type FactWindow
 } from "./rankQueries.js";
 import { buildRoundTrips, groupTradesByWallet } from "./roundtrips.js";
 import {
@@ -188,6 +189,10 @@ function tooActiveWallet(candidate: CandidateRow, facts: WalletFacts, context: R
   };
 }
 
+function factWindow(context: RankContext): FactWindow {
+  return { fromMs: context.long.fromMs, asOfMs: context.params.asOfMs, creationSlotWindow: context.params.bundleSlotWindow };
+}
+
 async function evaluateChunk(context: RankContext, chunk: readonly CandidateRow[]): Promise<RankedWallet[]> {
   const wallets = chunk.map((candidate) => candidate.wallet);
   const [recorded, history] = await Promise.all([
@@ -198,7 +203,7 @@ async function evaluateChunk(context: RankContext, chunk: readonly CandidateRow[
   const mints = [...new Set(trades.map((trade) => trade.mint))];
   const [contexts, facts] = await Promise.all([
     loadMintContexts(context.db, mints, context.params.asOfMs),
-    loadWalletFacts(context.db, wallets, { fromMs: context.long.fromMs, asOfMs: context.params.asOfMs }, new Set())
+    loadWalletFacts(context.db, wallets, factWindow(context), new Set())
   ]);
   const byWallet = groupTradesByWallet(trades);
   return wallets.map((wallet) =>
@@ -211,8 +216,7 @@ async function evaluateTooActive(context: RankContext, candidates: readonly Cand
   for (let start = 0; start < candidates.length; start += chunkSize) {
     const chunk = candidates.slice(start, start + chunkSize);
     const wallets = chunk.map((candidate) => candidate.wallet);
-    const window = { fromMs: context.long.fromMs, asOfMs: context.params.asOfMs };
-    const facts = await loadWalletFacts(context.db, wallets, window, new Set(wallets));
+    const facts = await loadWalletFacts(context.db, wallets, factWindow(context), new Set(wallets));
     for (const candidate of chunk) {
       ranked.push(tooActiveWallet(candidate, facts.get(candidate.wallet) ?? { ...EMPTY_WALLET_FACTS, tooActive: true }, context));
     }
