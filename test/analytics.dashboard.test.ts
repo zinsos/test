@@ -5,7 +5,9 @@ import { dashboardContentSecurityPolicy, renderDashboardHtml } from "../src/anal
 import { DASHBOARD_SCRIPT } from "../src/analytics/dashboardScript.js";
 import { DASHBOARD_CSS } from "../src/analytics/dashboardStyle.js";
 import { cacheKey, HttpError, parseInteger, parseMint, parseMode, parseTime, toJson, tokensMatch } from "../src/analytics/http.js";
+import { PUMP_COIN_URL } from "../src/analytics/positionQueries.js";
 import { resolveRoute } from "../src/analytics/routes.js";
+import { MINT, PENDING_MINT, renderTradesView, tradesFixture } from "./analytics.dashboardDom.js";
 
 function inlineBlocks(html: string, tag: string): string[] {
   const pattern = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "g");
@@ -19,9 +21,13 @@ function hashOf(source: string): string {
 describe("dashboard html", () => {
   const html = renderDashboardHtml();
 
-  it("is self-contained with no external URLs, script src or stylesheet links", () => {
-    expect(html).not.toMatch(/https?:/i);
-    expect(html).not.toMatch(/\/\//);
+  it("is self-contained with no external URLs except the pump.fun coin link prefix, script src or stylesheet links", () => {
+    expect(html).toContain(`var PUMP_COIN_URL = "${PUMP_COIN_URL}";`);
+    expect(html.split(PUMP_COIN_URL)).toHaveLength(2);
+    const withoutCoinLinks = html.split(PUMP_COIN_URL).join("");
+    expect(withoutCoinLinks).not.toMatch(/https?:/i);
+    expect(withoutCoinLinks).not.toMatch(/\/\//);
+    expect(DASHBOARD_SCRIPT).toContain('href: PUMP_COIN_URL + encodeURIComponent(mint), target: "_blank", rel: "noopener noreferrer"');
     expect(html).not.toMatch(/<script[^>]*\ssrc\s*=/i);
     expect(html).not.toMatch(/<link\b/i);
     expect(html).not.toMatch(/@import/i);
@@ -39,13 +45,48 @@ describe("dashboard html", () => {
   });
 
   it("has every tab, keeps the token in localStorage and sends it as a bearer", () => {
-    for (const tab of ["Edge", "Breakdowns", "Paper vs Live", "Scorer", "Recorder", "Signals", "Launches", "Wallets"]) {
+    for (const tab of ["Trades", "Edge", "Breakdowns", "Paper vs Live", "Scorer", "Recorder", "Signals", "Launches", "Wallets"]) {
       expect(DASHBOARD_SCRIPT).toContain(`"${tab}"`);
     }
     expect(DASHBOARD_SCRIPT).toContain("localStorage");
     expect(DASHBOARD_SCRIPT).toContain('"Bearer "');
     expect(DASHBOARD_SCRIPT).toContain('params.get("token")');
     expect(DASHBOARD_SCRIPT).toContain("Run the recorder for two weeks");
+  });
+
+  it("opens on the Trades tab and refreshes it every 10 seconds only while the page is visible", () => {
+    expect(DASHBOARD_SCRIPT).toMatch(/var TABS = \[\s*\["trades", "Trades"\],/);
+    expect(DASHBOARD_SCRIPT).toContain('tab: "trades"');
+    expect(DASHBOARD_SCRIPT).toContain('if (prefs.v !== PREFS_VERSION) { prefs.v = PREFS_VERSION; prefs.tab = "trades"; }');
+    expect(DASHBOARD_SCRIPT).toContain("var LIVE_REFRESH_MS = 10000;");
+    expect(DASHBOARD_SCRIPT).toContain('var LIVE_TABS = { trades: true };');
+    expect(DASHBOARD_SCRIPT).toContain('document.visibilityState === "visible" && !sheetOpen && !rendering && Date.now() - lastAttemptMs >= LIVE_REFRESH_MS');
+    expect(DASHBOARD_SCRIPT).toContain('api("/api/positions"');
+    expect(DASHBOARD_SCRIPT).toContain('"Updated " + fmtDur(');
+    expect(DASHBOARD_SCRIPT).toContain("No open positions right now");
+    expect(DASHBOARD_SCRIPT).toContain("Recent closed trades");
+    expect(DASHBOARD_SCRIPT).not.toContain("Signals need a tracked-wallet ranking");
+    expect(DASHBOARD_SCRIPT).toContain("Score momentum fires on a low-risk launch");
+  });
+
+  it("renders the Trades view from an api response in a browser-like sandbox", async () => {
+    const rendered = await renderTradesView(tradesFixture());
+    expect(rendered.text).toContain("Paper run #1");
+    expect(rendered.text).toContain("Halted for today");
+    expect(rendered.text).toContain("ALPHA");
+    expect(rendered.text).toContain("4.00×");
+    expect(rendered.text).toContain("+0.1473 SOL");
+    expect(rendered.text).toContain("Awaiting fill");
+    expect(rendered.text).toContain("Recent closed trades");
+    expect(rendered.links).toEqual([`${PUMP_COIN_URL}${MINT}`, `${PUMP_COIN_URL}${PENDING_MINT}`, `${PUMP_COIN_URL}${MINT}`]);
+    expect(rendered.authHeaders).toEqual(["Bearer dom-token", "Bearer dom-token"]);
+    const fixture = tradesFixture();
+    const counts = { ...(fixture.counts as Record<string, unknown>), open: 0, pending: 0, openedLast24h: 0 };
+    const empty = await renderTradesView({ ...fixture, open: [], counts });
+    expect(empty.text).toContain("No open positions right now");
+    expect(empty.text).toContain("score momentum (risk 35 or lower at the 60s checkpoint");
+    expect(empty.text).toContain("4 signals in the last 2h, 2 traded; most were skipped for max open positions");
+    expect(empty.paths).toEqual(["/api/runs?limit=200", "/api/positions"]);
   });
 
   it("ships a syntactically valid script that never writes untrusted text as HTML", () => {

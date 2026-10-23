@@ -1,4 +1,4 @@
-import { startAnalyticsServer } from "../analytics/index.js";
+import { entryRulesOf, sellFeeDefaultsOf, startAnalyticsServer } from "../analytics/index.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
 import type { StrategyConfig } from "../config/strategy.js";
@@ -294,7 +294,12 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           clock,
           scoreLookup: scorer ? (mint) => scorer.service.latest(mint) : null,
           extraHealth: () => statsSnapshot(),
-          settings: { maxRisk: config.scorer.maxRisk, labelHorizonHours: config.recorder.outcome.finalizeAfterHours }
+          settings: {
+            maxRisk: config.scorer.maxRisk,
+            labelHorizonHours: config.recorder.outcome.finalizeAfterHours,
+            sellFees: sellFeeDefaultsOf(config.execution),
+            entryRules: entryRulesOf(config)
+          }
         })
       : await startHealthServer({
           db,

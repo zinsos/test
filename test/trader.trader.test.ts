@@ -368,6 +368,43 @@ describe("trader risk protections", () => {
   });
 });
 
+describe("trader position freshness", () => {
+  it("saves the latest and peak price of an open position on every price move, without a fill and without changing exits", async () => {
+    const env = createEnv();
+    const { trader, store } = buildTrader(env);
+    await createLaunch(env, MINT_A, T0);
+    await env.clock.advanceTo(T0 + 5_000);
+    trader.handleSignal(signalFor(env, MINT_A));
+    await env.clock.advanceTo(T0 + 6_000);
+    const [opened] = trader.openPositions();
+    if (!opened) {
+      throw new Error("position not opened");
+    }
+    const fills = store.fillsFor(opened.id).length;
+
+    await moveQuoteReserves(env, MINT_A, 33n * SOL, T0 + 7_000);
+    const spotUp = env.market.get(MINT_A)?.price() ?? 0;
+    const up = store.positions.get(opened.id);
+    expect(up?.lastPrice).toBe(spotUp);
+    expect(up?.peakPrice).toBe(spotUp);
+    expect(spotUp).toBeGreaterThan(opened.entryPrice);
+
+    await moveQuoteReserves(env, MINT_A, 31n * SOL, T0 + 8_000);
+    const spotDown = env.market.get(MINT_A)?.price() ?? 0;
+    const down = store.positions.get(opened.id);
+    expect(down?.lastPrice).toBe(spotDown);
+    expect(down?.peakPrice).toBe(spotUp);
+    expect(down?.status).toBe("open");
+    expect(down?.tokensHeld).toBe(opened.tokensHeld);
+    expect(store.fillsFor(opened.id)).toHaveLength(fills);
+
+    const saves = store.positionSaves;
+    await env.clock.advanceTo(T0 + 30_000);
+    expect(store.positionSaves).toBe(saves);
+    expect(trader.openPositions()[0]?.lastPrice).toBe(spotDown);
+  });
+});
+
 describe("trader fixtures sanity", () => {
   it("starts from the default pump curve", () => {
     const env = createEnv();

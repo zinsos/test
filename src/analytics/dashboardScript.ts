@@ -4,14 +4,19 @@ export const DASHBOARD_SCRIPT = String.raw`
   var TOKEN_KEY = "snypra-edge-token";
   var PREFS_KEY = "snypra-edge-prefs";
   var REFRESH_MS = 60000;
+  var LIVE_REFRESH_MS = 10000;
+  var TICK_MS = 1000;
+  var PREFS_VERSION = "2";
   var PUMP_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
+  var PUMP_COIN_URL = "https://pump.fun/coin/";
   var DASH = "—";
   var DOT = " · ";
   var TABS = [
-    ["edge", "Edge"], ["breakdowns", "Breakdowns"], ["compare", "Paper vs Live"], ["scorer", "Scorer"],
+    ["trades", "Trades"], ["edge", "Edge"], ["breakdowns", "Breakdowns"], ["compare", "Paper vs Live"], ["scorer", "Scorer"],
     ["recorder", "Recorder"], ["signals", "Signals"], ["launches", "Launches"], ["wallets", "Wallets"]
   ];
   var FILTER_TABS = { edge: true, breakdowns: true, compare: true };
+  var LIVE_TABS = { trades: true };
   var PERIODS = [
     ["all", "All time", 0], ["1d", "Last 24h", 86400000], ["7d", "Last 7 days", 604800000],
     ["30d", "Last 30 days", 2592000000], ["90d", "Last 90 days", 7776000000]
@@ -35,6 +40,10 @@ export const DASHBOARD_SCRIPT = String.raw`
   var dom = {};
   var renderSeq = 0;
   var sheetOpen = false;
+  var rendering = false;
+  var lastAttemptMs = 0;
+  var lastRenderMs = 0;
+  var staleNote = "";
 
   function storageGet(key) {
     try { return window.localStorage.getItem(key); } catch (e) { return null; }
@@ -45,7 +54,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     } catch (e) { return; }
   }
   function loadPrefs() {
-    var prefs = { tab: "edge", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "" };
+    var prefs = { v: PREFS_VERSION, tab: "trades", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "" };
     var raw = storageGet(PREFS_KEY);
     if (raw) {
       try {
@@ -53,6 +62,7 @@ export const DASHBOARD_SCRIPT = String.raw`
         Object.keys(prefs).forEach(function (key) { if (parsed && typeof parsed[key] === "string") { prefs[key] = parsed[key]; } });
       } catch (e) { return prefs; }
     }
+    if (prefs.v !== PREFS_VERSION) { prefs.v = PREFS_VERSION; prefs.tab = "trades"; }
     return prefs;
   }
   function savePrefs() { storageSet(PREFS_KEY, JSON.stringify(state)); }
@@ -123,6 +133,9 @@ export const DASHBOARD_SCRIPT = String.raw`
   function fmtDay(ms) { return isNum(ms) ? new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : DASH; }
   function shortAddr(value) { return value && value.length > 12 ? value.slice(0, 4) + "…" + value.slice(-4) : (value || DASH); }
   function signClass(value) { return isNum(value) ? (value > 0 ? "pos" : value < 0 ? "neg" : "") : ""; }
+  function multipleClass(value) { return isNum(value) ? (value > 1 ? "pos" : value < 1 ? "neg" : "") : ""; }
+  function fmtSignedPct(value) { return isNum(value) ? (value > 0 ? "+" : "") + value.toFixed(1) + "%" : DASH; }
+  function fmtPlainPct(value) { return isNum(value) ? Math.round(value) + "%" : DASH; }
   function interval(range) { return range ? fmtSol(range.low) + " to " + fmtSol(range.high) : DASH; }
   function quoteLabel(mint) { return mint === "SOL" ? "SOL" : mint === PUMP_MINT ? "PUMP" : shortAddr(mint); }
 
@@ -588,7 +601,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   function signalsView() {
     return api("/api/signals/recent", { limit: 50 }).then(function (result) {
       if (!result.signals.length) {
-        return empty("No signals yet", "Signals need a tracked-wallet ranking (Wallets tab) and launch scores. Run the recorder for two weeks, then rank wallets.");
+        return empty("No signals yet", "Signals come from the entry filters enabled in the strategy. Score momentum fires on a low-risk launch with strong early buying at its checkpoint and needs only launch scores. Smart-wallet convergence fires when several tracked wallets buy the same launch and needs a wallet ranking (Wallets tab). Every signal lands here, traded or with its skip reason.");
       }
       return card("Recent signals", "Newest first. Tap a coin to see its latest score and flags.", el("ul", { class: "list" }, result.signals.map(function (signal) {
         return el("li", { class: "item" },
@@ -641,6 +654,173 @@ export const DASHBOARD_SCRIPT = String.raw`
           el("div", { class: "row" }, el("span", { class: "meta", text: "30d " + fmtSol(wallet.pnl30dSol) + " SOL" + DOT + fmtPct(wallet.winRate30d, 0) + " win" + DOT + fmtInt(wallet.trades30d) + " trades" })),
           el("div", { class: "row" }, el("span", { class: "meta", text: "90d " + fmtSol(wallet.pnl90dSol) + " SOL" + DOT + "median hold " + fmtDur(wallet.medianHoldSec) + DOT + "entry delay " + fmtDur(wallet.medianEntryDelaySec) })));
       }))));
+      return out;
+    });
+  }
+
+  function coinLabel(item) { return item.symbol || item.name || shortAddr(item.mint); }
+  function pumpLink(mint) {
+    return el("a", { class: "ext-link", href: PUMP_COIN_URL + encodeURIComponent(mint), target: "_blank", rel: "noopener noreferrer", text: "pump.fun ↗" });
+  }
+  function modeWord(mode) { return mode === "live" ? "Live" : mode === "paper" ? "Paper" : readable(mode); }
+  function sinceRead(data, ms) { return isNum(ms) ? fmtDur((data.readAtMs - ms) / 1000) + " ago" : DASH; }
+  function tradesRunOptions() {
+    var runs = meta.runs.filter(function (run) { return run.mode === "paper" || run.mode === "live"; });
+    if (runs.length < 2) { return null; }
+    return [["", "Latest run (auto)"]].concat(runs.map(function (run) {
+      return [String(run.id), "#" + run.id + " " + run.mode + (run.label ? " " + run.label : "") + (run.endedAtMs ? " (ended)" : "")];
+    }));
+  }
+  function tradesRunParam() {
+    if (!state.tradesRun) { return ""; }
+    var known = meta.runs.some(function (run) { return String(run.id) === state.tradesRun; });
+    return known ? state.tradesRun : "";
+  }
+  function riskTone(data) {
+    var b = data.bankroll;
+    if (b && b.killed) { return "bad"; }
+    if (b && b.haltedForDay) { return "warn"; }
+    return data.run.active ? "good" : "";
+  }
+  function riskBadge(data) {
+    var b = data.bankroll;
+    if (b && b.killed) { return badge("Kill switch on", "bad"); }
+    if (b && b.haltedForDay) { return badge("Halted for today", "warn"); }
+    if (!data.run.active) { return badge("Run ended", ""); }
+    return badge(data.run.mode === "live" ? "Trading live" : "Trading", "good");
+  }
+  function last24hText(data) {
+    var c = data.counts;
+    return "Last 24h: " + fmtInt(c.openedLast24h) + " opened" + DOT + fmtInt(c.closedLast24h) + " closed (" + fmtInt(c.winsLast24h) + " won)" + DOT + fmtSol(c.realizedLast24hSol) + " SOL";
+  }
+  function bankrollCard(data) {
+    var b = data.bankroll;
+    var run = data.run;
+    var figure = isNum(data.equityEstimateSol) ? fmtSol(data.equityEstimateSol, false) : null;
+    return el("section", { class: "card hero " + riskTone(data) },
+      el("div", { class: "row" }, el("h2", { text: modeWord(run.mode) + " run #" + run.id + (run.label ? DOT + run.label : "") }), riskBadge(data)),
+      figure ? el("div", { class: "figure", text: figure }) : null,
+      figure ? el("div", { class: "figure-unit", text: "SOL equity, open positions at their estimated exit value" }) : el("p", { class: "detail", text: "No bankroll saved for this run yet. It appears with the first trade, or within a minute while positions are open." }),
+      b && b.killed ? el("p", { class: "detail", text: "Kill switch: " + (b.killReason || "tripped") + ". New entries stay blocked until it is reset from the CLI." }) : null,
+      b && b.haltedForDay ? el("p", { class: "detail", text: "Daily loss limit reached. Entries resume " + fmtTime(b.haltedUntilMs) + "." }) : null,
+      el("p", { class: "subline", text: last24hText(data) }),
+      el("p", { class: "subline", text: "Started " + fmtTime(run.startedAtMs) + (run.active ? DOT + "updates every " + LIVE_REFRESH_MS / 1000 + "s while this tab is open" : DOT + "ended " + fmtTime(run.endedAtMs)) }));
+  }
+  function bankrollStats(data) {
+    var b = data.bankroll || {};
+    var c = data.counts;
+    return grid([
+      stat("Starting", fmtSol(b.startingSol, false), "SOL bankroll"),
+      stat("Realized", fmtSol(b.realizedPnlSol), "SOL, closed trades", signClass(b.realizedPnlSol)),
+      stat("Today", fmtSol(b.dayPnlSol), "SOL" + (b.dayKey ? ", day " + b.dayKey : ""), signClass(b.dayPnlSol)),
+      stat("Open now", fmtInt(c.open), (c.pending ? fmtInt(c.pending) + " awaiting fill" + DOT : "") + (c.open ? "est. " + fmtSol(data.openPnlEstimateSol) + " SOL" : "no positions"))
+    ]);
+  }
+  function coinMeta(item, ageSec) {
+    var named = item.symbol || item.name;
+    return (item.name && item.symbol ? item.name + DOT : "") + (named ? shortAddr(item.mint) + DOT : "") + fmtDur(ageSec) + " old";
+  }
+  function pendingItem(p) {
+    return el("li", { class: "item" },
+      el("div", { class: "row" }, mintButton(p.mint, coinLabel(p)), badge("Awaiting fill", "info")),
+      el("div", { class: "row" }, el("span", { class: "meta", text: coinMeta(p, p.ageSec) }), el("span", { class: "num", text: "budget " + fmtSol(p.budgetSol, false) + " SOL" })),
+      el("div", { class: "row" }, el("span", { class: "meta", text: readable(p.signalType) + DOT + "risk " + fmtNum(p.riskScore, 0) + DOT + "the buy is being confirmed" }), pumpLink(p.mint)));
+  }
+  function openItem(p, data) {
+    if (p.status === "pending") { return pendingItem(p); }
+    var badges = [];
+    if (p.exiting) { badges.push(badge("Selling: " + readable(p.exiting), "warn")); }
+    if (p.takeProfitLevelsHit > 0) { badges.push(badge(p.takeProfitLevelsHit === 1 ? "1 take-profit hit" : p.takeProfitLevelsHit + " take-profits hit", "good")); }
+    if (p.migrated) { badges.push(badge("Migrated", "info")); }
+    return el("li", { class: "item" },
+      el("div", { class: "row" }, mintButton(p.mint, coinLabel(p)), el("span", { class: "big-num " + multipleClass(p.multiple), text: fmtMult(p.multiple) })),
+      el("div", { class: "row" },
+        el("span", { class: "meta", text: coinMeta(p, p.ageSec) }),
+        el("span", { class: "num " + signClass(p.estimatedPnlSol), text: fmtSol(p.estimatedPnlSol) + " SOL" })),
+      el("div", { class: "row" },
+        el("span", { class: "meta", text: readable(p.signalType) + DOT + "risk " + fmtNum(p.riskScore, 0) + DOT + "sold " + fmtPlainPct(p.soldPct) }),
+        el("span", { class: "num " + signClass(p.estimatedPnlPct), text: fmtSignedPct(p.estimatedPnlPct) })),
+      el("div", { class: "row" },
+        el("span", { class: "meta", text: "cost " + fmtSol(p.entryCostSol, false) + DOT + "peak " + fmtMult(p.peakMultiple) + (p.proceedsSol > 0 ? DOT + "sold for " + fmtSol(p.proceedsSol, false) : "") + DOT + "last trade " + sinceRead(data, p.lastTradeAtMs) }),
+        pumpLink(p.mint)),
+      badges.length ? el("div", { class: "badges" }, badges) : null);
+  }
+  function closedItem(t, data) {
+    return el("li", { class: "item" },
+      el("div", { class: "row" }, mintButton(t.mint, coinLabel(t)), el("span", { class: "big-num " + signClass(t.pnlSol), text: fmtSol(t.pnlSol) + " SOL" })),
+      el("div", { class: "row" },
+        el("span", { class: "meta", text: readable(t.exitReason) + DOT + "held " + fmtDur(t.holdSec) + DOT + "peak " + fmtMult(t.peakMultiple) }),
+        el("span", { class: "num " + signClass(t.pnlPct), text: fmtSignedPct(t.pnlPct) })),
+      el("div", { class: "row" },
+        el("span", { class: "meta", text: readable(t.signalType) + DOT + "cost " + fmtSol(t.costSol, false) + DOT + "closed " + sinceRead(data, t.closedAtMs) }),
+        pumpLink(t.mint)));
+  }
+  function entryRulesText(data) {
+    var rules = data.entryRules;
+    var word = data.run && data.run.mode === "live" ? "Live trades" : "Paper trades";
+    if (!rules) {
+      return word + " open when a launch passes the risk scorer and an entry filter: score momentum (low risk with strong early buying) or smart-wallet convergence (several tracked wallets buying the same launch).";
+    }
+    var parts = [];
+    if (rules.enabled.indexOf("score_momentum") >= 0) {
+      var m = rules.scoreMomentum;
+      parts.push("score momentum (risk " + m.maxRiskScore + " or lower at the " + m.checkpointSec + "s checkpoint, " + m.minUniqueBuyersPerMin + "+ unique buyers a minute, buys at least " + m.minBuySellRatio + "× sells, market cap " + m.minMcapSol + " to " + m.maxMcapSol + " SOL)");
+    }
+    if (rules.enabled.indexOf("smart_convergence") >= 0) {
+      var c = rules.convergence;
+      parts.push("smart-wallet convergence (" + c.minWallets + "+ tracked wallets buy within " + c.windowSec + "s, risk " + c.maxRiskScore + " or lower; needs a wallet ranking, see Wallets)");
+    }
+    var filters = parts.length ? parts.join(" or ") : "no entry filter is enabled in the strategy config";
+    return word + " open when a launch passes the risk scorer (risk " + rules.scorerMaxRisk + " or lower, no hard block) and " + (parts.length > 1 ? "either " : "") + filters + ". At most " + rules.maxOpenPositions + " are open at once.";
+  }
+  function frequencyText(data) {
+    var c = data.counts;
+    var windowSec = Math.max(60, Math.min(86400, (data.readAtMs - data.run.startedAtMs) / 1000));
+    if (c.openedLast24h > 0) {
+      return "This run opened " + fmtInt(c.openedLast24h) + " in the last " + fmtDur(windowSec) + ", about one every " + fmtDur(windowSec / c.openedLast24h) + ". The last one opened " + sinceRead(data, c.lastOpenedAtMs) + ".";
+    }
+    var seen = 0;
+    var acted = 0;
+    data.activity.byType.forEach(function (item) { seen += item.total; acted += item.acted; });
+    if (seen > 0) {
+      var top = data.activity.skipReasons[0];
+      return fmtInt(seen) + " signals in the last " + fmtDur(windowSec) + ", " + (acted ? fmtInt(acted) + " traded" : "none traded") + (top ? "; most were skipped for " + readable(top.reason) : "") + ". See the Signals tab.";
+    }
+    return "Nothing passed in the last " + fmtDur(windowSec) + ". Strict filters can go hours without an entry on a quiet market; that is expected." + (isNum(c.lastOpenedAtMs) ? " The last entry was " + sinceRead(data, c.lastOpenedAtMs) + "." : "");
+  }
+  function activityCard(data) {
+    var a = data.activity;
+    if (!a.byType.length) { return null; }
+    var pairs = a.byType.map(function (item) { return [readable(item.type), fmtInt(item.total) + " seen" + DOT + fmtInt(item.acted) + " traded"]; });
+    a.skipReasons.forEach(function (item) { pairs.push(["skipped: " + readable(item.reason), fmtInt(item.count)]); });
+    return card("Entry signals, last " + a.windowHours + "h", "Every signal this run received, and why the rest were not traded.", kv(pairs));
+  }
+  function tradesView() {
+    return api("/api/positions", { runId: tradesRunParam() }).then(function (data) {
+      var out = [];
+      var runOptions = tradesRunOptions();
+      if (runOptions) {
+        out.push(el("div", { class: "controls" }, field("Run", selectBox(runOptions, state.tradesRun, function (value) { state.tradesRun = value; savePrefs(); render(); }, "Run"))));
+      }
+      if (!data.run) {
+        out.push(empty("No trading run yet", "Start the service with the trader module (MODULES includes trader) and TRADING_MODE=paper. " + entryRulesText(data)));
+        return out;
+      }
+      out.push(bankrollCard(data));
+      out.push(bankrollStats(data));
+      if (data.open.length) {
+        out.push(card("Open positions", "Newest first. PnL so far is an estimate: what was already sold plus the tokens still held at the last trade price, minus the coin's latest sell fees (strategy defaults when none were recorded), before price impact. Tap a coin for its score.",
+          el("ul", { class: "list" }, data.open.map(function (p) { return openItem(p, data); }))));
+      } else {
+        out.push(el("section", { class: "card empty" }, el("strong", { text: "No open positions right now" }), el("span", { text: entryRulesText(data) }), el("p", { class: "subline", text: frequencyText(data) })));
+      }
+      if (data.recentClosed.length) {
+        out.push(card("Recent closed trades", "Last " + data.recentClosed.length + " of " + fmtInt(data.counts.closed) + ", newest first. PnL is after every fee.",
+          el("ul", { class: "list" }, data.recentClosed.map(function (t) { return closedItem(t, data); }))));
+      } else {
+        out.push(empty("No closed trades yet", "Closed trades show here with their exit reason and PnL after fees. The Edge tab measures expectancy once enough have closed."));
+      }
+      out.push(activityCard(data));
       return out;
     });
   }
@@ -698,7 +878,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
 
   var VIEWS = {
-    edge: edgeView, breakdowns: breakdownsView, compare: compareView, scorer: scorerView,
+    trades: tradesView, edge: edgeView, breakdowns: breakdownsView, compare: compareView, scorer: scorerView,
     recorder: recorderView, signals: signalsView, launches: launchesView, wallets: walletsView
   };
 
@@ -709,24 +889,46 @@ export const DASHBOARD_SCRIPT = String.raw`
       if (active && button.scrollIntoView) { button.scrollIntoView({ block: "nearest", inline: "nearest" }); }
     });
   }
-  function render() {
+  function showUpdated() {
+    if (!lastRenderMs) { dom.updated.textContent = staleNote; return; }
+    var text = "Updated " + fmtDur(Math.max(0, (Date.now() - lastRenderMs) / 1000)) + " ago";
+    dom.updated.textContent = staleNote ? text + DOT + staleNote : text;
+  }
+  function render(quiet) {
     var seq = ++renderSeq;
+    var silent = quiet === true;
     setActiveTab();
-    renderFilters();
-    dom.main.classList.add("loading");
-    var view = VIEWS[state.tab] || edgeView;
+    if (!silent) {
+      renderFilters();
+      dom.main.classList.add("loading");
+    }
+    rendering = true;
+    lastAttemptMs = Date.now();
+    var view = VIEWS[state.tab] || tradesView;
     Promise.resolve().then(view).then(function (result) {
       if (seq !== renderSeq) { return; }
       var fragment = document.createDocumentFragment();
       append(fragment, result);
       dom.main.replaceChildren(fragment);
-      dom.updated.textContent = "Updated " + new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+      lastRenderMs = Date.now();
+      staleNote = "";
     }).catch(function (error) {
       if (seq !== renderSeq) { return; }
+      if (silent && !(error && error.auth)) { staleNote = "retrying"; return; }
       dom.main.replaceChildren(error && error.auth ? tokenForm() : errorCard(error));
     }).then(function () {
-      if (seq === renderSeq) { dom.main.classList.remove("loading"); }
+      if (seq !== renderSeq) { return; }
+      rendering = false;
+      dom.main.classList.remove("loading");
+      showUpdated();
     });
+  }
+  function liveRefreshDue() {
+    return LIVE_TABS[state.tab] === true && document.visibilityState === "visible" && !sheetOpen && !rendering && Date.now() - lastAttemptMs >= LIVE_REFRESH_MS;
+  }
+  function tick() {
+    showUpdated();
+    if (liveRefreshDue()) { render(true); }
   }
   function loadMeta() {
     return api("/api/runs", { limit: 200 }).then(function (result) {
@@ -738,9 +940,9 @@ export const DASHBOARD_SCRIPT = String.raw`
     fetch("/healthz", { cache: "no-store" }).then(function (res) { dom.dot.className = "dot " + (res.ok ? "good" : "bad"); })
       .catch(function () { dom.dot.className = "dot bad"; });
   }
-  function refresh() {
+  function refresh(quiet) {
     checkHealth();
-    return loadMeta().then(render);
+    return loadMeta().then(function () { render(quiet === true); });
   }
   function selectTab(id) {
     if (window.location.hash === "#" + id) { if (state.tab !== id) { state.tab = id; savePrefs(); render(); } return; }
@@ -748,7 +950,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   function build() {
     dom.dot = el("span", { class: "dot", "aria-hidden": "true" });
-    dom.updated = el("span", { class: "updated", "aria-live": "polite" });
+    dom.updated = el("span", { class: "updated" });
     dom.tabs = el("nav", { class: "tabs", role: "tablist", "aria-label": "Sections" }, TABS.map(function (tab) {
       return el("button", { type: "button", role: "tab", "data-tab": tab[0], text: tab[1], onclick: function () { selectTab(tab[0]); } });
     }));
@@ -757,23 +959,24 @@ export const DASHBOARD_SCRIPT = String.raw`
     var header = el("header", { class: "top" },
       el("div", { class: "bar" },
         el("div", { class: "brand" }, dom.dot, "SNYPRA edge"),
-        el("div", { class: "brand" }, dom.updated, el("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", text: "↻", onclick: refresh }))),
+        el("div", { class: "brand" }, dom.updated, el("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", text: "↻", onclick: function () { refresh(false); } }))),
       dom.tabs, dom.filters);
     var footer = el("footer", { class: "footer" }, "Numbers are after fees. Expectancy decides, not win rate.", el("br"),
-      el("button", { type: "button", text: "Forget token on this device", onclick: function () { storageSet(TOKEN_KEY, null); refresh(); } }));
+      el("button", { type: "button", text: "Forget token on this device", onclick: function () { storageSet(TOKEN_KEY, null); refresh(false); } }));
     document.body.replaceChildren(header, dom.main, footer);
   }
   function init() {
     captureToken();
-    state.tab = tabFromHash() || state.tab || "edge";
+    state.tab = tabFromHash() || state.tab || "trades";
     build();
     window.addEventListener("hashchange", function () {
       var tab = tabFromHash();
       if (tab && tab !== state.tab) { state.tab = tab; savePrefs(); render(); }
     });
-    document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible" && !sheetOpen) { refresh(); } });
-    window.setInterval(function () { if (document.visibilityState === "visible" && !sheetOpen) { refresh(); } }, REFRESH_MS);
-    refresh();
+    document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible" && !sheetOpen) { refresh(true); } });
+    window.setInterval(function () { if (document.visibilityState === "visible" && !sheetOpen) { refresh(true); } }, REFRESH_MS);
+    window.setInterval(tick, TICK_MS);
+    refresh(false);
   }
   if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", init); } else { init(); }
 })();

@@ -1,3 +1,4 @@
+import { defaultStrategyConfig } from "../config/strategy.js";
 import type { Clock } from "../core/clock.js";
 import type { LaunchScore, Pubkey, TradingMode } from "../core/types.js";
 import type { Db } from "../db/pool.js";
@@ -30,6 +31,16 @@ import {
   type TradeSummary
 } from "./metrics.js";
 import { describeCalibration, describeComparison, describeRecorder, describeSummary } from "./narrative.js";
+import {
+  DEFAULT_RECENT_CLOSED_LIMIT,
+  emptyPositionsSnapshot,
+  loadPositionsSnapshot,
+  MAX_RECENT_CLOSED_LIMIT,
+  selectPositionsRun,
+  sellFeeDefaultsOf,
+  type EntryRules,
+  type SellFeeDefaults
+} from "./positionQueries.js";
 import { latestScore, recentLaunches, recentSignals, trackedWallets } from "./activityQueries.js";
 import { recorderHealth } from "./recorderQueries.js";
 import { scoreCheckpoints, scorerCalibration } from "./scorerQueries.js";
@@ -55,6 +66,8 @@ export interface AnalyticsSettings {
   minCalibrationLaunches: number;
   defaultCheckpointSec: number;
   labelHorizonHours: number;
+  sellFees: SellFeeDefaults;
+  entryRules: EntryRules | null;
 }
 
 export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
@@ -68,7 +81,9 @@ export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
   tradeLimit: DEFAULT_TRADE_LIMIT,
   minCalibrationLaunches: DEFAULT_MIN_CALIBRATION_LAUNCHES,
   defaultCheckpointSec: 60,
-  labelHorizonHours: DEFAULT_LABEL_HORIZON_HOURS
+  labelHorizonHours: DEFAULT_LABEL_HORIZON_HOURS,
+  sellFees: sellFeeDefaultsOf(defaultStrategyConfig().execution),
+  entryRules: null
 };
 
 export type ScoreLookup = (mint: Pubkey) => LaunchScore | null;
@@ -264,6 +279,22 @@ async function recorderRoute(ctx: AnalyticsContext): Promise<unknown> {
   return { ...health, narrative, process: safeExtraHealth(ctx) };
 }
 
+async function positionsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
+  const params = request.params;
+  const runId = parseInteger(params, "runId", { min: 1 });
+  const mode = parseMode(params);
+  const closedLimit = parseInteger(params, "closedLimit", { min: 1, max: MAX_RECENT_CLOSED_LIMIT }) ?? DEFAULT_RECENT_CLOSED_LIMIT;
+  const nowMs = ctx.clock.nowMs();
+  const run = await selectPositionsRun(ctx.db, { runId, mode });
+  if (!run && runId !== null) {
+    throw new HttpError(404, "run_not_found", "no strategy run with this id and mode");
+  }
+  const snapshot = run
+    ? await loadPositionsSnapshot(ctx.db, run, { closedLimit, nowMs, fees: ctx.settings.sellFees })
+    : emptyPositionsSnapshot(nowMs);
+  return { filter: { runId, mode }, ...snapshot, entryRules: ctx.settings.entryRules };
+}
+
 async function walletsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
   return trackedWallets(ctx.db, { limit: parseInteger(request.params, "limit", { min: 1 }) ?? undefined });
 }
@@ -298,6 +329,7 @@ const ROUTES: ReadonlyMap<string, ApiRoute> = new Map<string, ApiRoute>([
   ["equity", { kind: "json", cacheable: true, handle: equityRoute }],
   ["compare", { kind: "json", cacheable: true, handle: compareRoute }],
   ["runs", { kind: "json", cacheable: true, handle: runsRoute }],
+  ["positions", { kind: "json", cacheable: false, handle: positionsRoute }],
   ["score", { kind: "json", cacheable: false, handle: scoreRoute }],
   ["signals/recent", { kind: "json", cacheable: true, handle: signalsRoute }],
   ["launches/recent", { kind: "json", cacheable: true, handle: launchesRoute }],

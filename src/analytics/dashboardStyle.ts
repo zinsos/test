@@ -158,6 +158,14 @@ tr.insufficient td { color: var(--muted); }
 .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
 .row + .row { margin-top: 4px; }
 .meta { font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; }
+.num { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; flex: 0 0 auto; }
+.big-num { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; flex: 0 0 auto; }
+.ext-link {
+  display: inline-flex; align-items: center; min-height: 44px; flex: 0 0 auto; color: var(--accent-ink); font-size: 14px;
+  font-weight: 600; text-decoration: none; white-space: nowrap;
+}
+.ext-link:hover, .ext-link:focus-visible { text-decoration: underline; }
+.hero > .row h2 { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .title-btn {
   border: none; background: none; padding: 0; min-height: 44px; display: inline-flex; align-items: center; gap: 6px;
   font-weight: 650; font-size: 16px; color: var(--accent-ink); cursor: pointer; text-align: left; min-width: 0; overflow-wrap: anywhere;

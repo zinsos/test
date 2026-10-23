@@ -252,4 +252,32 @@ describe.skipIf(!hasTestDatabase)("PgTradingStore", () => {
     expect(store.stats().writeErrors).toBe(0);
     await store.stop();
   });
+
+  it("coalesces every price update of an open position into one row write per flush carrying the latest price", async () => {
+    const db = database.db;
+    const store = new PgTradingStore({ db });
+    const runId = await store.createRun({ mode: "paper", label: "freshness", config: {}, dataFrom: null, dataTo: null });
+    let open = position(runId, `${runId}-fresh`);
+    store.savePosition(open);
+    await store.flush();
+    const writtenBefore = store.stats().positionsWritten;
+    for (let step = 1; step <= 40; step += 1) {
+      const price = 3e-5 + step * 1e-7;
+      open = { ...open, lastPrice: price, peakPrice: Math.max(open.peakPrice, price) };
+      store.savePosition(open);
+    }
+    open = { ...open, lastPrice: 3.2e-5 };
+    store.savePosition(open);
+    expect(store.stats().positionsBuffered).toBe(1);
+    await store.flush();
+    expect(store.stats().positionsWritten).toBe(writtenBefore + 1);
+    const row = await db.query<{ last_price: number; peak_price: number; status: string }>(
+      "SELECT last_price, peak_price, status FROM positions WHERE id = $1",
+      [open.id]
+    );
+    expect(row.rows[0]?.last_price).toBe(3.2e-5);
+    expect(row.rows[0]?.peak_price).toBe(3e-5 + 40 * 1e-7);
+    expect(row.rows[0]?.status).toBe("open");
+    await store.stop();
+  });
 });
