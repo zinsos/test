@@ -3,7 +3,7 @@ import { createRng } from "../src/core/rng.js";
 import type { DatasetRow } from "../src/scorer/dataset.js";
 import { fitLogistic, predictLogistic, sigmoid, solveLinearSystem } from "../src/scorer/logistic.js";
 import { ScoringModel } from "../src/scorer/model.js";
-import { badOutcome, calibrationTable, riskShape, timeSplit, tune } from "../src/scorer/tune.js";
+import { badOutcome, calibrationTable, riskShape, targetDescription, timeSplit, tune } from "../src/scorer/tune.js";
 import { parseWeights } from "../src/scorer/weights.js";
 
 const T = Date.UTC(2026, 9, 1);
@@ -34,6 +34,7 @@ function syntheticRows(count: number, seed: string): DatasetRow[] {
       },
       labels: {
         survived15m: !bad,
+        rugged1h: null,
         migrated: false,
         rugged: bad,
         died: false,
@@ -188,6 +189,21 @@ describe("tune", () => {
     expect(() => tune([], "rugged")).toThrow();
     expect(badOutcome(rows[0] as DatasetRow, "survived_15m")).toBeNull();
     expect(badOutcome({ ...(rows[0] as DatasetRow), labels: { ...(rows[0] as DatasetRow).labels, migrated: true } }, "migrated")).toBe(false);
+  });
+
+  it("treats a rug within the first hour as the bad outcome and skips launches whose rugged_1h label is not known yet", () => {
+    const rows = syntheticRows(60, "rug-1h").map((row) => ({ ...row, labels: { ...row.labels, rugged1h: row.labels.rugged } }));
+    const first = rows[0] as DatasetRow;
+    expect(badOutcome({ ...first, labels: { ...first.labels, rugged1h: true } }, "rugged_1h")).toBe(true);
+    expect(badOutcome({ ...first, labels: { ...first.labels, rugged1h: false } }, "rugged_1h")).toBe(false);
+    expect(badOutcome({ ...first, labels: { ...first.labels, rugged1h: null } }, "rugged_1h")).toBeNull();
+    expect(targetDescription("rugged_1h")).toBe("rugged_1h = true");
+    expect(targetDescription("survived_15m")).toBe("survived_15m = false");
+    const unknownTail = rows.map((row, index) => (index >= 50 ? { ...row, labels: { ...row.labels, rugged1h: null } } : row));
+    const result = tune(unknownTail, "rugged_1h");
+    expect(result.rows).toBe(50);
+    expect(result.target).toBe("rugged_1h = true");
+    expect(result.baseRate).toBeGreaterThan(0);
   });
 
   it("builds calibration buckets that include a score of exactly 100", () => {

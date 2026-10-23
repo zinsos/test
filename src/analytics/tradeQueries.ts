@@ -1,6 +1,7 @@
 import type { ClosedTrade, OrderSide, SignalType, TradingMode } from "../core/types.js";
 import { toBigInt, toNullableNumber, toNumber, type Db } from "../db/pool.js";
 import type { FillSummary, PaperLivePair } from "./compare.js";
+import { LAB_LABEL_PREFIX, LAB_RUN_IDS_SQL } from "./labQueries.js";
 import { equitySeries, type EquityOptions, type EquityPoint } from "./metrics.js";
 import { lamportsToSol } from "./units.js";
 
@@ -137,7 +138,8 @@ const TRADE_FILTER_SQL = `p.status = 'closed' AND p.closed_at IS NOT NULL
    AND ($2::text IS NULL OR p.mode = $2)
    AND ($3::timestamptz IS NULL OR p.closed_at >= $3)
    AND ($4::timestamptz IS NULL OR p.closed_at < $4)
-   AND ($5::boolean OR p.shadow_of IS NULL)`;
+   AND ($5::boolean OR p.shadow_of IS NULL)
+   AND ($1::bigint IS NOT NULL OR p.run_id NOT IN (${LAB_RUN_IDS_SQL}))`;
 
 export async function loadClosedTrades(db: Db, filter: TradeFilter = {}): Promise<ClosedTradeRecord[]> {
   const limit = clampLimit(filter.limit, DEFAULT_TRADE_LIMIT, MAX_TRADE_LIMIT);
@@ -205,7 +207,14 @@ function runFromRecord(row: DbRecord): RunInfo {
   };
 }
 
-export async function loadRuns(db: Db, options: { limit?: number; mode?: TradingMode | null } = {}): Promise<RunInfo[]> {
+export function isLabLabel(label: string | null | undefined): boolean {
+  return typeof label === "string" && label.startsWith(LAB_LABEL_PREFIX);
+}
+
+export async function loadRuns(
+  db: Db,
+  options: { limit?: number; mode?: TradingMode | null; includeLab?: boolean } = {}
+): Promise<RunInfo[]> {
   const limit = clampLimit(options.limit, DEFAULT_RUN_LIMIT, 1_000);
   const result = await db.query<DbRecord>(
     `SELECT r.id, r.mode, r.label, r.started_at, r.ended_at, r.data_from, r.data_to,
@@ -222,9 +231,10 @@ export async function loadRuns(db: Db, options: { limit?: number; mode?: Trading
        FROM positions WHERE run_id = r.id
      ) p ON TRUE
      WHERE ($2::text IS NULL OR r.mode = $2)
+       AND ($3::boolean OR r.label IS NULL OR r.label NOT LIKE '${LAB_LABEL_PREFIX}%')
      ORDER BY r.started_at DESC, r.id DESC
      LIMIT $1`,
-    [limit, options.mode ?? null]
+    [limit, options.mode ?? null, options.includeLab === true]
   );
   return result.rows.map(runFromRecord);
 }
@@ -233,7 +243,7 @@ export async function loadModes(db: Db): Promise<ModeInfo[]> {
   const result = await db.query<DbRecord>(
     `SELECT mode, count(*)::int AS closed, max(closed_at) AS last_closed
      FROM positions
-     WHERE status = 'closed' AND shadow_of IS NULL
+     WHERE status = 'closed' AND shadow_of IS NULL AND run_id NOT IN (${LAB_RUN_IDS_SQL})
      GROUP BY mode
      ORDER BY max(closed_at) DESC NULLS LAST`
   );

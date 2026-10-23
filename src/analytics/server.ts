@@ -6,6 +6,7 @@ import type { Db } from "../db/pool.js";
 import { TtlCache } from "./cache.js";
 import { dashboardContentSecurityPolicy, renderDashboardHtml } from "./dashboard.js";
 import { HttpError, isAuthorized, sendEmpty, sendHtml, sendJson, startCsv, writeChunk } from "./http.js";
+import type { LiveHub } from "./liveHub.js";
 import {
   DEFAULT_ANALYTICS_SETTINGS,
   resolveRoute,
@@ -39,6 +40,7 @@ export interface AnalyticsServerOptions {
   cacheTtlMs?: number;
   cacheMaxEntries?: number;
   settings?: Partial<AnalyticsSettings>;
+  live?: LiveHub | null;
 }
 
 export interface AnalyticsServer {
@@ -146,6 +148,10 @@ async function handleApi(ctx: AnalyticsContext, access: ApiAccess, url: URL, req
     await streamCsv(ctx, resolved.route, request, req, res);
     return;
   }
+  if (resolved.route.kind === "stream") {
+    resolved.route.handle(ctx, request, req, res);
+    return;
+  }
   sendJson(res, 200, await runJsonRoute(ctx, resolved.route, request));
 }
 
@@ -169,7 +175,8 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
     }),
     settings: { ...DEFAULT_ANALYTICS_SETTINGS, ...options.settings },
     scoreLookup: options.scoreLookup ?? null,
-    extraHealth: options.extraHealth ?? null
+    extraHealth: options.extraHealth ?? null,
+    live: options.live ?? null
   };
   const access: ApiAccess = {
     token: options.token && options.token.length > 0 ? options.token : null,
@@ -266,6 +273,7 @@ export async function startAnalyticsServer(options: AnalyticsServerOptions): Pro
     close() {
       if (!closing) {
         closing = new Promise<void>((resolve) => {
+          options.live?.disconnectAll();
           server.close(() => resolve());
           server.closeAllConnections();
         });

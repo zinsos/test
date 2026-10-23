@@ -1,4 +1,4 @@
-import { entryRulesOf, sellFeeDefaultsOf, startAnalyticsServer } from "../analytics/index.js";
+import { entryRulesOf, latestSkipReason, LiveHub, sellFeeDefaultsOf, startAnalyticsServer, thresholdsOf } from "../analytics/index.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
 import type { StrategyConfig } from "../config/strategy.js";
@@ -34,6 +34,7 @@ import { TradingLock } from "./tradingLock.js";
 const log = moduleLogger("app");
 const MINUTE_MS = 60_000;
 const MIN_DASHBOARD_TOKEN_LENGTH = 24;
+const SKIP_REASON_LOOKBACK_MS = 1_000;
 const PLACEHOLDER_DASHBOARD_TOKEN = "change-me-to-a-long-random-string";
 
 export function dashboardTokenProblem(token: string | undefined): string | null {
@@ -283,6 +284,20 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
     };
     const port = options.port ?? env.PORT;
     const ready = recorder ? () => (ingest?.pipeline.stats().batches ?? 0) > 0 : undefined;
+    const liveHub = modules.has("dashboard")
+      ? new LiveHub({
+          bus,
+          clock,
+          market,
+          config: { exits: config.exits, execution: config.execution },
+          thresholds: thresholdsOf(config),
+          positions: () => tradingParts?.trader.openPositions() ?? [],
+          tradingActive: () => tradingParts?.trader.isRunning() ?? false,
+          skipReason: (signal) =>
+            tradingParts ? latestSkipReason(db, tradingParts.runId, signal.mint, signal.atMs - SKIP_REASON_LOOKBACK_MS) : Promise.resolve(null)
+        })
+      : null;
+    liveHub?.start();
     const http = modules.has("dashboard")
       ? await startAnalyticsServer({
           db,
@@ -300,7 +315,8 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
             sellFees: sellFeeDefaultsOf(config.execution),
             entryRules: entryRulesOf(config),
             dayResetUtcHour: config.risk.dayResetUtcHour
-          }
+          },
+          live: liveHub
         })
       : await startHealthServer({
           db,
@@ -310,7 +326,13 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           nowMs: () => clock.nowMs(),
           ready
         });
-    stoppables.push({ name: "http", stop: () => http.close() });
+    stoppables.push({
+      name: "http",
+      stop: async () => {
+        await http.close();
+        liveHub?.stop();
+      }
+    });
 
     if (modules.has("trader") && tracker) {
       const lock = new TradingLock({

@@ -9,6 +9,7 @@ import { decodeLogs } from "../src/chain/events.js";
 import type { Db } from "../src/db/pool.js";
 import { DatabaseWaitAborted, waitForDatabase } from "../src/db/wait.js";
 import { ReplayLogSource, type ReplayTransaction } from "../src/ingest/replaySource.js";
+import { openStream } from "./analytics.sse.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 
 interface FixtureTx {
@@ -91,6 +92,37 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
     const stats = app.stats() as { pipeline: { emitted: number }; risk: { runId: number } };
     expect(stats.pipeline.emitted).toBeGreaterThan(0);
     expect(stats.risk.runId).toBe(app.runId);
+    const liveStatus = await fetch(`http://127.0.0.1:${app.httpPort}/api/live/status`, { headers: { authorization: "Bearer s3cret-dashboard-token-for-tests" } });
+    expect(await liveStatus.json()).toMatchObject({ enabled: true, tradingActive: true, clients: 0 });
+    expect((await fetch(`http://127.0.0.1:${app.httpPort}/api/live/stream`)).status).toBe(401);
+    const stream = await openStream(app.httpPort, "/api/live/stream?token=s3cret-dashboard-token-for-tests");
+    expect(stream.status).toBe(200);
+    expect((await stream.next((message) => message.event === "hello")).data).toMatchObject({ tradingActive: true, positions: [] });
+    const scored = [...app.market.all()].find((launch) => launch.isSolQuoted);
+    expect(scored).toBeDefined();
+    app.bus.emit("score", {
+      mint: scored?.mint ?? "",
+      launchId: scored?.launchId ?? null,
+      checkpointSec: 60,
+      computedAtMs: clock.nowMs(),
+      slot: 1,
+      score: 12,
+      hardBlocked: false,
+      flags: [],
+      features: {},
+      contributions: {},
+      weightsVersion: "test"
+    });
+    const scoreEvent = await stream.next((message) => message.data.kind === "score");
+    expect(scoreEvent.data).toMatchObject({ mint: scored?.mint, category: "score", tone: "good" });
+    expect(String(scoreEvent.data.text)).toMatch(/^Scored .+ 60s: 12 \(clean\)$/);
+    app.bus.emit("signal", { id: null, type: "score_momentum", mint: scored?.mint ?? "", atMs: clock.nowMs(), slot: 1, riskScore: 12, wallets: [], meta: {} });
+    await clock.advanceTo(clock.nowMs() + 3_000);
+    const outcome = await stream.next((message) => message.data.kind === "entering" || message.data.kind === "skipped");
+    expect(outcome.data.mint).toBe(scored?.mint);
+    await clock.advanceTo(clock.nowMs() + 15_000);
+    await stream.next((message) => message.event === "heartbeat");
+    stream.close();
     await app.recorder?.service.settleInflight();
     await app.stop("test");
     await app.stop("again");
@@ -156,10 +188,11 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
   });
 
   it("serves only the dashboard without opening a chain stream", async () => {
+    const clock = new VirtualClock(START_MS);
     const app = await startLiveApp({
       env: loadEnv({ DATABASE_URL: database.url, MODULES: "dashboard", DASHBOARD_TOKEN: "dashboard-only-token-0123456789" }),
       config: config(),
-      clock: new VirtualClock(START_MS),
+      clock,
       db: database.db,
       rpc: null,
       port: 0
@@ -168,7 +201,12 @@ describe.skipIf(!hasTestDatabase)("live app wiring", () => {
     expect(app.scorer).toBeNull();
     expect((await fetch(`http://127.0.0.1:${app.httpPort}/healthz`)).status).toBe(200);
     expect((app.stats() as { stream: unknown }).stream).toBeNull();
+    const stream = await openStream(app.httpPort, "/api/live/stream", { Authorization: "Bearer dashboard-only-token-0123456789" });
+    expect((await stream.next((message) => message.event === "hello")).data).toMatchObject({ tradingActive: false, positions: [] });
+    await clock.advanceTo(START_MS + 15_000);
+    expect((await stream.next((message) => message.event === "heartbeat")).data).toMatchObject({ clients: 1, tradingActive: false });
     await app.stop("test");
+    await stream.ended();
   });
 
   it("refuses to serve the dashboard without a long, non-placeholder token", async () => {

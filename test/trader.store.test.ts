@@ -253,6 +253,50 @@ describe.skipIf(!hasTestDatabase)("PgTradingStore", () => {
     await store.stop();
   });
 
+  it("holds back fills of a position opened while a flush was writing positions until its row exists, and drops rejected signals when asked to", async () => {
+    const db = database.db;
+    let onPositionsInsert: (() => void) | null = null;
+    const gated = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "query") {
+          return async (...args: unknown[]) => {
+            const result = await (target.query as (...inner: unknown[]) => Promise<unknown>).apply(target, args);
+            if (typeof args[0] === "string" && args[0].startsWith("INSERT INTO positions") && onPositionsInsert) {
+              const hook = onPositionsInsert;
+              onPositionsInsert = null;
+              hook();
+            }
+            return result;
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    const store = new PgTradingStore({ db: gated, maxRetries: 0, retryDelayMs: 0, skipRejectedSignals: true });
+    const runId = await store.createRun({ mode: "backtest", label: "race", config: {}, dataFrom: null, dataTo: null });
+    const first = withNextFillSeq(position(runId, `${runId}-first`));
+    const order = buyOrder("smart_convergence");
+    store.savePosition(first);
+    store.recordFill(first, order, failedFill(order, "tx_failed", [], "curve"));
+    const second = withNextFillSeq(position(runId, `${runId}-second`));
+    onPositionsInsert = () => {
+      store.savePosition(second);
+      store.recordFill(second, order, failedFill(order, "tx_failed", [], "curve"));
+    };
+    await store.flush();
+    expect(store.stats().writeErrors).toBe(0);
+    expect(store.stats().fillsBuffered).toBe(1);
+    await store.flush();
+    const fills = await db.query<{ position_id: string }>("SELECT position_id FROM fills WHERE run_id = $1 ORDER BY position_id", [runId]);
+    expect(fills.rows.map((row) => row.position_id)).toEqual([first.id, second.id].sort());
+    expect(await store.recordSignal(runId, { signal: signal("MintRejected", T0), acted: false, skipReason: "risk_too_high", launchId: null })).toBeNull();
+    expect(await store.recordSignal(runId, { signal: signal("MintActed", T0), acted: true, skipReason: null, launchId: null })).toBeNull();
+    await store.stop();
+    const signals = await db.query<{ mint: string; acted: boolean }>("SELECT mint, acted FROM signals WHERE run_id = $1", [runId]);
+    expect(signals.rows).toEqual([{ mint: "MintActed", acted: true }]);
+    expect(store.stats().writeErrors).toBe(0);
+  });
+
   it("coalesces every price update of an open position into one row write per flush carrying the latest price", async () => {
     const db = database.db;
     const store = new PgTradingStore({ db });

@@ -1,0 +1,53 @@
+[
+  {
+    "name": "momentum-strict",
+    "description": "score_momentum only enters launches with a risk score of 25 or less (default 35): fewer, cleaner entries.",
+    "overrides": { "signals": { "scoreMomentum": { "maxRiskScore": 25 } } }
+  },
+  {
+    "name": "momentum-loose",
+    "description": "score_momentum accepts risk scores up to 50 (default 35): more entries, more rugs.",
+    "overrides": { "signals": { "scoreMomentum": { "maxRiskScore": 50 } } }
+  },
+  {
+    "name": "momentum-low-buyers",
+    "description": "score_momentum needs 8 unique buyers per minute instead of 15: enters quieter launches.",
+    "overrides": { "signals": { "scoreMomentum": { "minUniqueBuyersPerMin": 8 } } }
+  },
+  {
+    "name": "fast-exits",
+    "description": "Bank half at 1.5x, trail tighter (15% from 1.2x peak, 10% from 3x) and time-stop flat positions after 120s.",
+    "overrides": {
+      "exits": {
+        "takeProfit": [
+          { "atMultiple": 1.5, "sellFractionOfInitial": 0.5 },
+          { "atMultiple": 3, "sellFractionOfInitial": 0.15 },
+          { "atMultiple": 5, "sellFractionOfInitial": 0.15 },
+          { "atMultiple": 10, "sellFractionOfInitial": 0.1 }
+        ],
+        "trailing": [
+          { "peakMultiple": 1.2, "trailFraction": 0.15 },
+          { "peakMultiple": 2, "trailFraction": 0.12 },
+          { "peakMultiple": 3, "trailFraction": 0.1 },
+          { "peakMultiple": 5, "trailFraction": 0.1 }
+        ],
+        "timeStop": { "afterSec": 120 }
+      }
+    }
+  },
+  {
+    "name": "no-time-stop",
+    "description": "Never time-stop flat positions (time stop after 24h, so max hold and the other exits decide).",
+    "overrides": { "exits": { "timeStop": { "afterSec": 86400 } } }
+  },
+  {
+    "name": "trade-blocked-event-exits",
+    "description": "Trade launches the scorer hard-blocks or rates too risky (bundled, dev-heavy, clustered) and leave on dev or insider sells: tests whether bundled launches pump before they dump.",
+    "overrides": {
+      "scorer": { "hardBlocks": { "devShareAbove": 1, "bundleShareAbove": 1, "clusterShareAbove": 1, "devRugRateAbove": 1 } },
+      "tracker": { "convergence": { "maxRiskScore": 100 } },
+      "signals": { "scoreMomentum": { "maxRiskScore": 100 } },
+      "exits": { "events": { "devSellExit": true, "devSellMinFraction": 0.05, "insiderSellExitFraction": 0.2 } }
+    }
+  }
+]

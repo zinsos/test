@@ -10,7 +10,9 @@ import {
   datasetColumns,
   exportCsv,
   iterateDataset,
+  labelMaturitySec,
   streamDatasetCsv,
+  type DatasetLabelName,
   type DatasetRow
 } from "../src/scorer/dataset.js";
 import { FEATURE_NAMES, REPLAY_STORED_FEATURES } from "../src/scorer/featureNames.js";
@@ -51,17 +53,25 @@ function datasetRow(overrides: Partial<DatasetRow> = {}): DatasetRow {
     score: 61.25,
     hardBlocked: true,
     features: { bundle_share: 0.2, copycat: 1 },
-    labels: { survived15m: null, migrated: false, rugged: true, died: false, peakMultipleFrom1m: 1.5, return15mFrom1m: -0.8 },
+    labels: { survived15m: null, rugged1h: true, migrated: false, rugged: true, died: false, peakMultipleFrom1m: 1.5, return15mFrom1m: -0.8 },
     ...overrides
   };
 }
 
 describe("dataset csv", () => {
-  it("has stable columns: base, every feature, labels", () => {
+  it("has stable columns: base, every feature, labels, with rugged_1h appended last so older positional readers keep working", () => {
     const columns = datasetColumns();
     expect(columns.slice(0, 6)).toEqual(["launch_id", "mint", "created_at", "checkpoint_sec", "score", "hard_blocked"]);
     expect(columns.slice(6, 6 + FEATURE_NAMES.length)).toEqual([...FEATURE_NAMES]);
-    expect(columns.slice(-6)).toEqual(["survived_15m", "migrated", "rugged", "died", "peak_multiple_from_1m", "return_15m_from_1m"]);
+    expect(columns.slice(-7)).toEqual([
+      "survived_15m",
+      "migrated",
+      "rugged",
+      "died",
+      "peak_multiple_from_1m",
+      "return_15m_from_1m",
+      "rugged_1h"
+    ]);
     expect(csvHeader().split(",")).toEqual(columns);
   });
 
@@ -75,7 +85,7 @@ describe("dataset csv", () => {
     expect(cells[6 + FEATURE_NAMES.indexOf("bundle_share")]).toBe("0.2");
     expect(cells[6 + FEATURE_NAMES.indexOf("copycat")]).toBe("1");
     expect(cells[6 + FEATURE_NAMES.indexOf("dev_share")]).toBe("");
-    expect(cells.slice(-6)).toEqual(["", "0", "1", "0", "1.5", "-0.8"]);
+    expect(cells.slice(-7)).toEqual(["", "0", "1", "0", "1.5", "-0.8", "1"]);
     const csv = exportCsv([datasetRow(), datasetRow({ mint: 'we"ird,mint' })]);
     expect(csv.split("\n")).toHaveLength(4);
     expect(csv).toContain('"we""ird,mint"');
@@ -165,6 +175,7 @@ describe.skipIf(!hasTestDatabase)("scorer persistence", () => {
     const dsb = rows.find((row) => row.mint === "DsB");
     expect(dsb?.labels).toEqual({
       survived15m: true,
+      rugged1h: false,
       migrated: true,
       rugged: false,
       died: false,
@@ -213,6 +224,96 @@ describe.skipIf(!hasTestDatabase)("scorer persistence", () => {
     expect(await mints({ asOf: new Date(asOf), labelHorizonHours: 1 })).toEqual(["OldDied", "OldRug", "YoungRug"]);
     expect(await mints({ asOf: new Date(asOf + 24 * 60 * MINUTE) })).toEqual(["OldDied", "OldRug", "YoungRug"]);
     expect(await mints({})).toEqual(["OldDied", "OldRug", "YoungRug"]);
+  });
+
+  it("enters each launch for a label only once that label matured, whatever the launch's status", async () => {
+    const db = database.db;
+    const asOf = T + 10 * 24 * 60 * MINUTE;
+    const ago = (minutes: number): number => asOf - minutes * MINUTE;
+    const specs: Array<{ mint: string; createdAtMs: number; outcome: Parameters<typeof insertOutcome>[2]; computedAfterMin: number }> = [
+      { mint: "MatFreshRug", createdAtMs: ago(10), outcome: { rugged: true, finalized: true, rugAtMs: ago(7), knownAtMs: ago(2) }, computedAfterMin: 9 },
+      {
+        mint: "MatYoungRug",
+        createdAtMs: ago(30),
+        outcome: { rugged: true, finalized: true, survived15m: false, rugAtMs: ago(25), knownAtMs: ago(20) },
+        computedAfterMin: 29
+      },
+      { mint: "MatYoungAlive", createdAtMs: ago(30), outcome: { status: "alive", survived15m: true }, computedAfterMin: 29 },
+      {
+        mint: "MatHourRug",
+        createdAtMs: ago(70),
+        outcome: { rugged: true, finalized: true, survived15m: true, rugAtMs: ago(20), knownAtMs: ago(15) },
+        computedAfterMin: 69
+      },
+      {
+        mint: "MatLateRug",
+        createdAtMs: ago(120),
+        outcome: { rugged: true, finalized: true, survived15m: true, rugAtMs: ago(30), knownAtMs: ago(25) },
+        computedAfterMin: 119
+      },
+      { mint: "MatHourAlive", createdAtMs: ago(70), outcome: { status: "alive", survived15m: true }, computedAfterMin: 66 },
+      { mint: "MatStaleRow", createdAtMs: ago(70), outcome: { status: "alive", survived15m: true }, computedAfterMin: 40 },
+      {
+        mint: "MatOldMigrated",
+        createdAtMs: ago(25 * 60),
+        outcome: { migrated: true, finalized: true, survived15m: true, knownAtMs: ago(24 * 60) },
+        computedAfterMin: 25 * 60
+      },
+      { mint: "MatOldPending", createdAtMs: ago(25 * 60), outcome: { status: "alive", survived15m: false }, computedAfterMin: 23 * 60 }
+    ];
+    for (const spec of specs) {
+      const id = await insertLaunch(db, { mint: spec.mint, createdAtMs: spec.createdAtMs });
+      await db.query(
+        `INSERT INTO launch_scores (launch_id, checkpoint_sec, mint, computed_at, slot, score, features, contributions, weights_version)
+         VALUES ($1, 75, $2, $3, 1, 40, '{}', '{}', 'v')`,
+        [id, spec.mint, new Date(spec.createdAtMs + 75_000)]
+      );
+      await insertOutcome(db, id, spec.outcome);
+      await db.query("UPDATE launch_outcomes SET computed_at = $2 WHERE launch_id = $1", [id, new Date(spec.createdAtMs + spec.computedAfterMin * MINUTE)]);
+    }
+    const query = { checkpointSec: 75, asOf: new Date(asOf), surviveCheckSec: 900, rugLookaheadSec: 300, labelHorizonHours: 24 };
+    const byMint = async (label: DatasetLabelName | null): Promise<Map<string, DatasetRow>> =>
+      new Map((await buildDataset(db, { ...query, label })).map((row) => [row.mint, row]));
+
+    const survived = await byMint("survived_15m");
+    expect([...survived.keys()].sort()).toEqual(
+      ["MatHourAlive", "MatHourRug", "MatLateRug", "MatOldMigrated", "MatOldPending", "MatStaleRow", "MatYoungAlive", "MatYoungRug"].sort()
+    );
+    expect(survived.get("MatYoungRug")?.labels).toEqual({
+      survived15m: false,
+      rugged1h: null,
+      migrated: null,
+      rugged: null,
+      died: null,
+      peakMultipleFrom1m: null,
+      return15mFrom1m: null
+    });
+    expect(survived.get("MatYoungAlive")?.labels.survived15m).toBe(true);
+
+    const rugged1h = await byMint("rugged_1h");
+    expect([...rugged1h.keys()].sort()).toEqual(["MatHourAlive", "MatHourRug", "MatLateRug", "MatOldMigrated", "MatOldPending"].sort());
+    expect(rugged1h.get("MatHourRug")?.labels.rugged1h).toBe(true);
+    expect(rugged1h.get("MatLateRug")?.labels.rugged1h).toBe(false);
+    expect(rugged1h.get("MatHourAlive")?.labels.rugged1h).toBe(false);
+    expect(rugged1h.get("MatOldMigrated")?.labels.rugged1h).toBe(false);
+    expect(rugged1h.has("MatYoungRug")).toBe(false);
+    expect(rugged1h.has("MatFreshRug")).toBe(false);
+    expect(rugged1h.has("MatStaleRow")).toBe(false);
+
+    expect([...(await byMint("migrated")).keys()]).toEqual(["MatOldMigrated"]);
+    expect([...(await byMint("rugged")).keys()]).toEqual(["MatOldMigrated"]);
+    expect([...(await byMint(null)).keys()]).toEqual(["MatOldMigrated"]);
+    const allLabels = (await byMint(null)).get("MatOldMigrated")?.labels;
+    expect(allLabels).toMatchObject({ survived15m: true, rugged1h: false, migrated: true, rugged: false, died: false });
+
+    const later = new Map(
+      (await buildDataset(db, { ...query, asOf: new Date(asOf + 40 * MINUTE), label: "rugged_1h" })).map((row) => [row.mint, row])
+    );
+    expect(later.get("MatYoungRug")?.labels.rugged1h).toBe(true);
+    expect(later.has("MatFreshRug")).toBe(false);
+    expect(labelMaturitySec("survived_15m", query)).toBe(1_200);
+    expect(labelMaturitySec("rugged_1h", query)).toBe(3_900);
+    expect(labelMaturitySec("migrated", query)).toBe(86_400);
   });
 
   it("saves, activates and loads weights from the database and a file", async () => {

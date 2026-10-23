@@ -83,16 +83,22 @@ const SHAPE_QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 const CATEGORICAL_MAX_DISTINCT = 6;
 const SMOOTHING = 10;
 
+const BAD_WHEN_TRUE: ReadonlySet<DatasetLabelName> = new Set(["rugged", "rugged_1h", "died"]);
+
+export function badWhenTrue(label: DatasetLabelName): boolean {
+  return BAD_WHEN_TRUE.has(label);
+}
+
 export function badOutcome(row: DatasetRow, label: DatasetLabelName): boolean | null {
   const value = labelValue(row, label);
   if (value === null) {
     return null;
   }
-  return label === "rugged" || label === "died" ? value : !value;
+  return badWhenTrue(label) ? value : !value;
 }
 
 export function targetDescription(label: DatasetLabelName): string {
-  return label === "rugged" || label === "died" ? `${label} = true` : `${label} = false`;
+  return badWhenTrue(label) ? `${label} = true` : `${label} = false`;
 }
 
 function labeledRows(rows: readonly DatasetRow[], label: DatasetLabelName): Labeled[] {

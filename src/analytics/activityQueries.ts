@@ -2,6 +2,7 @@ import { SOL_QUOTE } from "../core/constants.js";
 import type { FeatureVector, LaunchScore, Pubkey } from "../core/types.js";
 import { toBigInt, toNullableNumber, toNumber, type Db } from "../db/pool.js";
 import { PUBLISHED_RUN_SQL } from "../tracker/registry.js";
+import { LAB_RUN_IDS_SQL } from "./labQueries.js";
 import { clampLimit } from "./tradeQueries.js";
 import { lamportsRatio } from "./units.js";
 
@@ -113,6 +114,17 @@ function nullableInt(value: unknown): number | null {
   return value === null || value === undefined ? null : toNumber(value);
 }
 
+export async function latestSkipReason(db: Db, runId: number, mint: Pubkey, sinceMs: number): Promise<string | null> {
+  const result = await db.query<DbRecord>(
+    `SELECT skip_reason FROM signals
+     WHERE run_id = $1 AND mint = $2 AND acted = FALSE AND at >= $3
+     ORDER BY id DESC
+     LIMIT 1`,
+    [runId, mint, new Date(sinceMs)]
+  );
+  return textOrNull(result.rows[0]?.skip_reason);
+}
+
 export async function recentSignals(
   db: Db,
   options: { limit?: number; runId?: number | null; type?: string | null } = {}
@@ -125,6 +137,7 @@ export async function recentSignals(
      FROM signals s
      LEFT JOIN launches l ON l.mint = s.mint
      WHERE ($2::bigint IS NULL OR s.run_id = $2)
+       AND ($2::bigint IS NOT NULL OR s.run_id IS NULL OR s.run_id NOT IN (${LAB_RUN_IDS_SQL}))
        AND ($3::text IS NULL OR s.type = $3)
      ORDER BY s.at DESC, s.id DESC
      LIMIT $1`,

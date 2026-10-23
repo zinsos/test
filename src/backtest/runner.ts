@@ -160,7 +160,8 @@ function createBacktestMarket(config: StrategyConfig): MarketState {
 export async function runBacktest(options: BacktestOptions): Promise<BacktestResult> {
   const { db, config, fromMs, toMs } = options;
   const label = options.label ?? null;
-  const store: ManagedTradingStore = options.store ?? new PgTradingStore({ db });
+  const recordRejected = options.recordRejectedSignals ?? true;
+  const store: ManagedTradingStore = options.store ?? new PgTradingStore({ db, skipRejectedSignals: !recordRejected });
   const loader = new BacktestLoader({
     db,
     fromMs,
@@ -226,7 +227,6 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
     persistScores: false
   });
   let trader: Trader | null = null;
-  const recordRejected = options.recordRejectedSignals ?? true;
   const tracker = createTrackerModule({
     db,
     rpc: null,

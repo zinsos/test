@@ -7,7 +7,17 @@ import { DASHBOARD_CSS } from "../src/analytics/dashboardStyle.js";
 import { cacheKey, HttpError, parseInteger, parseMint, parseMode, parseTime, toJson, tokensMatch } from "../src/analytics/http.js";
 import { PUMP_COIN_URL } from "../src/analytics/positionQueries.js";
 import { resolveRoute } from "../src/analytics/routes.js";
-import { jsonResponse, MINT, neverResponds, PENDING_MINT, renderTradesView, startDashboard, tradesFixture } from "./analytics.dashboardDom.js";
+import {
+  jsonResponse,
+  MINT,
+  neverResponds,
+  PENDING_MINT,
+  READ_AT_MS,
+  renderTradesView,
+  startDashboard,
+  tradesFixture,
+  type Responder
+} from "./analytics.dashboardDom.js";
 
 function inlineBlocks(html: string, tag: string): string[] {
   const pattern = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "g");
@@ -45,9 +55,10 @@ describe("dashboard html", () => {
   });
 
   it("has every tab, keeps the token in localStorage and sends it as a bearer", () => {
-    for (const tab of ["Trades", "Edge", "Breakdowns", "Paper vs Live", "Scorer", "Recorder", "Signals", "Launches", "Wallets"]) {
+    for (const tab of ["Trades", "Live", "Edge", "Lab", "Breakdowns", "Paper vs Live", "Scorer", "Recorder", "Signals", "Launches", "Wallets"]) {
       expect(DASHBOARD_SCRIPT).toContain(`"${tab}"`);
     }
+    expect(DASHBOARD_SCRIPT).toMatch(/var TABS = \[\s*\["trades", "Trades"\], \["live", "Live"\], \["edge", "Edge"\], \["lab", "Lab"\],/);
     expect(DASHBOARD_SCRIPT).toContain("localStorage");
     expect(DASHBOARD_SCRIPT).toContain('"Bearer "');
     expect(DASHBOARD_SCRIPT).toContain('params.get("token")');
@@ -181,7 +192,9 @@ describe("dashboard html", () => {
     expect(() => new Function(DASHBOARD_SCRIPT)).not.toThrow();
     expect(DASHBOARD_SCRIPT).not.toContain("</script");
     const innerHtmlUses = DASHBOARD_SCRIPT.split("innerHTML").length - 1;
-    expect(innerHtmlUses).toBe(2);
+    expect(innerHtmlUses).toBe(3);
+    expect(DASHBOARD_SCRIPT).toContain("box.innerHTML = markup;");
+    expect(DASHBOARD_SCRIPT).not.toMatch(/markup \+= [^;]*(text|symbol|label|name)\b/);
     expect(DASHBOARD_SCRIPT).not.toContain("outerHTML");
     expect(DASHBOARD_SCRIPT).not.toContain("insertAdjacentHTML");
     expect(DASHBOARD_SCRIPT).not.toContain("eval(");
@@ -195,6 +208,7 @@ describe("dashboard html", () => {
     expect(csp).toContain(`style-src ${hashOf(style ?? "")}`);
     expect(csp).toContain("default-src 'none'");
     expect(csp).toContain("connect-src 'self'");
+    expect(DASHBOARD_SCRIPT).toContain('new Source("/api/live/stream" + queryString({ token: token() }))');
     expect(csp).not.toContain("unsafe-inline");
     expect(html).not.toMatch(/\sstyle=/);
   });
@@ -281,5 +295,286 @@ describe("TtlCache", () => {
     await disabled.getOrLoad("y", async () => (calls += 1));
     expect(calls).toBe(2);
     expect(disabled.size).toBe(0);
+  });
+});
+
+const POSITION = "7-1800000000000-abc";
+
+function liveView(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: POSITION,
+    mint: MINT,
+    symbol: "GEN",
+    name: "Genesis",
+    mode: "paper",
+    signalType: "score_momentum",
+    riskScore: 18,
+    openedAtMs: READ_AT_MS - 120_000,
+    ageSec: 120,
+    entryPrice: 0.00005,
+    price: 0.0001,
+    multiple: 2,
+    peakMultiple: 2.2,
+    costSol: 0.075,
+    proceedsSol: 0,
+    pnlEstimateSol: 0.07,
+    pnlEstimatePct: 93,
+    soldPct: 0,
+    takeProfitLevelsHit: 0,
+    migrated: false,
+    exiting: null,
+    lastTradeAtMs: READ_AT_MS - 1_000,
+    levels: {
+      entryPrice: 0.00005,
+      stopLossPrice: 0.0000325,
+      trailingStopPrice: 0.0000858,
+      moonbagStopPrice: 0.0000605,
+      trailFraction: 0.22,
+      nextTakeProfit: { multiple: 3, price: 0.00015, sellPctOfInitial: 15 },
+      takeProfits: [{ multiple: 3, price: 0.00015, sellPctOfInitial: 15 }],
+      timeStopAtMs: null,
+      maxHoldAtMs: READ_AT_MS + 3_480_000
+    },
+    ...overrides
+  };
+}
+
+function liveEvent(id: number, kind: string, category: string, text: string, data: Record<string, unknown> = {}): Record<string, unknown> {
+  return { id, kind, category, tone: kind === "closed" ? "good" : "info", atMs: READ_AT_MS - 1_000 + id, mint: MINT, symbol: "GEN", text, data };
+}
+
+function liveResponder(status: Record<string, unknown>): Responder {
+  return (path) => {
+    if (path.startsWith("/api/runs")) {
+      return Promise.resolve(jsonResponse({ runs: [], modes: [] }));
+    }
+    if (path === "/api/live/status") {
+      return Promise.resolve(jsonResponse(status));
+    }
+    if (path.startsWith("/api/live/position/")) {
+      return Promise.resolve(
+        jsonResponse({
+          position: liveView(),
+          fromMs: READ_AT_MS - 180_000,
+          totalTrades: 3,
+          points: [
+            { atMs: READ_AT_MS - 150_000, price: 0.00004 },
+            { atMs: READ_AT_MS - 100_000, price: 0.00005 },
+            { atMs: READ_AT_MS - 2_000, price: 0.0001 }
+          ],
+          inMemory: true
+        })
+      );
+    }
+    return Promise.resolve(jsonResponse({ error: "not_found", message: "unknown" }, 404));
+  };
+}
+
+const LIVE_STATUS = { enabled: true, streamId: "s1", clients: 0, maxClients: 10, tradingActive: true, events: 0, lastEventAtMs: null, openPositions: 1, heartbeatMs: 15_000 };
+
+describe("live tab", () => {
+  it("streams a status chip, a charted card per open position and a filterable, pausable feed", async () => {
+    const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder: liveResponder(LIVE_STATUS) });
+    expect(dashboard.paths).toContain("/api/live/status");
+    expect(dashboard.streams).toHaveLength(1);
+    const stream = dashboard.streams[0];
+    if (!stream) {
+      throw new Error("no stream");
+    }
+    expect(stream.url).toBe("/api/live/stream?token=dom-token");
+    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Connecting…");
+    stream.open();
+    stream.send("hello", { streamId: "s1", serverTimeMs: READ_AT_MS, tradingActive: true, maxClients: 10, clients: 1, heartbeatMs: 15_000, positions: [liveView()] });
+    stream.send("message", liveEvent(1, "score", "score", "Scored $GEN 60s: 18 (clean)"), "s1:1");
+    stream.send("message", liveEvent(2, "opened", "trade", "Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL"), "s1:2");
+    stream.send("message", { ...liveEvent(3, "position", "trade", "$GEN 2.5x"), data: liveView({ multiple: 2.5, price: 0.000125 }) }, "s1:3");
+    stream.send("message", liveEvent(2, "opened", "trade", "duplicate replayed event"), "s1:2");
+    await dashboard.flush();
+    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Live");
+    expect(dashboard.paths).toContain(`/api/live/position/${POSITION}/series`);
+    const text = (): string => dashboard.view().text;
+    expect(text()).toContain("$GEN");
+    expect(text()).toContain("2.00×");
+    expect(text()).toContain("Exits: stop 0.65× · trailing stop 1.72× · next take-profit 3.00× sells 15%");
+    expect(text()).toContain("take-profit");
+    expect(text()).not.toContain("duplicate replayed event");
+    const feed = (): string[] => dashboard.find("feed-text").map((node) => node.textContent);
+    expect(feed()).toEqual(["Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL", "Scored $GEN 60s: 18 (clean)"]);
+    const chart = dashboard.find("live-chart")[0];
+    for (const line of ["lv-price", "lv-entry", "lv-stop", "lv-trail", "lv-tp"]) {
+      expect(chart?.innerHTML).toContain(`class="${line}"`);
+    }
+    expect(chart?.innerHTML).not.toMatch(/style=|GEN/);
+    const labels = dashboard.find("lv-label");
+    expect(labels.map((node) => node.textContent)).toEqual(["TP 3.00×", "trail 1.72×", "entry 1.00×", "stop 0.65×"]);
+    const tops = labels.map((node) => Number.parseFloat(node.style.top ?? ""));
+    expect(tops.every((top, index) => index === 0 || top - (tops[index - 1] ?? 0) >= 10)).toBe(true);
+    expect(Math.min(...tops)).toBeGreaterThanOrEqual(5);
+    expect(Math.max(...tops)).toBeLessThanOrEqual(95);
+
+    await dashboard.change("Show", "scores");
+    expect(feed()).toEqual(["Scored $GEN 60s: 18 (clean)"]);
+    await dashboard.change("Show", "trades");
+    expect(feed()).toEqual(["Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL"]);
+    expect(JSON.parse(dashboard.storage.get("snypra-edge-prefs") ?? "{}")).toMatchObject({ liveFilter: "trades" });
+    await dashboard.change("Show", "all");
+
+    await dashboard.click("Pause");
+    stream.send("message", { ...liveEvent(4, "rejected", "signal", "Rejected $XYZ: risk 82 above 35"), tone: "neutral" }, "s1:4");
+    await dashboard.flush();
+    expect(feed()).not.toContain("Rejected $XYZ: risk 82 above 35");
+    expect(dashboard.bodyText()).toContain("Resume (1 new)");
+    await dashboard.click("Resume");
+    expect(feed()[0]).toBe("Rejected $XYZ: risk 82 above 35");
+
+    stream.send("message", liveEvent(5, "closed", "trade", "Closed $GEN: +0.025 SOL (+33.3%), trailing stop after 5m", { positionId: POSITION }), "s1:5");
+    await dashboard.flush();
+    expect(feed()[0]).toBe("Closed $GEN: +0.025 SOL (+33.3%), trailing stop after 5m");
+    expect(text()).not.toContain("Exits:");
+    expect(text()).toContain("No open positions.");
+  });
+
+  it("reconnects after the stream closes or stalls", async () => {
+    const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder: liveResponder(LIVE_STATUS) });
+    const first = dashboard.streams[0];
+    first?.open();
+    first?.fail(true);
+    await dashboard.flush();
+    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Offline, retrying in 3s");
+    expect(dashboard.updated()).toBe("Offline, retrying in 3s");
+    await dashboard.advance(3_000);
+    expect(dashboard.streams).toHaveLength(2);
+    const second = dashboard.streams[1];
+    second?.open();
+    await dashboard.advance(30_000);
+    second?.send("heartbeat", { atMs: READ_AT_MS + 33_000, clients: 1, tradingActive: true });
+    await dashboard.advance(40_000);
+    expect(second?.closed).toBe(false);
+    await dashboard.advance(6_000);
+    expect(second?.closed).toBe(true);
+    await dashboard.advance(3_000);
+    expect(dashboard.streams).toHaveLength(3);
+  });
+
+  it("explains when this service has no live stream and opens none", async () => {
+    const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder: liveResponder({ ...LIVE_STATUS, enabled: false }) });
+    expect(dashboard.view().text).toContain("No live stream in this service");
+    expect(dashboard.streams).toHaveLength(0);
+  });
+});
+
+function labFixture(): Record<string, unknown> {
+  const run = { id: 2, startedAtMs: READ_AT_MS - 7_200_000, finishedAtMs: READ_AT_MS - 6_600_000, status: "done", error: null, dataFromMs: READ_AT_MS - 266_400_000, dataToMs: READ_AT_MS - 7_200_000, notes: {} };
+  const summary = (trades: number, expectancySol: number, low: number, high: number, verdict: string) => ({
+    trades,
+    wins: Math.round(trades * 0.4),
+    winRate: 0.4,
+    expectancySol,
+    ciLowSol: low,
+    ciHighSol: high,
+    totalPnlSol: expectancySol * trades,
+    maxDrawdownSol: 0.3,
+    avgHoldSec: 240,
+    verdict,
+    exitReasons: []
+  });
+  return {
+    available: true,
+    runs: 3,
+    latest: { ...run, id: 3, status: "running", finishedAtMs: null, startedAtMs: READ_AT_MS - 300_000 },
+    run,
+    variants: [
+      { id: 6, name: "faster_exits", description: "Tighter trailing stops and an earlier first take-profit.", isBaseline: false, overrides: {}, strategyRunId: 41, summary: summary(118, 0.006, -0.001, 0.013, "no_edge"), error: null, vsBaselineSol: 0.004 },
+      { id: 5, name: "baseline", description: "The strategy in config/strategy.json.", isBaseline: true, overrides: {}, strategyRunId: 40, summary: summary(120, 0.002, -0.004, 0.008, "no_edge"), error: null, vsBaselineSol: null },
+      { id: 7, name: "broken", description: "", isBaseline: false, overrides: {}, strategyRunId: null, summary: null, error: "replay failed", vsBaselineSol: null }
+    ],
+    scorer: [
+      {
+        label: "rugged",
+        checkpointSec: 60,
+        rows: 2_400,
+        positives: 610,
+        validationAuc: 0.74,
+        baselineAuc: 0.69,
+        features: [{ name: "dev_share", auc: 0.68, direction: "higher_riskier", coverage: 1, weight: 1.4 }],
+        calibration: [{ bucket: "90-100", n: 80, positiveRate: 0.81 }],
+        weightsVersion: "lab-2-rugged-60",
+        skipReason: null
+      },
+      { label: "migrated", checkpointSec: 30, rows: 40, positives: 2, validationAuc: null, baselineAuc: null, features: [], calibration: [], weightsVersion: null, skipReason: "too few positives" }
+    ],
+    history: [
+      { labRunId: 1, startedAtMs: READ_AT_MS - 86_400_000, dataFromMs: null, dataToMs: null, trades: 90, expectancySol: 0.001, ciLowSol: -0.006, ciHighSol: 0.008, totalPnlSol: 0.09 },
+      { labRunId: 2, startedAtMs: READ_AT_MS - 7_200_000, dataFromMs: null, dataToMs: null, trades: 120, expectancySol: 0.002, ciLowSol: -0.004, ciHighSol: 0.008, totalPnlSol: 0.24 }
+    ],
+    takeaway: {
+      tone: "warn",
+      headline: "Faster exits beat the baseline by +0.004 SOL per trade over 118 trades, not yet significant",
+      detail: "faster exits made +0.006 SOL per trade."
+    }
+  };
+}
+
+describe("lab tab", () => {
+  function labResponder(lab: Record<string, unknown>): Responder {
+    return (path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : path === "/api/lab" ? lab : { summary: { n: 0 }, points: [] }));
+  }
+
+  it("renders the run, takeaway, leaderboard with the baseline highlighted, scorer training and baseline history", async () => {
+    const dashboard = await startDashboard({}, { hash: "#lab", responder: labResponder(labFixture()) });
+    expect(dashboard.paths).toContain("/api/lab");
+    const text = dashboard.view().text;
+    for (const expected of [
+      "Lab run #2",
+      "Run #3 is running now",
+      "Faster exits beat the baseline by +0.004 SOL per trade over 118 trades, not yet significant",
+      "Strategy leaderboard",
+      "faster exits",
+      "Tighter trailing stops and an earlier first take-profit.",
+      "+0.006",
+      "118 trades · win 40% · total +0.708 SOL · max drawdown -0.300",
+      "95% range -0.001 to +0.013 · vs baseline +0.004 per trade",
+      "No edge yet",
+      "replay failed",
+      "Scorer: rugged at 60s",
+      "Retrained AUC0.740",
+      "dev share",
+      "riskier when higher",
+      "90-100",
+      "Skipped: too few positives",
+      "Baseline over time"
+    ]) {
+      expect(text).toContain(expected);
+    }
+    expect(dashboard.find("baseline")).toHaveLength(1);
+    expect(dashboard.find("baseline")[0]?.textContent).toContain("Baseline");
+    await dashboard.click("Open in Edge");
+    expect(JSON.parse(dashboard.storage.get("snypra-edge-prefs") ?? "{}")).toMatchObject({ runId: "41", mode: "backtest" });
+    expect(dashboard.location.hash).toBe("edge");
+  });
+
+  it("explains the empty state before the first lab run", async () => {
+    const empty = { available: true, runs: 0, latest: null, run: null, variants: [], scorer: [], history: [], takeaway: null };
+    const dashboard = await startDashboard({}, { hash: "#lab", responder: labResponder(empty) });
+    expect(dashboard.view().text).toContain("No lab run yet");
+    expect(dashboard.view().text).toContain("after the lab job has run once");
+  });
+
+  it("keeps a lab run chosen from the Lab tab selectable in the Edge run picker", async () => {
+    const prefs = JSON.stringify({ v: "2", tab: "edge", mode: "backtest", runId: "41", period: "all", checkpoint: "", quote: "", tradesRun: "", liveFilter: "all" });
+    const responder: Responder = (path) =>
+      Promise.resolve(
+        jsonResponse(
+          path.startsWith("/api/runs")
+            ? { runs: [{ id: 9, mode: "backtest", label: "bt", closedTrades: 3 }], modes: [] }
+            : path.startsWith("/api/summary")
+              ? { summary: { n: 0 }, narrative: { tone: "neutral", headline: "No closed trades yet", detail: "" } }
+              : { points: [] }
+        )
+      );
+    const dashboard = await startDashboard({}, { storage: { "snypra-edge-prefs": prefs }, responder });
+    expect(dashboard.paths).toContain("/api/summary?runId=41");
+    expect(dashboard.bodyText()).toContain("#41 (opened from Lab)");
+    expect(dashboard.bodyText()).toContain("#9 backtest bt (3)");
   });
 });

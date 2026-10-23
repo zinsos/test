@@ -552,6 +552,7 @@ export class SignalEngine {
 
   private reject(signal: Signal, reason: SignalRejectReason): void {
     this.counters.rejected += 1;
+    this.bus.emit("signalRejected", { signal, reason });
     if (!this.onRejected) {
       return;
     }

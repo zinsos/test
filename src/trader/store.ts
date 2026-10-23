@@ -35,6 +35,7 @@ export interface PgTradingStoreOptions {
   retryDelayMs?: number;
   signalIdBlock?: number;
   maxBufferedRows?: number;
+  skipRejectedSignals?: boolean;
 }
 
 export interface RunInput {
@@ -93,8 +94,10 @@ export class PgTradingStore implements TradingStore {
   private readonly retryDelayMs: number;
   private readonly signalIdBlock: number;
   private readonly maxBufferedRows: number;
+  private readonly skipRejectedSignals: boolean;
   private readonly positions = new Map<string, Position>();
   private readonly discards = new Set<string>();
+  private readonly writtenPositionIds = new Set<string>();
   private fills: Row[] = [];
   private signalsWithId: BufferedSignal[] = [];
   private signalsWithoutId: BufferedSignal[] = [];
@@ -125,6 +128,7 @@ export class PgTradingStore implements TradingStore {
     this.retryDelayMs = options.retryDelayMs ?? 250;
     this.signalIdBlock = Math.max(1, options.signalIdBlock ?? 256);
     this.maxBufferedRows = options.maxBufferedRows ?? 100_000;
+    this.skipRejectedSignals = options.skipRejectedSignals ?? false;
   }
 
   async prepare(): Promise<void> {
@@ -165,6 +169,9 @@ export class PgTradingStore implements TradingStore {
   }
 
   recordSignal(runId: number, record: SignalRecord): Promise<number | null> {
+    if (this.skipRejectedSignals && !record.acted) {
+      return Promise.resolve(null);
+    }
     const id = this.signalIds.shift() ?? null;
     this.refillSignalIdsIfLow();
     if (id === null) {
@@ -371,6 +378,9 @@ export class PgTradingStore implements TradingStore {
     );
     if (ok) {
       this.counters.positionsWritten += batch.length;
+      for (const position of batch) {
+        this.writtenPositionIds.add(position.id);
+      }
       return;
     }
     for (const position of batch) {
@@ -403,11 +413,23 @@ export class PgTradingStore implements TradingStore {
     });
   }
 
+  private positionRowMissing(positionId: string): boolean {
+    return this.positions.has(positionId) && !this.writtenPositionIds.has(positionId);
+  }
+
   private async writeFills(): Promise<void> {
     if (this.fills.length === 0) {
       return;
     }
-    const batch = this.fills.splice(0, this.fills.length);
+    const batch: Row[] = [];
+    const waiting: Row[] = [];
+    for (const row of this.fills) {
+      (this.positionRowMissing(String(row[0])) ? waiting : batch).push(row);
+    }
+    this.fills = waiting;
+    if (batch.length === 0) {
+      return;
+    }
     const ok = await this.withRetries("fills", batch.length, () =>
       this.insertRows("fills", FILL_COLUMNS, batch, FILL_INSERT_CONFLICT)
     );

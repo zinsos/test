@@ -5,12 +5,12 @@ import { mintAt } from "./analytics.db.js";
 
 export const MINT = mintAt(40);
 export const PENDING_MINT = mintAt(41);
-const READ_AT_MS = Date.UTC(2026, 9, 23, 12, 0, 0);
+export const READ_AT_MS = Date.UTC(2026, 9, 23, 12, 0, 0);
 const TOKEN = "dom-token";
 
 type Listener = (event: unknown) => void;
 
-class FakeNode {
+export class FakeNode {
   readonly childNodes: FakeNode[] = [];
   readonly attributes = new Map<string, string>();
   readonly style: Record<string, string> = {};
@@ -31,6 +31,36 @@ class FakeNode {
 
   get children(): FakeNode[] {
     return this.childNodes.filter((node) => node.tagName !== "#text");
+  }
+
+  get firstChild(): FakeNode | null {
+    return this.childNodes[0] ?? null;
+  }
+
+  get lastChild(): FakeNode | null {
+    return this.childNodes[this.childNodes.length - 1] ?? null;
+  }
+
+  insertBefore(child: FakeNode, reference: FakeNode | null): FakeNode {
+    if (!reference) {
+      return this.appendChild(child);
+    }
+    child.remove();
+    child.parent = this;
+    const index = this.childNodes.indexOf(reference);
+    this.childNodes.splice(index < 0 ? this.childNodes.length : index, 0, child);
+    return child;
+  }
+
+  removeChild(child: FakeNode): FakeNode {
+    child.remove();
+    return child;
+  }
+
+  dispatch(type: string): void {
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener({ target: this });
+    }
   }
 
   get classList(): { add(name: string): void; remove(name: string): void } {
@@ -160,12 +190,64 @@ export interface DashboardOptions {
   storage?: Record<string, string>;
   hash?: string;
   search?: string;
+  responder?: Responder;
+  eventSource?: boolean;
+}
+
+type StreamListener = (message: { data: string; lastEventId?: string }) => void;
+
+export class FakeEventSource {
+  readyState = 0;
+  closed = false;
+  onopen: ((event: unknown) => void) | null = null;
+  onmessage: StreamListener | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  private readonly listeners = new Map<string, StreamListener[]>();
+
+  constructor(readonly url: string) {}
+
+  addEventListener(type: string, listener: StreamListener): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  close(): void {
+    this.readyState = 2;
+    this.closed = true;
+  }
+
+  open(): void {
+    this.readyState = 1;
+    this.onopen?.({});
+  }
+
+  send(event: string, data: unknown, id = ""): void {
+    const message = { data: JSON.stringify(data), lastEventId: id };
+    if (event === "message") {
+      this.onmessage?.(message);
+      return;
+    }
+    for (const listener of this.listeners.get(event) ?? []) {
+      listener(message);
+    }
+  }
+
+  fail(closed: boolean): void {
+    this.readyState = closed ? 2 : 0;
+    this.onerror?.({});
+  }
 }
 
 export interface DashboardHarness {
   paths: string[];
   authHeaders: string[];
   storage: Map<string, string>;
+  streams: FakeEventSource[];
+  location: { hash: string };
+  change(label: string, value: string): Promise<void>;
+  click(text: string): Promise<void>;
+  find(className: string): FakeNode[];
+  bodyText(): string;
+  flush(): Promise<void>;
   setResponder(responder: Responder): void;
   setVisibility(state: "visible" | "hidden"): void;
   focus(tag: string | null): void;
@@ -201,7 +283,9 @@ export async function startDashboard(positions: Record<string, unknown>, options
   const authHeaders: string[] = [];
   const intervals: Interval[] = [];
   let nowMs = READ_AT_MS;
-  let responder: Responder = (path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : positions));
+  let responder: Responder =
+    options.responder ?? ((path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : positions)));
+  const streams: FakeEventSource[] = [];
   const document = {
     readyState: "complete",
     visibilityState: "visible",
@@ -226,7 +310,15 @@ export async function startDashboard(positions: Record<string, unknown>, options
       intervals.push({ run, everyMs, lastMs: nowMs });
       return intervals.length;
     },
-    setTimeout: () => 0
+    setTimeout: () => 0,
+    EventSource: options.eventSource
+      ? class extends FakeEventSource {
+          constructor(url: string) {
+            super(url);
+            streams.push(this);
+          }
+        }
+      : undefined
   };
   const RealDate = Date;
   class FakeDate extends RealDate {
@@ -248,10 +340,39 @@ export async function startDashboard(positions: Record<string, unknown>, options
   new Function("window", "document", "fetch", "Date", DASHBOARD_SCRIPT)(window, document, fetch, FakeDate);
   await settle();
   const main = (): FakeNode | undefined => body.descendants().find((node) => node.tagName === "main");
+  const nodes = (): FakeNode[] => body.descendants();
   return {
     paths,
     authHeaders,
     storage,
+    streams,
+    location: window.location,
+    async change(label, value) {
+      const select = nodes().find((node) => node.tagName === "select" && node.getAttribute("aria-label") === label);
+      if (!select) {
+        throw new Error(`no select ${label}`);
+      }
+      select.value = value;
+      select.dispatch("change");
+      await settle();
+    },
+    async click(text) {
+      const button = nodes().find((node) => node.tagName === "button" && node.textContent.startsWith(text));
+      if (!button) {
+        throw new Error(`no button ${text}`);
+      }
+      button.dispatch("click");
+      await settle();
+    },
+    find(className) {
+      return nodes().filter((node) => node.className.split(" ").includes(className));
+    },
+    bodyText() {
+      return body.textContent;
+    },
+    flush() {
+      return settle();
+    },
     setResponder(next) {
       responder = next;
     },

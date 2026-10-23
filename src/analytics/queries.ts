@@ -24,6 +24,7 @@ export {
   DEFAULT_WALLET_LIMIT,
   latestRankRun,
   latestScore,
+  latestSkipReason,
   MAX_RECENT_LIMIT,
   recentLaunches,
   recentSignals,

@@ -1,14 +1,25 @@
 import { createWriteStream } from "node:fs";
 import { once } from "node:events";
-import { buildDataset, DATASET_LABELS, streamDatasetCsv, type DatasetLabelName } from "../../scorer/dataset.js";
+import { buildDataset, DATASET_LABELS, datasetMaturityOf, streamDatasetCsv, type DatasetLabelName } from "../../scorer/dataset.js";
 import { loadScoringModel } from "../../scorer/model.js";
 import { tune, type TuneResult } from "../../scorer/tune.js";
 import { saveWeights } from "../../scorer/weights.js";
 import { dateOption, flagOption, numberOption, stringOption, UsageError } from "../args.js";
 import { commandConfig, EXIT_FAILURE, EXIT_OK, withDatabase, type CommandContext } from "../commandContext.js";
 
-function isLabel(value: string): value is DatasetLabelName {
+export function isDatasetLabel(value: string): value is DatasetLabelName {
   return (DATASET_LABELS as readonly string[]).includes(value);
+}
+
+function optionalLabel(ctx: CommandContext, command: string): DatasetLabelName | null {
+  const label = stringOption(ctx.options, "label");
+  if (label === undefined) {
+    return null;
+  }
+  if (!isDatasetLabel(label)) {
+    throw new UsageError(`--label must be one of ${DATASET_LABELS.join(", ")}`, command);
+  }
+  return label;
 }
 
 function auc(value: number | null): string {
@@ -33,17 +44,17 @@ export function formatTuneReport(result: TuneResult, checkpointSec: number, maxF
 
 export async function tuneScorerCommand(ctx: CommandContext): Promise<number> {
   const checkpointSec = numberOption(ctx.options, "checkpoint") ?? 0;
-  const label = stringOption(ctx.options, "label") ?? "";
-  if (!isLabel(label)) {
+  const label = optionalLabel(ctx, "tune-scorer");
+  if (label === null) {
     throw new UsageError(`--label must be one of ${DATASET_LABELS.join(", ")}`, "tune-scorer");
   }
   const config = await commandConfig(ctx);
   return withDatabase(ctx, "tune-scorer", async (db) => {
     const from = dateOption(ctx.options, "from") ?? null;
     const to = dateOption(ctx.options, "to") ?? null;
-    const rows = await buildDataset(db, { checkpointSec, from, to, labelHorizonHours: config.recorder.outcome.finalizeAfterHours });
+    const rows = await buildDataset(db, { checkpointSec, from, to, label, ...datasetMaturityOf(config.recorder.outcome) });
     if (rows.length === 0) {
-      ctx.io.err(`no scored launches with known outcomes at checkpoint ${checkpointSec}s; record longer or check --from/--to`);
+      ctx.io.err(`no scored launches with a matured ${label} label at checkpoint ${checkpointSec}s; record longer or check --from/--to`);
       return EXIT_FAILURE;
     }
     const current = await loadScoringModel({ db, filePath: config.scorer.weightsFile });
@@ -78,6 +89,7 @@ export async function tuneScorerCommand(ctx: CommandContext): Promise<number> {
 export async function exportDatasetCommand(ctx: CommandContext): Promise<number> {
   const checkpointSec = numberOption(ctx.options, "checkpoint") ?? 0;
   const out = stringOption(ctx.options, "out") ?? "-";
+  const label = optionalLabel(ctx, "export-dataset");
   const config = await commandConfig(ctx);
   return withDatabase(ctx, "export-dataset", async (db) => {
     const stream = out === "-" ? process.stdout : createWriteStream(out, { encoding: "utf8" });
@@ -87,7 +99,8 @@ export async function exportDatasetCommand(ctx: CommandContext): Promise<number>
       from: dateOption(ctx.options, "from") ?? null,
       to: dateOption(ctx.options, "to") ?? null,
       quoteMint: stringOption(ctx.options, "quote") ?? null,
-      labelHorizonHours: config.recorder.outcome.finalizeAfterHours
+      label,
+      ...datasetMaturityOf(config.recorder.outcome)
     })) {
       rows += chunk.split("\n").filter((line) => line.length > 0).length;
       if (!stream.write(chunk)) {

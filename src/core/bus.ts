@@ -8,11 +8,17 @@ export interface RiskEvent {
   detail: Record<string, unknown>;
 }
 
+export interface SignalRejection {
+  signal: Signal;
+  reason: string;
+}
+
 export interface BusEvents {
   chain: ChainEvent;
   gap: IngestGap;
   score: LaunchScore;
   signal: Signal;
+  signalRejected: SignalRejection;
   positionOpened: Position;
   positionUpdated: Position;
   positionClosed: Position;

@@ -1,3 +1,6 @@
+import { LAB_VIEW_SCRIPT } from "./dashboardLab.js";
+import { LIVE_VIEW_SCRIPT } from "./dashboardLive.js";
+
 export const DASHBOARD_SCRIPT = String.raw`
 (function () {
   "use strict";
@@ -14,11 +17,12 @@ export const DASHBOARD_SCRIPT = String.raw`
   var DASH = "—";
   var DOT = " · ";
   var TABS = [
-    ["trades", "Trades"], ["edge", "Edge"], ["breakdowns", "Breakdowns"], ["compare", "Paper vs Live"], ["scorer", "Scorer"],
-    ["recorder", "Recorder"], ["signals", "Signals"], ["launches", "Launches"], ["wallets", "Wallets"]
+    ["trades", "Trades"], ["live", "Live"], ["edge", "Edge"], ["lab", "Lab"], ["breakdowns", "Breakdowns"], ["compare", "Paper vs Live"],
+    ["scorer", "Scorer"], ["recorder", "Recorder"], ["signals", "Signals"], ["launches", "Launches"], ["wallets", "Wallets"]
   ];
   var FILTER_TABS = { edge: true, breakdowns: true, compare: true };
   var LIVE_TABS = { trades: true };
+  var STREAM_TABS = { live: true };
   var PERIODS = [
     ["all", "All time", 0], ["1d", "Last 24h", 86400000], ["7d", "Last 7 days", 604800000],
     ["30d", "Last 30 days", 2592000000], ["90d", "Last 90 days", 7776000000]
@@ -57,7 +61,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     } catch (e) { return; }
   }
   function loadPrefs() {
-    var prefs = { v: "", tab: "trades", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "" };
+    var prefs = { v: "", tab: "trades", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "", liveFilter: "all" };
     var raw = storageGet(PREFS_KEY);
     if (raw) {
       try {
@@ -275,10 +279,13 @@ export const DASHBOARD_SCRIPT = String.raw`
   function runOptions() {
     var mode = state.mode === "auto" ? resolvedMode() : state.mode === "all" ? "" : state.mode;
     var options = [["", "All runs"]];
+    var listed = false;
     meta.runs.forEach(function (run) {
+      if (String(run.id) === state.runId) { listed = true; }
       if (mode && run.mode !== mode) { return; }
       options.push([String(run.id), "#" + run.id + " " + run.mode + (run.label ? " " + run.label : "") + " (" + fmtInt(run.closedTrades) + ")"]);
     });
+    if (state.runId && !listed) { options.push([state.runId, "#" + state.runId + " (opened from Lab)"]); }
     return options;
   }
   function renderFilters() {
@@ -887,8 +894,10 @@ export const DASHBOARD_SCRIPT = String.raw`
     return card("Could not load this view", null, el("p", { class: "error-text", text: error && error.message ? error.message : "Unknown error" }), actions([el("button", { class: "btn", type: "button", text: "Try again", onclick: render })]));
   }
 
+${LIVE_VIEW_SCRIPT}
+${LAB_VIEW_SCRIPT}
   var VIEWS = {
-    trades: tradesView, edge: edgeView, breakdowns: breakdownsView, compare: compareView, scorer: scorerView,
+    trades: tradesView, live: liveView, edge: edgeView, lab: labView, breakdowns: breakdownsView, compare: compareView, scorer: scorerView,
     recorder: recorderView, signals: signalsView, launches: launchesView, wallets: walletsView
   };
 
@@ -900,6 +909,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     });
   }
   function showUpdated() {
+    if (STREAM_TABS[state.tab] === true && !locked) { dom.updated.textContent = liveStatusText(); return; }
     if (!lastRenderMs) { dom.updated.textContent = staleNote; return; }
     var text = "Updated " + fmtDur(Math.max(0, (Date.now() - lastRenderMs) / 1000)) + " ago";
     dom.updated.textContent = staleNote ? text + DOT + staleNote : text;
@@ -915,6 +925,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   function render(quiet) {
     var seq = ++renderSeq;
     var silent = quiet === true;
+    if (STREAM_TABS[state.tab] !== true) { liveStop(); }
     if (!silent) {
       setActiveTab();
       dom.main.classList.add("loading");
@@ -952,6 +963,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   function tick() {
     showUpdated();
+    liveTick();
     if (liveRefreshDue()) { render(true); }
   }
   function loadMeta() {
@@ -971,7 +983,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   function periodicRefresh() {
     if (!autoRefreshAllowed()) { return; }
-    if (LIVE_TABS[state.tab] === true) { checkHealth(); loadMeta(); return; }
+    if (LIVE_TABS[state.tab] === true || STREAM_TABS[state.tab] === true) { checkHealth(); loadMeta(); return; }
     refresh(true);
   }
   function selectTab(id) {
@@ -1003,7 +1015,10 @@ export const DASHBOARD_SCRIPT = String.raw`
       var tab = tabFromHash();
       if (tab && tab !== state.tab) { state.tab = tab; savePrefs(); render(); }
     });
-    document.addEventListener("visibilitychange", function () { if (autoRefreshAllowed()) { refresh(true); } });
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState !== "visible") { liveStop(); return; }
+      if (autoRefreshAllowed()) { refresh(true); }
+    });
     window.setInterval(periodicRefresh, REFRESH_MS);
     window.setInterval(tick, TICK_MS);
     refresh(false);

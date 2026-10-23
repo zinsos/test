@@ -2,15 +2,18 @@ import type { FeatureVector } from "../core/types.js";
 import { toNullableNumber, toNumber, type Db } from "../db/pool.js";
 import { FEATURE_NAMES } from "./featureNames.js";
 
-export type DatasetLabelName = "survived_15m" | "migrated" | "rugged" | "died";
+export type DatasetLabelName = "survived_15m" | "rugged_1h" | "migrated" | "rugged" | "died";
 
-export const DATASET_LABELS: readonly DatasetLabelName[] = ["survived_15m", "migrated", "rugged", "died"];
+export const DATASET_LABELS: readonly DatasetLabelName[] = ["survived_15m", "rugged_1h", "migrated", "rugged", "died"];
+
+export const FAST_LABELS: readonly DatasetLabelName[] = ["survived_15m", "rugged_1h"];
 
 export interface DatasetLabels {
   survived15m: boolean | null;
-  migrated: boolean;
-  rugged: boolean;
-  died: boolean;
+  rugged1h: boolean | null;
+  migrated: boolean | null;
+  rugged: boolean | null;
+  died: boolean | null;
   peakMultipleFrom1m: number | null;
   return15mFrom1m: number | null;
 }
@@ -27,17 +30,67 @@ export interface DatasetRow {
   labels: DatasetLabels;
 }
 
-export interface DatasetQuery {
+export interface LabelMaturity {
+  labelHorizonHours: number;
+  surviveCheckSec: number;
+  rugLookaheadSec: number;
+}
+
+export interface DatasetQuery extends Partial<LabelMaturity> {
   checkpointSec?: number | null;
   from?: Date | null;
   to?: Date | null;
   quoteMint?: string | null;
   limit?: number | null;
   asOf?: Date | null;
-  labelHorizonHours?: number;
+  label?: DatasetLabelName | null;
 }
 
 export const DEFAULT_LABEL_HORIZON_HOURS = 24;
+export const SURVIVE_SETTLE_SEC = 300;
+export const RUG_1H_WINDOW_SEC = 3_600;
+
+const DEFAULT_MATURITY: LabelMaturity = {
+  labelHorizonHours: DEFAULT_LABEL_HORIZON_HOURS,
+  surviveCheckSec: 900,
+  rugLookaheadSec: 300
+};
+
+export function datasetMaturityOf(outcome: {
+  finalizeAfterHours: number;
+  surviveCheckSec: number;
+  rugLookaheadSec: number;
+}): LabelMaturity {
+  return {
+    labelHorizonHours: outcome.finalizeAfterHours,
+    surviveCheckSec: outcome.surviveCheckSec,
+    rugLookaheadSec: outcome.rugLookaheadSec
+  };
+}
+
+function maturityOf(query: Partial<LabelMaturity>): LabelMaturity {
+  return {
+    labelHorizonHours: query.labelHorizonHours ?? DEFAULT_MATURITY.labelHorizonHours,
+    surviveCheckSec: query.surviveCheckSec ?? DEFAULT_MATURITY.surviveCheckSec,
+    rugLookaheadSec: query.rugLookaheadSec ?? DEFAULT_MATURITY.rugLookaheadSec
+  };
+}
+
+export function isFastLabel(label: DatasetLabelName): boolean {
+  return FAST_LABELS.includes(label);
+}
+
+export function labelMaturitySec(label: DatasetLabelName, maturity: Partial<LabelMaturity> = {}): number {
+  const resolved = maturityOf(maturity);
+  switch (label) {
+    case "survived_15m":
+      return resolved.surviveCheckSec + SURVIVE_SETTLE_SEC;
+    case "rugged_1h":
+      return RUG_1H_WINDOW_SEC + resolved.rugLookaheadSec;
+    default:
+      return resolved.labelHorizonHours * 3_600;
+  }
+}
 
 interface DatasetDbRow {
   launch_id: unknown;
@@ -49,27 +102,51 @@ interface DatasetDbRow {
   hard_blocked: boolean;
   features: Record<string, unknown>;
   survived_15m: boolean | null;
-  migrated: boolean;
-  rugged: boolean;
-  died: boolean;
+  rugged_1h: boolean | null;
+  migrated: boolean | null;
+  rugged: boolean | null;
+  died: boolean | null;
   peak_multiple_from_1m: unknown;
   return_15m_from_1m: unknown;
 }
 
 const DATASET_SQL = `
+SELECT d.* FROM (
 SELECT s.launch_id, l.mint, l.created_at, l.quote_mint, s.checkpoint_sec, s.score, s.hard_blocked, s.features,
-       o.survived_15m, o.migrated, o.rugged, o.died, o.peak_multiple_from_1m, o.return_15m_from_1m
+       CASE WHEN m.survived THEN o.survived_15m END AS survived_15m,
+       CASE WHEN m.rug_1h AND (o.finalized OR o.computed_at >= l.created_at + make_interval(secs => ${RUG_1H_WINDOW_SEC}))
+            THEN COALESCE(o.rug_at <= l.created_at + make_interval(secs => ${RUG_1H_WINDOW_SEC}), FALSE) END AS rugged_1h,
+       CASE WHEN m.settled THEN o.migrated END AS migrated,
+       CASE WHEN m.settled THEN o.rugged END AS rugged,
+       CASE WHEN m.settled THEN o.died END AS died,
+       CASE WHEN m.settled THEN o.peak_multiple_from_1m END AS peak_multiple_from_1m,
+       CASE WHEN m.survived THEN o.return_15m_from_1m END AS return_15m_from_1m
   FROM launch_scores s
   JOIN launches l ON l.id = s.launch_id
   JOIN launch_outcomes o ON o.launch_id = s.launch_id
- WHERE (o.finalized OR o.outcome_known_at IS NOT NULL)
-   AND l.created_at <= COALESCE($9::timestamptz, now()) - make_interval(secs => $10::float8)
+  CROSS JOIN LATERAL (
+    SELECT l.created_at <= COALESCE($9::timestamptz, now()) - make_interval(secs => $12::float8) AS survived,
+           l.created_at <= COALESCE($9::timestamptz, now()) - make_interval(secs => $13::float8) AS rug_1h,
+           l.created_at <= COALESCE($9::timestamptz, now()) - make_interval(secs => $14::float8)
+             AND (o.finalized OR o.outcome_known_at IS NOT NULL) AS settled
+  ) m
+ WHERE l.created_at <= COALESCE($9::timestamptz, now()) - make_interval(secs => $10::float8)
+   AND (NOT $11::boolean OR o.finalized OR o.outcome_known_at IS NOT NULL)
    AND ($1::int IS NULL OR s.checkpoint_sec = $1)
    AND ($2::timestamptz IS NULL OR l.created_at >= $2)
    AND ($3::timestamptz IS NULL OR l.created_at < $3)
    AND ($4::text IS NULL OR l.quote_mint = $4)
    AND (l.created_at, s.launch_id, s.checkpoint_sec) > ($5::timestamptz, $6::bigint, $7::int)
- ORDER BY l.created_at, s.launch_id, s.checkpoint_sec
+) d
+ WHERE CASE $15::text
+         WHEN 'survived_15m' THEN d.survived_15m IS NOT NULL
+         WHEN 'rugged_1h' THEN d.rugged_1h IS NOT NULL
+         WHEN 'migrated' THEN d.migrated IS NOT NULL
+         WHEN 'rugged' THEN d.rugged IS NOT NULL
+         WHEN 'died' THEN d.died IS NOT NULL
+         ELSE TRUE
+       END
+ ORDER BY d.created_at, d.launch_id, d.checkpoint_sec
  LIMIT $8`;
 
 export const LABEL_COLUMNS = [
@@ -78,10 +155,23 @@ export const LABEL_COLUMNS = [
   "rugged",
   "died",
   "peak_multiple_from_1m",
-  "return_15m_from_1m"
+  "return_15m_from_1m",
+  "rugged_1h"
 ] as const;
 
 export const BASE_COLUMNS = ["launch_id", "mint", "created_at", "checkpoint_sec", "score", "hard_blocked"] as const;
+
+interface EntryRule {
+  entrySec: number;
+  requireSettled: boolean;
+}
+
+export function entryRuleOf(query: DatasetQuery): EntryRule {
+  if (query.label) {
+    return { entrySec: labelMaturitySec(query.label, query), requireSettled: !isFastLabel(query.label) };
+  }
+  return { entrySec: Math.max(...DATASET_LABELS.map((label) => labelMaturitySec(label, query))), requireSettled: true };
+}
 
 function featureVector(raw: Record<string, unknown>): FeatureVector {
   const features: FeatureVector = {};
@@ -103,6 +193,7 @@ function rowFromDb(row: DatasetDbRow): DatasetRow {
     features: featureVector(row.features),
     labels: {
       survived15m: row.survived_15m,
+      rugged1h: row.rugged_1h,
       migrated: row.migrated,
       rugged: row.rugged,
       died: row.died,
@@ -122,6 +213,7 @@ export async function* iterateDataset(db: Db, query: DatasetQuery = {}, pageSize
   let cursorLaunch = "0";
   let cursorCheckpoint = -1;
   let remaining = query.limit ?? Number.POSITIVE_INFINITY;
+  const rule = entryRuleOf(query);
   while (remaining > 0) {
     const take = Math.min(pageSize, remaining);
     const page: DatasetDbRow[] = await queryPage(db, [
@@ -134,7 +226,12 @@ export async function* iterateDataset(db: Db, query: DatasetQuery = {}, pageSize
       cursorCheckpoint,
       take,
       query.asOf ?? null,
-      (query.labelHorizonHours ?? DEFAULT_LABEL_HORIZON_HOURS) * 3_600
+      rule.entrySec,
+      rule.requireSettled,
+      labelMaturitySec("survived_15m", query),
+      labelMaturitySec("rugged_1h", query),
+      labelMaturitySec("migrated", query),
+      query.label ?? null
     ]);
     if (page.length === 0) {
       return;
@@ -163,6 +260,8 @@ export function labelValue(row: DatasetRow, label: DatasetLabelName): boolean | 
   switch (label) {
     case "survived_15m":
       return row.labels.survived15m;
+    case "rugged_1h":
+      return row.labels.rugged1h;
     case "migrated":
       return row.labels.migrated;
     case "rugged":
@@ -209,7 +308,8 @@ export function csvLine(row: DatasetRow, featureNames: readonly string[] = FEATU
     csvCell(row.labels.rugged),
     csvCell(row.labels.died),
     csvCell(row.labels.peakMultipleFrom1m),
-    csvCell(row.labels.return15mFrom1m)
+    csvCell(row.labels.return15mFrom1m),
+    csvCell(row.labels.rugged1h)
   ];
   return cells.join(",");
 }

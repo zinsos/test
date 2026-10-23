@@ -64,7 +64,12 @@ export const COMMANDS: readonly CommandSpec[] = [
     summary: "fit suggested scorer weights from recorded outcomes and store them as a new version",
     options: [
       { name: "checkpoint", kind: "number", required: true, description: "scorer checkpoint in seconds (10, 30, 60, 120)" },
-      { name: "label", kind: "string", required: true, description: "outcome to predict: rugged, died, survived_15m or migrated" },
+      {
+        name: "label",
+        kind: "string",
+        required: true,
+        description: "outcome to predict: survived_15m, rugged_1h (fast, mature after about 20 and 65 minutes), migrated, rugged or died (24h)"
+      },
       FROM_OPTION,
       TO_OPTION,
       { name: "activate", kind: "boolean", description: "make the new weights the active version" },
@@ -81,6 +86,11 @@ export const COMMANDS: readonly CommandSpec[] = [
       FROM_OPTION,
       TO_OPTION,
       { name: "quote", kind: "string", description: "only launches with this quote mint (SOL for SOL-quoted)" },
+      {
+        name: "label",
+        kind: "string",
+        description: "only launches whose label has matured (survived_15m, rugged_1h, migrated, rugged, died); default: every label matured (24h)"
+      },
       { name: "out", kind: "string", required: true, description: "output file, or - for stdout" },
       CONFIG_OPTION
     ]
@@ -134,6 +144,19 @@ export const COMMANDS: readonly CommandSpec[] = [
     options: [
       { name: "keep-days", kind: "number", required: true, description: "days of recorded data to keep (at least 100 keeps 90-day wallet rankings intact)" },
       { name: "dry-run", kind: "boolean", description: "only report what would be deleted" }
+    ]
+  },
+  {
+    name: "lab",
+    summary: "train the scorer on fast labels and replay recent hours for the baseline and every variant in config/lab-variants.json",
+    options: [
+      { name: "hours", kind: "number", description: "hours of recorded data to replay, ending now (default 6, at most 48)" },
+      { name: "max-variants", kind: "number", description: "run only the first N variants besides the baseline" },
+      { name: "labels", kind: "string", description: "comma-separated labels to train (default survived_15m,rugged_1h,migrated)" },
+      { name: "variants", kind: "string", description: "variants file (default config/lab-variants.json)" },
+      { name: "prune-keep", kind: "number", description: "only delete lab backtest runs of all but the latest N lab runs, then exit" },
+      { name: "json", kind: "boolean", description: "print the full result as JSON after the report" },
+      CONFIG_OPTION
     ]
   },
   { name: "help", summary: "show this help", options: [] }

@@ -101,3 +101,15 @@ export {
 } from "./server.js";
 export { DASHBOARD_TITLE, dashboardContentSecurityPolicy, renderDashboardHtml } from "./dashboard.js";
 export { lamportsToSol } from "./units.js";
+export {
+  DEFAULT_HEARTBEAT_MS,
+  DEFAULT_LIVE_MAX_CLIENTS,
+  DEFAULT_UPDATE_THROTTLE_MS,
+  LiveHub,
+  type LiveHello,
+  type LiveHubOptions,
+  type LiveStatus
+} from "./liveHub.js";
+export { thresholdsOf, type LiveEvent, type LiveKind, type LiveThresholds } from "./liveEvents.js";
+export { exitLevels, livePositionView, positionSeries, type ExitLevels, type LivePositionView, type PositionSeries } from "./liveSeries.js";
+export { LAB_LABEL_PREFIX, labTakeaway, loadLabOverview, type LabOverview, type LabVariantRow } from "./labQueries.js";

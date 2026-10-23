@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { defaultStrategyConfig } from "../config/strategy.js";
 import type { Clock } from "../core/clock.js";
 import type { LaunchScore, Pubkey, TradingMode } from "../core/types.js";
@@ -42,6 +43,8 @@ import {
   type SellFeeDefaults
 } from "./positionQueries.js";
 import { latestScore, recentLaunches, recentSignals, trackedWallets } from "./activityQueries.js";
+import { loadLabOverview } from "./labQueries.js";
+import type { LiveHub, LiveStatus } from "./liveHub.js";
 import { recorderHealth } from "./recorderQueries.js";
 import { scoreCheckpoints, scorerCalibration } from "./scorerQueries.js";
 import {
@@ -98,6 +101,7 @@ export interface AnalyticsContext {
   settings: AnalyticsSettings;
   scoreLookup: ScoreLookup | null;
   extraHealth: ExtraHealth | null;
+  live: LiveHub | null;
 }
 
 export interface ApiRequest {
@@ -113,7 +117,11 @@ export interface CsvStream {
 
 export type JsonRoute = { kind: "json"; cacheable: boolean; handle: (ctx: AnalyticsContext, request: ApiRequest) => Promise<unknown> };
 export type CsvRoute = { kind: "csv"; handle: (ctx: AnalyticsContext, request: ApiRequest) => CsvStream };
-export type ApiRoute = JsonRoute | CsvRoute;
+export type StreamRoute = {
+  kind: "stream";
+  handle: (ctx: AnalyticsContext, request: ApiRequest, req: IncomingMessage, res: ServerResponse) => void;
+};
+export type ApiRoute = JsonRoute | CsvRoute | StreamRoute;
 
 const BREAKDOWN_ALL = "all";
 
@@ -199,7 +207,8 @@ async function compareRoute(ctx: AnalyticsContext, request: ApiRequest): Promise
 
 async function runsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
   const limit = parseInteger(request.params, "limit", { min: 1, max: 1_000 }) ?? undefined;
-  return { runs: await loadRuns(ctx.db, { limit, mode: parseMode(request.params) }), modes: await loadModes(ctx.db) };
+  const includeLab = parseFlag(request.params, "lab");
+  return { runs: await loadRuns(ctx.db, { limit, mode: parseMode(request.params), includeLab }), modes: await loadModes(ctx.db) };
 }
 
 async function scoreRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
@@ -302,6 +311,53 @@ async function walletsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise
   return trackedWallets(ctx.db, { limit: parseInteger(request.params, "limit", { min: 1 }) ?? undefined });
 }
 
+const POSITION_ID = /^[A-Za-z0-9_-]{1,160}$/;
+
+const LIVE_DISABLED: LiveStatus = {
+  enabled: false,
+  streamId: null,
+  clients: 0,
+  maxClients: 0,
+  tradingActive: false,
+  events: 0,
+  lastEventAtMs: null,
+  openPositions: 0,
+  heartbeatMs: 0
+};
+
+function liveStatusRoute(ctx: AnalyticsContext): Promise<unknown> {
+  return Promise.resolve(ctx.live ? ctx.live.status() : LIVE_DISABLED);
+}
+
+function liveSeriesRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
+  const raw = request.segments[0] ?? "";
+  let id: string;
+  try {
+    id = decodeURIComponent(raw);
+  } catch {
+    throw new HttpError(400, "invalid_position", "position id is malformed");
+  }
+  if (!POSITION_ID.test(id)) {
+    throw new HttpError(400, "invalid_position", "position id is malformed");
+  }
+  const series = ctx.live?.series(id) ?? null;
+  if (!series) {
+    throw new HttpError(404, "position_not_open", "no open position with this id in this process");
+  }
+  return Promise.resolve(series);
+}
+
+function liveStreamRoute(ctx: AnalyticsContext, _request: ApiRequest, req: IncomingMessage, res: ServerResponse): void {
+  if (!ctx.live) {
+    throw new HttpError(404, "live_unavailable", "this service has no live event stream; run the dashboard in the trading service");
+  }
+  ctx.live.connect(req, res);
+}
+
+async function labRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
+  return loadLabOverview(ctx.db, { historyLimit: parseInteger(request.params, "history", { min: 1, max: 200 }) ?? undefined });
+}
+
 function scorerDatasetRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStream {
   const params = request.params;
   return {
@@ -339,24 +395,39 @@ const ROUTES: ReadonlyMap<string, ApiRoute> = new Map<string, ApiRoute>([
   ["scorer/calibration", { kind: "json", cacheable: true, handle: calibrationRoute }],
   ["recorder/health", { kind: "json", cacheable: true, handle: (ctx) => recorderRoute(ctx) }],
   ["wallets/tracked", { kind: "json", cacheable: true, handle: walletsRoute }],
+  ["lab", { kind: "json", cacheable: true, handle: labRoute }],
+  ["live/status", { kind: "json", cacheable: false, handle: (ctx) => liveStatusRoute(ctx) }],
+  ["live/stream", { kind: "stream", handle: liveStreamRoute }],
   ["export/scorer-dataset.csv", { kind: "csv", handle: scorerDatasetRoute }],
   ["export/trades.csv", { kind: "csv", handle: tradesCsvRoute }]
 ]);
 
-const PARAMETERIZED_PREFIXES: readonly string[] = ["score"];
+interface ParameterizedRoute {
+  prefix: string;
+  suffix: string;
+  route: ApiRoute;
+}
+
+const PARAMETERIZED_ROUTES: readonly ParameterizedRoute[] = [
+  { prefix: "score/", suffix: "", route: { kind: "json", cacheable: false, handle: scoreRoute } },
+  { prefix: "live/position/", suffix: "/series", route: { kind: "json", cacheable: false, handle: liveSeriesRoute } }
+];
 
 export function resolveRoute(apiPath: string): { route: ApiRoute; segments: string[] } | null {
   const exact = ROUTES.get(apiPath);
   if (exact) {
     return { route: exact, segments: [] };
   }
-  for (const prefix of PARAMETERIZED_PREFIXES) {
-    const route = ROUTES.get(prefix);
-    if (route && apiPath.startsWith(`${prefix}/`)) {
-      const rest = apiPath.slice(prefix.length + 1);
-      if (rest.length > 0 && !rest.includes("/")) {
-        return { route, segments: [rest] };
-      }
+  for (const pattern of PARAMETERIZED_ROUTES) {
+    if (apiPath.length <= pattern.prefix.length + pattern.suffix.length) {
+      continue;
+    }
+    if (!apiPath.startsWith(pattern.prefix) || !apiPath.endsWith(pattern.suffix)) {
+      continue;
+    }
+    const rest = apiPath.slice(pattern.prefix.length, apiPath.length - pattern.suffix.length);
+    if (!rest.includes("/")) {
+      return { route: pattern.route, segments: [rest] };
     }
   }
   return null;
