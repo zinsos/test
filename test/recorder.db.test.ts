@@ -335,7 +335,7 @@ describe.skipIf(!hasTestDatabase)("recorder with postgres", () => {
           owner === null ? null : { owner: "token", lamports: 1, data: { parsed: { info: { owner } } } }
         );
       },
-      stats: () => ({ calls: 0, errors: 0, queued: 0, active: 0 })
+      stats: () => ({ calls: 0, errors: 0, queued: 0, active: 0, dropped: 0 })
     };
     const snapshotter = new HolderSnapshotter({ db, clock, market: second.market, rpc, config: recorderConfig });
     snapshotter.start();

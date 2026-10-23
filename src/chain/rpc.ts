@@ -10,7 +10,12 @@ export interface RpcClientOptions {
   maxConcurrency: number;
   timeoutMs: number;
   maxRetries: number;
+  maxQueued?: number;
+  maxQueueWaitMs?: number;
 }
+
+const DEFAULT_MAX_QUEUED = 2_000;
+const DEFAULT_MAX_QUEUE_WAIT_MS = 120_000;
 
 export class RpcError extends Error {
   constructor(
@@ -80,7 +85,9 @@ export interface ParsedAccountInfo {
 
 interface QueueItem {
   priority: RpcPriority;
+  enqueuedAtMs: number;
   run: () => void;
+  drop: (reason: string) => void;
 }
 
 const PRIORITY_ORDER: Record<RpcPriority, number> = { high: 0, normal: 1, low: 2 };
@@ -94,13 +101,26 @@ export class RpcClient {
   private nextId = 1;
   private callCount = 0;
   private errorCount = 0;
+  private droppedCount = 0;
+  private readonly capacity: number;
+  private readonly maxQueued: number;
+  private readonly maxQueueWaitMs: number;
 
   constructor(private readonly options: RpcClientOptions) {
-    this.tokens = options.maxRps;
+    this.capacity = Math.max(1, options.maxRps);
+    this.tokens = this.capacity;
+    this.maxQueued = Math.max(1, options.maxQueued ?? DEFAULT_MAX_QUEUED);
+    this.maxQueueWaitMs = Math.max(1, options.maxQueueWaitMs ?? DEFAULT_MAX_QUEUE_WAIT_MS);
   }
 
-  stats(): { calls: number; errors: number; queued: number; active: number } {
-    return { calls: this.callCount, errors: this.errorCount, queued: this.queue.length, active: this.active };
+  stats(): { calls: number; errors: number; queued: number; active: number; dropped: number } {
+    return {
+      calls: this.callCount,
+      errors: this.errorCount,
+      queued: this.queue.length,
+      active: this.active,
+      dropped: this.droppedCount
+    };
   }
 
   async call<T>(method: string, params: unknown[], priority: RpcPriority = "normal"): Promise<T> {
@@ -193,6 +213,11 @@ export class RpcClient {
     return new Promise<T>((resolve, reject) => {
       const item: QueueItem = {
         priority,
+        enqueuedAtMs: Date.now(),
+        drop: (reason) => {
+          this.droppedCount += 1;
+          reject(new RpcError(reason, null, false));
+        },
         run: () => {
           this.active += 1;
           task()
@@ -203,6 +228,10 @@ export class RpcClient {
             });
         }
       };
+      if (!this.makeRoomFor(priority)) {
+        item.drop("rpc queue full");
+        return;
+      }
       const index = this.queue.findIndex((queued) => PRIORITY_ORDER[queued.priority] > PRIORITY_ORDER[priority]);
       if (index === -1) {
         this.queue.push(item);
@@ -213,16 +242,47 @@ export class RpcClient {
     });
   }
 
+  private makeRoomFor(priority: RpcPriority): boolean {
+    this.dropExpired();
+    if (this.queue.length < this.maxQueued) {
+      return true;
+    }
+    const tail = this.queue[this.queue.length - 1];
+    if (!tail || PRIORITY_ORDER[tail.priority] <= PRIORITY_ORDER[priority]) {
+      return false;
+    }
+    this.queue.pop();
+    tail.drop("rpc queue full");
+    return true;
+  }
+
+  private dropExpired(): void {
+    const cutoff = Date.now() - this.maxQueueWaitMs;
+    if (!this.queue.some((item) => item.enqueuedAtMs < cutoff)) {
+      return;
+    }
+    const kept: QueueItem[] = [];
+    for (const item of this.queue) {
+      if (item.enqueuedAtMs < cutoff) {
+        item.drop("rpc queue wait exceeded");
+      } else {
+        kept.push(item);
+      }
+    }
+    this.queue.splice(0, this.queue.length, ...kept);
+  }
+
   private refill(): void {
     const now = Date.now();
     const elapsed = (now - this.lastRefill) / 1000;
     if (elapsed > 0) {
-      this.tokens = Math.min(this.options.maxRps, this.tokens + elapsed * this.options.maxRps);
+      this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.options.maxRps);
       this.lastRefill = now;
     }
   }
 
   private pump(): void {
+    this.dropExpired();
     this.refill();
     while (this.queue.length > 0 && this.active < this.options.maxConcurrency && this.tokens >= 1) {
       const item = this.queue.shift();
