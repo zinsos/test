@@ -74,8 +74,16 @@ class SteppingClock implements Clock {
 
 type StatusValue = { slot: number; err: unknown; confirmationStatus: "processed" | "confirmed" | "finalized" | null; confirmations: number | null };
 
+function tokenAccountWith(amount: bigint): { pubkey: PublicKey; account: { data: Buffer } } {
+  const data = Buffer.alloc(165);
+  data.writeBigUInt64LE(amount, 64);
+  return { pubkey: Keypair.generate().publicKey, account: { data } };
+}
+
 class FakeConnection {
   blockhashCalls = 0;
+  walletTokens: bigint[] | null = [];
+  readonly tokenBalanceQueries: string[] = [];
   readonly sent: Uint8Array[] = [];
   readonly sendOptions: Array<SendOptions | undefined> = [];
   readonly simulated: VersionedTransaction[] = [];
@@ -118,6 +126,14 @@ class FakeConnection {
     return null;
   }
 
+  async getTokenAccountsByOwner(_owner: PublicKey, filter: { mint: PublicKey }): Promise<{ value: Array<{ pubkey: PublicKey; account: { data: Buffer } }> }> {
+    this.tokenBalanceQueries.push(filter.mint.toBase58());
+    if (this.walletTokens === null) {
+      throw new Error("rpc down");
+    }
+    return { value: this.walletTokens.map(tokenAccountWith) };
+  }
+
   uniqueSignatures(): string[] {
     return [...new Set(this.sent.map(signatureOfRaw))];
   }
@@ -155,6 +171,8 @@ class FakeBuilder implements TradeInstructionBuilder {
       expectedTokens: 245_224_727_144n,
       expectedQuote: 19_800_000n,
       closesTokenAccount: false,
+      createsTokenAccount: true,
+      tokenBalanceBefore: 0n,
       instructionSet: "buy_exact_quote_in_v3",
       ...this.outcome
     };
@@ -357,6 +375,24 @@ describe("LiveExecutor sends and parses fills", () => {
     expect(fill.filledSlot).toBe(777);
     expect(fetched).toHaveLength(2);
   });
+
+  it("books the token account rent and the tokens that actually arrived when an unparsed buy created the account", async () => {
+    const config = execConfig();
+    const { executor, connection } = setup();
+    connection.statusFor = () => confirmed(777);
+    connection.walletTokens = [230_000_000_000n];
+    const fill = await executor.execute(curveBuyOrder());
+    expect(fill.error).toBe("fill_unparsed");
+    expect(fill.tokenAmount).toBe(230_000_000_000n);
+    expect(fill.rentPaid).toBe(BigInt(config.ataRentLamports));
+    expect(connection.tokenBalanceQueries).toEqual([CURVE_BUY_MINT]);
+    const topUp = setup({ builder: new FakeBuilder({ createsTokenAccount: false, tokenBalanceBefore: 50_000_000_000n }) });
+    topUp.connection.statusFor = () => confirmed(778);
+    topUp.connection.walletTokens = [280_000_000_000n];
+    const added = await topUp.executor.execute(curveBuyOrder());
+    expect(added.tokenAmount).toBe(230_000_000_000n);
+    expect(added.rentPaid).toBe(0n);
+  });
 });
 
 describe("LiveExecutor reconcile", () => {
@@ -437,6 +473,30 @@ describe("LiveExecutor refusals and guards", () => {
     expect(fill.attempts.map((attempt) => attempt.error)).toEqual(["slippage_exceeded", "slippage_exceeded"]);
     expect(builder.requests).toHaveLength(0);
     expect(connection.sent).toHaveLength(0);
+  });
+
+  it("never lets the on-chain tolerance exceed the order cap after the price moved in our favour", async () => {
+    const launch = new LaunchState(launchInfoFromEvent(createEvent({ mint: CURVE_BUY_MINT })));
+    const { executor, builder } = setup({ market: launchMarket(launch), dryRun: true, config: { maxRetries: 0 } });
+    await executor.execute(curveBuyOrder({ quoteBudget: SOL / 10n, referencePrice: launch.price() * 2, maxSlippageBps: 1500 }));
+    expect(builder.requests[0]?.slippageBps).toBe(1500);
+  });
+
+  it("sends nothing once halted, and reads the wallet balance across token accounts", async () => {
+    const { executor, connection, builder } = setup();
+    executor.halt();
+    const fill = await executor.execute(curveBuyOrder());
+    expect(fill.success).toBe(false);
+    expect(fill.error).toBe("halted");
+    expect(fill.networkFees).toBe(0n);
+    expect(builder.requests).toHaveLength(0);
+    expect(connection.sent).toHaveLength(0);
+    connection.walletTokens = [5n, 7n];
+    expect(await executor.tokenBalance(CURVE_BUY_MINT)).toBe(12n);
+    connection.walletTokens = [];
+    expect(await executor.tokenBalance(CURVE_BUY_MINT)).toBe(0n);
+    connection.walletTokens = null;
+    expect(await executor.tokenBalance(CURVE_BUY_MINT)).toBeNull();
   });
 
   it("passes only the slippage left after the current price drift, plus market hints, to the builder", async () => {

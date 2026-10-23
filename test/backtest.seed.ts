@@ -24,6 +24,7 @@ export interface SeedLaunch {
   slot: number;
   trades: readonly SeedTrade[];
   dataComplete?: boolean;
+  incompleteFromMs?: number;
   quoteMint?: string;
 }
 
@@ -36,8 +37,9 @@ function slotFor(launch: SeedLaunch, atMs: number): number {
 export async function seedLaunch(db: Db, launch: SeedLaunch): Promise<number> {
   const inserted = await db.query<{ id: unknown }>(
     `INSERT INTO launches (mint, bonding_curve, dev_wallet, creator, name, symbol, uri, quote_mint, create_signature,
-       create_slot, created_at, token_total_supply, initial_virtual_token, initial_virtual_quote, initial_real_token, data_complete)
-     VALUES ($1, $2, $3, $3, $4, $5, '', $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
+       create_slot, created_at, token_total_supply, initial_virtual_token, initial_virtual_quote, initial_real_token, data_complete,
+       data_incomplete_at)
+     VALUES ($1, $2, $3, $3, $4, $5, '', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
     [
       launch.mint,
       `${launch.mint.slice(0, 16)}Curve`,
@@ -52,7 +54,8 @@ export async function seedLaunch(db: Db, launch: SeedLaunch): Promise<number> {
       DEFAULT_INITIAL_VIRTUAL_TOKEN_RESERVES.toString(),
       DEFAULT_INITIAL_VIRTUAL_QUOTE_RESERVES.toString(),
       DEFAULT_INITIAL_REAL_TOKEN_RESERVES.toString(),
-      launch.dataComplete ?? true
+      launch.incompleteFromMs === undefined ? (launch.dataComplete ?? true) : false,
+      launch.incompleteFromMs === undefined ? null : new Date(launch.incompleteFromMs)
     ]
   );
   const launchId = Number(inserted.rows[0]?.id);

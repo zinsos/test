@@ -279,17 +279,17 @@ describe.skipIf(!hasTestDatabase)("recorder with postgres", () => {
     expect(first.service.stats().tradeDuplicates).toBeGreaterThan(0);
   });
 
-  it("resumes after a restart, records the restart gap and stays idempotent on replay", async () => {
+  it("resumes after a clean restart without a restart gap when the new stream overlaps the old one", async () => {
     await first.service.stop();
-    const before = await db.query("SELECT mint, trade_count, buy_count, sell_count, last_trade_slot, pool FROM launches ORDER BY mint");
+    const before = await db.query("SELECT mint, trade_count, buy_count, sell_count, unique_traders, last_trade_slot, pool FROM launches ORDER BY mint");
+    const incompleteBefore = await count(db, "SELECT count(*) AS n FROM launches WHERE NOT data_complete");
+    const checkpoint = await db.query("SELECT last_slot, stopped_at FROM recorder_checkpoints WHERE instance = $1", [first.service.instanceId]);
+    expect(toNumber(checkpoint.rows[0]?.last_slot)).toBe(Math.max(...fixtures.map((tx) => tx.slot)));
+    expect(checkpoint.rows[0]?.stopped_at).toBeInstanceOf(Date);
     second = buildStack(db, clock);
     await second.service.start();
     expect(second.registry.size).toBe(10);
     expect(second.registry.mintForPool(migrationTwo.pool)).toBe(migrationTwo.mint);
-    const restart = await db.query("SELECT * FROM ingest_gaps WHERE reason = 'restart'");
-    expect(restart.rows).toHaveLength(1);
-    expect(restart.rows[0]?.affected_launches).toBe(4);
-    expect(await count(db, "SELECT count(*) AS n FROM launches WHERE data_complete")).toBe(0);
 
     feedEvent(second, syntheticOne);
     feedEvent(second, syntheticTwo);
@@ -300,12 +300,15 @@ describe.skipIf(!hasTestDatabase)("recorder with postgres", () => {
     }
     await second.service.settleInflight();
     await second.service.flush();
+    await clock.advanceTo(clock.nowMs() + 20_000);
+    await second.service.settleInflight();
     expect(await count(db, "SELECT count(*) AS n FROM launches")).toBe(10);
     expect(await count(db, "SELECT count(*) AS n FROM trades")).toBe(expectedTrades);
-    const after = await db.query("SELECT mint, trade_count, buy_count, sell_count, last_trade_slot, pool FROM launches ORDER BY mint");
+    const after = await db.query("SELECT mint, trade_count, buy_count, sell_count, unique_traders, last_trade_slot, pool FROM launches ORDER BY mint");
     expect(after.rows).toEqual(before.rows);
-    expect(second.service.stats().launchesInserted).toBe(0);
-    expect(second.service.stats().tradesReplayedBeforeResume).toBe(expectedTrades);
+    expect(await count(db, "SELECT count(*) AS n FROM ingest_gaps WHERE reason = 'restart'")).toBe(0);
+    expect(await count(db, "SELECT count(*) AS n FROM launches WHERE NOT data_complete")).toBe(incompleteBefore);
+    expect(second.service.stats()).toMatchObject({ launchesInserted: 0, tradesReplayedBeforeResume: expectedTrades, restartsCovered: 1, restartGaps: 0 });
     expect(second.market.get(template.mint)?.launchId).toBe(second.registry.launchId(template.mint));
   });
 

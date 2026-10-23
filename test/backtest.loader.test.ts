@@ -165,6 +165,14 @@ describe.skipIf(!hasTestDatabase)("replay loader on Postgres", () => {
     await seedLaunch(database.db, { mint: "LoaderB", dev: "DevB", createdAtMs: T + 90_000, slot: 2_000, trades: convergenceTrades(["d", "e", "f"]) });
     await seedLaunch(database.db, { mint: "LoaderPump", dev: "DevP", createdAtMs: T + 95_000, slot: 2_100, trades: convergenceTrades(["g"]), quoteMint: "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn" });
     await seedLaunch(database.db, { mint: "LoaderGap", dev: "DevG", createdAtMs: T + 100_000, slot: 2_200, trades: convergenceTrades(["h"]), dataComplete: false });
+    await seedLaunch(database.db, {
+      mint: "LoaderSurvivor",
+      dev: "DevS",
+      createdAtMs: T + 110_000,
+      slot: 2_300,
+      trades: convergenceTrades(["i", "j", "k"]),
+      incompleteFromMs: T + 110_000 + 150_000
+    });
     await database.db.query(
       "UPDATE launches SET completed_at = $1, completed_slot = 1100, migrated_at = $2, migrated_slot = 1200, pool = 'PoolA' WHERE mint = 'LoaderA'",
       [new Date(T + 150_000), new Date(T + 160_000)]
@@ -192,14 +200,27 @@ describe.skipIf(!hasTestDatabase)("replay loader on Postgres", () => {
       expect((all[index] as ReplayEvent).atMs).toBeGreaterThanOrEqual((all[index - 1] as ReplayEvent).atMs);
     }
     const creates = all.filter((event) => event.event.kind === "create").map((event) => event.event.mint);
-    expect(creates).toEqual(["LoaderA", "LoaderB", "LoaderPump"]);
+    expect(creates).toEqual(["LoaderA", "LoaderB", "LoaderPump", "LoaderGap", "LoaderSurvivor"]);
     const tradeMints = new Set(all.filter((event) => event.event.kind === "trade").map((event) => event.event.mint));
-    expect([...tradeMints].sort()).toEqual(["LoaderA", "LoaderB"]);
+    expect([...tradeMints].sort()).toEqual(["LoaderA", "LoaderB", "LoaderGap", "LoaderSurvivor"]);
+    const incompleteFrom = new Map(
+      all.filter((event) => event.event.kind === "create").map((event) => [event.event.mint, event.incompleteFromMs ?? null])
+    );
+    expect(Object.fromEntries(incompleteFrom)).toEqual({
+      LoaderA: null,
+      LoaderB: null,
+      LoaderPump: null,
+      LoaderGap: T + 100_000,
+      LoaderSurvivor: T + 260_000
+    });
+    expect(all.filter((event) => event.event.kind === "trade" && event.event.mint === "LoaderSurvivor")).toHaveLength(
+      convergenceTrades(["i", "j", "k"]).length
+    );
     expect(all.filter((event) => event.event.kind === "complete" || event.event.kind === "migrate").map((event) => event.event.kind)).toEqual([
       "complete",
       "migrate"
     ]);
-    expect(loader.stats()).toMatchObject({ launches: 3, lifecycle: 2 });
+    expect(loader.stats()).toMatchObject({ launches: 5, incompleteLaunches: 2, lifecycle: 2 });
   });
 
   it("loads stored live scores chunk by chunk ahead of replay time and forgets old chunks", async () => {

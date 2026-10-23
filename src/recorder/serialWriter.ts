@@ -1,10 +1,11 @@
-import { BatchWriter, type BatchTableSpec, type Row } from "../db/batch.js";
+import { BatchWriter, type BatchTableSpec, type BatchWriterHooks, type Row } from "../db/batch.js";
 import type { Db } from "../db/pool.js";
 
-export interface SerialBatchWriterOptions {
+export interface SerialBatchWriterOptions extends BatchWriterHooks {
   flushIntervalMs: number;
   flushAtRows: number;
   maxRetries: number;
+  maxBackoffMs?: number;
 }
 
 export class SerialBatchWriter {
@@ -20,7 +21,10 @@ export class SerialBatchWriter {
     this.writer = new BatchWriter(db, {
       flushIntervalMs: options.flushIntervalMs,
       maxBufferedRows: Number.MAX_SAFE_INTEGER,
-      maxRetries: options.maxRetries
+      maxRetries: options.maxRetries,
+      maxBackoffMs: options.maxBackoffMs,
+      onInserted: options.onInserted,
+      onDropped: options.onDropped
     });
     for (const spec of specs) {
       this.writer.register(spec);
@@ -42,6 +46,7 @@ export class SerialBatchWriter {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.writer.beginStop();
     await this.flush();
   }
 

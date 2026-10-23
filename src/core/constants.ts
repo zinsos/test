@@ -19,4 +19,5 @@ export const BASE_SIGNATURE_FEE_LAMPORTS = 5_000n;
 export const TOKEN_ACCOUNT_RENT_LAMPORTS = 2_039_280n;
 
 export const SLOT_MS = 400;
+export const MAX_BLOCKHASH_AGE_MS = 120_000;
 export const BPS = 10_000n;

@@ -25,7 +25,7 @@ import { createTrackerModule } from "../tracker/index.js";
 import { closedTradeOf } from "../trader/accounting.js";
 import { PgTradingStore } from "../trader/store.js";
 import { Trader } from "../trader/trader.js";
-import { applyReplayEvent, BacktestLoader, type LoaderCounts } from "./loader.js";
+import { applyReplayEvent, BacktestLoader, scheduleIncomplete, type LoaderCounts } from "./loader.js";
 import { RollingStoredFeatures } from "./storedScores.js";
 
 const log = moduleLogger("backtest");
@@ -275,6 +275,7 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
           await clock.advanceTo(replay.atMs);
         }
         applyReplayEvent(market, replay);
+        scheduleIncomplete(clock, market, replay);
         bus.emit("chain", replay.event);
         events += 1;
         await tracker.signals.idle();

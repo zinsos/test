@@ -12,18 +12,23 @@ import type {
   TradeEvent,
   TradeVenue
 } from "../core/types.js";
-import type { BatchTableSpec } from "../db/batch.js";
+import type { BatchTableSpec, ReturnedRow, Row } from "../db/batch.js";
 import { ensureTradePartitions } from "../db/partitions.js";
-import { toNullableNumber, toNumber, type Db } from "../db/pool.js";
+import { toNumber, type Db } from "../db/pool.js";
 import { BoundedSet } from "../ingest/lru.js";
+import { gapAffectsLaunch } from "../ingest/pipeline.js";
 import type { MarketState } from "../market/state.js";
-import { LaunchAggregate, writeAggregateDeltas } from "./aggregates.js";
+import { LaunchAggregate, loadLaunchWallets, writeAggregateDeltas } from "./aggregates.js";
+import { RecorderCheckpointStore, type PredecessorCoverage, type StreamPosition } from "./checkpoints.js";
 import type { LaunchRegistry, TrackedLaunch } from "./registry.js";
 import { SerialBatchWriter, type SerialBatchWriterOptions } from "./serialWriter.js";
 import { cleanText } from "./sql.js";
 
 const log = moduleLogger("recorder");
 const HOUR_MS = 3_600_000;
+const CONTIGUOUS_SLOT_TOLERANCE = 1;
+export const RESTART_GAP_REASON = "restart";
+export const DROPPED_TRADES_REASON = "trade write dropped";
 
 export const VENUE_CODES: Record<TradeVenue, number> = { curve: 0, pool: 1, curve_post_complete: 2 };
 
@@ -54,10 +59,16 @@ export const TRADES_TABLE_SPEC: BatchTableSpec = {
     "real_quote",
     "ix_name"
   ],
-  conflict: "ON CONFLICT DO NOTHING"
+  conflict: "ON CONFLICT DO NOTHING",
+  returning: "launch_id, is_buy"
 };
 
 type FollowUpEvent = TradeEvent | CurveCompleteEvent | MigrationEvent;
+
+interface DurableGap {
+  gap: IngestGap;
+  launchIds: readonly number[] | null;
+}
 
 interface PendingLaunch {
   event: LaunchCreatedEvent;
@@ -96,6 +107,10 @@ export interface RecorderServiceOptions {
   insertRetryDelayMs?: number;
   dedupeCapacity?: number;
   recordRestartGap?: boolean;
+  restartCheckDelayMs?: number;
+  restartMaxWaitMs?: number;
+  cursorStaleMs?: number;
+  instanceId?: string;
   manageTradePartitions?: boolean;
 }
 
@@ -158,6 +173,51 @@ function launchInsertParams(event: LaunchCreatedEvent, observedAtMs: number): un
   ];
 }
 
+const GENERAL_GAP_CONDITION = `(CASE WHEN $2::bigint IS NOT NULL THEN create_slot <= $2::bigint
+         WHEN $3::bigint IS NOT NULL THEN create_slot < $3::bigint
+         ELSE created_at <= $5 END)
+    AND (tracking_ended_at IS NULL OR tracking_ended_at >= $4)`;
+
+function gapSql(condition: string): string {
+  return `WITH affected AS (
+       UPDATE launches
+          SET data_complete = false,
+              data_incomplete_at = LEAST(COALESCE(data_incomplete_at, 'infinity'::timestamptz), GREATEST(created_at, $4))
+        WHERE ${condition}
+          AND (data_complete OR data_incomplete_at IS NULL OR data_incomplete_at > GREATEST(created_at, $4))
+        RETURNING 1
+     )
+     INSERT INTO ingest_gaps (source, from_slot, to_slot, started_at, ended_at, reason, affected_launches)
+     SELECT $1, $2::bigint, $3::bigint, $4, $5, $6, (SELECT count(*)::int FROM affected)`;
+}
+
+export function droppedTradesGap(rows: readonly Row[]): DurableGap | null {
+  const launchIds = new Set<number>();
+  let fromSlot = Number.POSITIVE_INFINITY;
+  let toSlot = Number.NEGATIVE_INFINITY;
+  let startedAtMs = Number.POSITIVE_INFINITY;
+  let endedAtMs = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    const [launchId, blockTime, slot] = row;
+    const atMs = blockTime instanceof Date ? blockTime.getTime() : Number.NaN;
+    if (typeof launchId !== "number" || typeof slot !== "number" || !Number.isFinite(atMs)) {
+      continue;
+    }
+    launchIds.add(launchId);
+    fromSlot = Math.min(fromSlot, slot);
+    toSlot = Math.max(toSlot, slot);
+    startedAtMs = Math.min(startedAtMs, atMs);
+    endedAtMs = Math.max(endedAtMs, atMs);
+  }
+  if (launchIds.size === 0) {
+    return null;
+  }
+  return {
+    gap: { source: "recorder", fromSlot, toSlot, startedAtMs, endedAtMs, reason: DROPPED_TRADES_REASON },
+    launchIds: [...launchIds]
+  };
+}
+
 const INSERT_LAUNCH_SQL = `
   INSERT INTO launches (
     mint, bonding_curve, dev_wallet, creator, name, symbol, uri, quote_mint, token_program,
@@ -184,11 +244,23 @@ export class RecorderService {
   private readonly insertRetries: number;
   private readonly insertRetryDelayMs: number;
   private readonly recordRestartGap: boolean;
+  private readonly restartCheckDelayMs: number;
+  private readonly restartMaxWaitMs: number;
+  private readonly cursorStaleMs: number;
   private readonly manageTradePartitions: boolean;
   private readonly trackMaxAgeMs: number;
   private readonly recentTrades: BoundedSet<string>;
+  private readonly checkpoints: RecorderCheckpointStore;
   private readonly pending = new Map<Pubkey, PendingLaunch>();
   private readonly aggregates = new Map<Pubkey, LaunchAggregate>();
+  private readonly aggregatesById = new Map<number, LaunchAggregate>();
+  private readonly durableQueue: DurableGap[] = [];
+  private firstPosition: StreamPosition | null = null;
+  private lastPosition: StreamPosition | null = null;
+  private firstSeenAtMs = 0;
+  private restartChecked = false;
+  private restartTimer: TimerHandle | null = null;
+  private legacyCoverage: Promise<PredecessorCoverage | null> | null = null;
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly registeredListeners = new Set<RegisteredListener>();
   private readonly wakers = new Set<() => void>();
@@ -216,6 +288,10 @@ export class RecorderService {
     migrations: 0,
     gapsRecorded: 0,
     gapErrors: 0,
+    tradeWritesDropped: 0,
+    restartsCovered: 0,
+    restartGaps: 0,
+    checkpointErrors: 0,
     aggregateFlushes: 0,
     aggregateRowsUpdated: 0,
     aggregateErrors: 0,
@@ -238,15 +314,26 @@ export class RecorderService {
     this.insertRetries = options.insertRetries ?? 5;
     this.insertRetryDelayMs = options.insertRetryDelayMs ?? 500;
     this.recordRestartGap = options.recordRestartGap ?? true;
+    this.restartCheckDelayMs = options.restartCheckDelayMs ?? 15_000;
+    this.restartMaxWaitMs = options.restartMaxWaitMs ?? 120_000;
+    this.cursorStaleMs = options.cursorStaleMs ?? 60_000;
     this.manageTradePartitions = options.manageTradePartitions ?? true;
     this.trackMaxAgeMs = options.config.trackMaxAgeHours * HOUR_MS;
     this.recentTrades = new BoundedSet<string>(options.dedupeCapacity ?? 50_000);
+    this.checkpoints = new RecorderCheckpointStore(options.db, options.instanceId);
     this.writer = new SerialBatchWriter(options.db, [TRADES_TABLE_SPEC], {
       flushIntervalMs: 1_000,
       flushAtRows: 2_000,
-      maxRetries: 6,
-      ...options.writerOptions
+      maxRetries: 40,
+      maxBackoffMs: 10_000,
+      ...options.writerOptions,
+      onInserted: (_table, rows) => this.countInserted(rows),
+      onDropped: (_table, rows) => this.markDropped(rows)
     });
+  }
+
+  get instanceId(): string {
+    return this.checkpoints.instance;
   }
 
   async start(): Promise<void> {
@@ -255,17 +342,15 @@ export class RecorderService {
     }
     this.running = true;
     this.stopping = false;
-    const loaded = await this.registry.load();
+    await this.registry.load();
+    await this.checkpoints.register(this.clock.nowMs());
     if (this.manageTradePartitions) {
       await this.ensurePartitions();
-    }
-    if (this.recordRestartGap && loaded > 0) {
-      await this.recordRestart();
     }
     this.unsubscribers = [
       this.bus.on("chain", (event) => this.handleChain(event)),
       this.bus.on("gap", (gap) => this.handleGap(gap)),
-      this.registry.onUntrack((launch) => this.aggregates.delete(launch.mint))
+      this.registry.onUntrack((launch) => this.forgetAggregate(launch))
     ];
     this.writer.start();
     this.scheduleAggregateFlush();
@@ -287,8 +372,17 @@ export class RecorderService {
     this.cancelTimers();
     this.wakeSleepers();
     await this.settleInflight();
-    await this.flush();
+    await this.finishRestartCheck();
+    const durable = this.durablePosition();
     await this.writer.stop();
+    await this.settleInflight();
+    await this.retryDurable();
+    await this.flushAggregates().catch((error: unknown) => log.error({ err: error }, "final aggregate flush failed"));
+    if (this.durableQueue.length === 0) {
+      await this.saveCheckpoint(durable, true);
+    } else {
+      log.error({ pending: this.durableQueue.length }, "stopping with unrecorded gaps; the next start will treat this stop as a crash");
+    }
     this.running = false;
     log.info({ stats: this.stats() }, "recorder stopped");
   }
@@ -304,6 +398,7 @@ export class RecorderService {
     if (this.stopping) {
       return;
     }
+    this.observePosition(event);
     if (event.kind === "create") {
       this.handleCreate(event);
       return;
@@ -312,7 +407,7 @@ export class RecorderService {
   };
 
   readonly handleGap = (gap: IngestGap): void => {
-    this.track(this.recordGap(gap, false));
+    this.track(this.recordGap({ gap, launchIds: null }));
   };
 
   async flushTrades(): Promise<void> {
@@ -351,6 +446,7 @@ export class RecorderService {
       tracked: this.registry.size,
       pendingLaunches: this.pending.size,
       queuedNow: this.queuedTotal,
+      gapsPending: this.durableQueue.length,
       aggregates: this.aggregates.size,
       aggregatesDirty: dirty,
       inflight: this.inflight.size,
@@ -381,6 +477,7 @@ export class RecorderService {
     if (dirty.length === 0) {
       return;
     }
+    await this.seedResumedWallets(dirty);
     const byLaunch = new Map<number, LaunchAggregate>();
     for (const aggregate of dirty) {
       byLaunch.set(aggregate.launchId, aggregate);
@@ -397,6 +494,21 @@ export class RecorderService {
       for (const delta of result.failed) {
         byLaunch.get(delta.launchId)?.restoreDelta(delta);
       }
+    }
+  }
+
+  private async seedResumedWallets(aggregates: readonly LaunchAggregate[]): Promise<void> {
+    const resumed = aggregates.filter((aggregate) => aggregate.needsWalletSeed);
+    if (resumed.length === 0) {
+      return;
+    }
+    try {
+      const wallets = await loadLaunchWallets(this.db, resumed.map((aggregate) => aggregate.launchId));
+      for (const aggregate of resumed) {
+        aggregate.seedWallets(wallets.get(aggregate.launchId) ?? []);
+      }
+    } catch (error) {
+      log.warn({ err: error, launches: resumed.length }, "could not load traders of resumed launches; unique traders stay a lower bound");
     }
   }
 
@@ -473,7 +585,6 @@ export class RecorderService {
     this.counters.tradesRecorded += 1;
     if (tracked.resumeSlot !== null && event.tx.slot <= tracked.resumeSlot) {
       this.counters.tradesReplayedBeforeResume += 1;
-      return;
     }
     this.aggregateFor(tracked).applyTrade(event, atMs);
   }
@@ -481,10 +592,160 @@ export class RecorderService {
   private aggregateFor(tracked: TrackedLaunch): LaunchAggregate {
     let aggregate = this.aggregates.get(tracked.mint);
     if (!aggregate || aggregate.launchId !== tracked.launchId) {
-      aggregate = new LaunchAggregate(tracked.launchId, tracked.mint, tracked.tokenTotalSupply);
+      if (aggregate) {
+        this.aggregatesById.delete(aggregate.launchId);
+      }
+      aggregate = new LaunchAggregate(tracked.launchId, tracked.mint, tracked.tokenTotalSupply, tracked.resumeSlot !== null);
       this.aggregates.set(tracked.mint, aggregate);
+      this.aggregatesById.set(tracked.launchId, aggregate);
     }
     return aggregate;
+  }
+
+  private forgetAggregate(launch: TrackedLaunch): void {
+    const aggregate = this.aggregates.get(launch.mint);
+    if (aggregate) {
+      this.aggregates.delete(launch.mint);
+      this.aggregatesById.delete(aggregate.launchId);
+    }
+  }
+
+  private countInserted(rows: readonly ReturnedRow[]): void {
+    for (const row of rows) {
+      this.aggregatesById.get(toNumber(row.launch_id))?.countInserted(row.is_buy === true);
+    }
+  }
+
+  private markDropped(rows: readonly Row[]): void {
+    const dropped = droppedTradesGap(rows);
+    if (!dropped) {
+      return;
+    }
+    this.counters.tradeWritesDropped += rows.length;
+    this.track(this.recordGap(dropped));
+  }
+
+  private observePosition(event: ChainEvent): void {
+    const position: StreamPosition = { slot: event.tx.slot, atMs: tradeBlockTimeMs(event) };
+    if (!this.firstPosition) {
+      this.firstPosition = position;
+      this.firstSeenAtMs = this.clock.nowMs();
+      if (this.recordRestartGap) {
+        this.legacyCoverage = this.checkpoints.legacyCoverage(position.slot).catch((error: unknown) => {
+          log.warn({ err: error }, "legacy restart baseline unavailable");
+          return null;
+        });
+        this.scheduleRestartCheck(this.firstSeenAtMs + this.restartCheckDelayMs);
+      } else {
+        this.restartChecked = true;
+      }
+    }
+    if (!this.lastPosition || position.slot >= this.lastPosition.slot) {
+      this.lastPosition = position;
+    }
+  }
+
+  private durablePosition(): StreamPosition | null {
+    let position = this.lastPosition;
+    for (const pending of this.pending.values()) {
+      const slot = pending.event.tx.slot - 1;
+      if (position && slot < position.slot) {
+        position = { slot, atMs: tradeBlockTimeMs(pending.event) };
+      }
+    }
+    return position;
+  }
+
+  private scheduleRestartCheck(atMs: number): void {
+    this.restartTimer = this.clock.schedule(atMs, () => {
+      this.restartTimer = null;
+      if (!this.stopping) {
+        this.track(this.checkRestart(false));
+      }
+    });
+  }
+
+  private async finishRestartCheck(): Promise<void> {
+    if (this.restartTimer) {
+      this.clock.cancel(this.restartTimer);
+      this.restartTimer = null;
+    }
+    if (!this.restartChecked && this.firstPosition) {
+      await this.checkRestart(true);
+    }
+  }
+
+  private async checkRestart(final: boolean): Promise<void> {
+    const first = this.firstPosition;
+    if (!first || this.restartChecked) {
+      return;
+    }
+    const nowMs = this.clock.nowMs();
+    let coverage: PredecessorCoverage | null;
+    try {
+      coverage = await this.checkpoints.checkpointCoverage(first.slot, nowMs - this.cursorStaleMs);
+      if (coverage.source === "none" && coverage.liveInstances === 0) {
+        coverage = await this.legacyCoverage;
+      }
+    } catch (error) {
+      this.counters.checkpointErrors += 1;
+      log.error({ err: error }, "restart coverage check failed");
+      if (!final) {
+        this.scheduleRestartCheck(nowMs + this.restartCheckDelayMs);
+      }
+      return;
+    }
+    if (this.restartChecked) {
+      return;
+    }
+    if (!coverage) {
+      if (!final) {
+        this.scheduleRestartCheck(nowMs + this.restartCheckDelayMs);
+      }
+      return;
+    }
+    const covered = coverage.slot !== null && coverage.slot >= first.slot - CONTIGUOUS_SLOT_TOLERANCE;
+    if (coverage.source === "none" || covered) {
+      this.restartChecked = true;
+      this.counters.restartsCovered += 1;
+      log.info({ firstSlot: first.slot, coveredTo: coverage.slot, source: coverage.source }, "stream start is covered by the previous recorder");
+      return;
+    }
+    if (!final && coverage.liveInstances > 0 && nowMs - this.firstSeenAtMs < this.restartMaxWaitMs) {
+      this.scheduleRestartCheck(nowMs + this.restartCheckDelayMs);
+      return;
+    }
+    this.restartChecked = true;
+    this.counters.restartGaps += 1;
+    const gap: IngestGap = {
+      source: "recorder",
+      fromSlot: coverage.slot,
+      toSlot: first.slot,
+      startedAtMs: Math.min(coverage.atMs ?? first.atMs, first.atMs),
+      endedAtMs: first.atMs,
+      reason: RESTART_GAP_REASON
+    };
+    log.warn({ gap, source: coverage.source }, "slots between the previous recorder and this one were not recorded");
+    await this.recordGap({ gap, launchIds: null });
+  }
+
+  private async saveCheckpoint(durable: StreamPosition | null, stopped: boolean): Promise<void> {
+    try {
+      await this.checkpoints.save(this.firstPosition, durable, this.clock.nowMs(), stopped);
+    } catch (error) {
+      this.counters.checkpointErrors += 1;
+      log.error({ err: error }, "failed to save recorder checkpoint");
+    }
+  }
+
+  private async persistProgress(): Promise<void> {
+    const durable = this.durablePosition();
+    await this.writer.flush();
+    await this.retryDurable();
+    await this.flushAggregates();
+    if (this.durableQueue.length === 0) {
+      await this.saveCheckpoint(durable, false);
+    }
   }
 
   private attachLaunchId(mint: Pubkey, launchId: number): void {
@@ -577,67 +838,53 @@ export class RecorderService {
     }
   }
 
-  private async recordRestart(): Promise<void> {
-    const result = await this.db.query<{ slot: unknown; at: Date | null }>(
-      `SELECT max(last_trade_slot) AS slot, max(GREATEST(last_trade_at, created_at)) AS at
-         FROM launches WHERE tracking_ended_at IS NULL`
-    );
-    const row = result.rows[0];
-    const now = this.clock.nowMs();
-    await this.recordGap(
-      {
-        source: "recorder",
-        fromSlot: toNullableNumber(row?.slot),
-        toSlot: null,
-        startedAtMs: row?.at ? row.at.getTime() : now,
-        endedAtMs: now,
-        reason: "restart"
-      },
-      true
-    );
-  }
-
-  private markMemoryIncomplete(gap: IngestGap, allTracked: boolean): void {
+  private markMemoryIncomplete(entry: DurableGap): void {
+    const ids = entry.launchIds ? new Set(entry.launchIds) : null;
     for (const launch of this.market.all()) {
-      const affected = allTracked
-        ? this.registry.isTracked(launch.mint)
-        : gap.fromSlot !== null
-          ? launch.info.createdSlot <= gap.fromSlot
-          : launch.info.createdAtMs <= gap.endedAtMs;
+      const affected = ids ? launch.launchId !== null && ids.has(launch.launchId) : gapAffectsLaunch(entry.gap, launch);
       if (affected) {
         launch.dataComplete = false;
       }
     }
   }
 
-  private async recordGap(gap: IngestGap, allTracked: boolean): Promise<void> {
-    this.markMemoryIncomplete(gap, allTracked);
-    const affectedCondition = allTracked
-      ? "tracking_ended_at IS NULL"
-      : `(CASE WHEN $2::bigint IS NOT NULL THEN create_slot <= $2::bigint ELSE created_at <= $5 END)
-         AND (tracking_ended_at IS NULL OR tracking_ended_at >= $4)`;
+  private async recordGap(entry: DurableGap): Promise<void> {
+    this.markMemoryIncomplete(entry);
+    if (!(await this.writeGap(entry))) {
+      this.durableQueue.push(entry);
+    }
+  }
+
+  private async writeGap(entry: DurableGap): Promise<boolean> {
+    const { gap, launchIds } = entry;
+    const params: unknown[] = [
+      gap.source,
+      gap.fromSlot,
+      gap.toSlot,
+      new Date(gap.startedAtMs),
+      new Date(Math.max(gap.endedAtMs, gap.startedAtMs)),
+      cleanText(gap.reason, 500)
+    ];
+    if (launchIds) {
+      params.push(launchIds.map(String));
+    }
     try {
-      await this.db.query(
-        `WITH affected AS (
-           UPDATE launches SET data_complete = false
-            WHERE data_complete AND ${affectedCondition}
-            RETURNING 1
-         )
-         INSERT INTO ingest_gaps (source, from_slot, to_slot, started_at, ended_at, reason, affected_launches)
-         SELECT $1, $2::bigint, $3::bigint, $4, $5, $6, (SELECT count(*)::int FROM affected)`,
-        [
-          gap.source,
-          gap.fromSlot,
-          gap.toSlot,
-          new Date(gap.startedAtMs),
-          new Date(Math.max(gap.endedAtMs, gap.startedAtMs)),
-          cleanText(gap.reason, 500)
-        ]
-      );
+      await this.db.query(gapSql(launchIds ? "id = ANY($7::bigint[])" : GENERAL_GAP_CONDITION), params);
       this.counters.gapsRecorded += 1;
+      return true;
     } catch (error) {
       this.counters.gapErrors += 1;
-      log.error({ err: error, gap }, "failed to record ingest gap");
+      log.error({ err: error, gap }, "failed to record ingest gap, will retry");
+      return false;
+    }
+  }
+
+  private async retryDurable(): Promise<void> {
+    const queued = this.durableQueue.splice(0, this.durableQueue.length);
+    for (const entry of queued) {
+      if (!(await this.writeGap(entry))) {
+        this.durableQueue.push(entry);
+      }
     }
   }
 
@@ -657,9 +904,9 @@ export class RecorderService {
         return;
       }
       try {
-        await this.flushAggregates();
+        await this.persistProgress();
       } catch (error) {
-        log.error({ err: error }, "aggregate flush crashed");
+        log.error({ err: error }, "recorder persistence tick failed");
       }
       if (!this.stopping) {
         this.scheduleAggregateFlush();
@@ -681,6 +928,10 @@ export class RecorderService {
   }
 
   private cancelTimers(): void {
+    if (this.restartTimer) {
+      this.clock.cancel(this.restartTimer);
+      this.restartTimer = null;
+    }
     if (this.aggregateTimer) {
       this.clock.cancel(this.aggregateTimer);
       this.aggregateTimer = null;

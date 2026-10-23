@@ -57,7 +57,7 @@ export async function resumeOrCreateRun(
 export async function loadOpenPositions(db: Db, runId: number): Promise<Position[]> {
   const result = await db.query<Record<string, unknown>>(
     `SELECT ${POSITION_COLUMNS.join(", ")} FROM positions
-      WHERE run_id = $1 AND status = 'open'
+      WHERE run_id = $1 AND status IN ('open', 'pending')
       ORDER BY opened_at, id`,
     [runId]
   );
@@ -66,7 +66,7 @@ export async function loadOpenPositions(db: Db, runId: number): Promise<Position
 
 export async function countOpenPositions(db: Db, mode: TradingMode | null): Promise<number> {
   const result = await db.query<{ open: number }>(
-    `SELECT count(*)::int AS open FROM positions WHERE status = 'open' AND ($1::text IS NULL OR mode = $1)`,
+    `SELECT count(*)::int AS open FROM positions WHERE status IN ('open', 'pending') AND ($1::text IS NULL OR mode = $1)`,
     [mode]
   );
   return result.rows[0]?.open ?? 0;

@@ -216,6 +216,19 @@ describe("slippage", () => {
     expect(outcome.fillPrice).toBeNull();
   });
 
+  it("refuses a retry whose quote already breaks the slippage bound before sending, like the live guard, and skips the failure draw", () => {
+    const config = execConfig({ failureRate: 1 });
+    const beyondBound = order({ referencePrice: spotPrice(initialReserves()) * 0.5, maxSlippageBps: 1500 });
+    const retry = attempt({ config, order: beyondBound, attempt: 1 });
+    expect(retry.error).toBe("slippage_exceeded");
+    expect(retry.sent).toBe(false);
+    expect(retry.networkFee).toBe(0n);
+    expect(retry.tip).toBe(0n);
+    const firstAttempt = attempt({ config, order: beyondBound, attempt: 0 });
+    expect(firstAttempt.error).toBe("tx_failed");
+    expect(firstAttempt.networkFee).toBe(BigInt(config.baseFeeLamports + config.priorityFeeLamports));
+  });
+
   it("accepts a fill exactly at the limit and reports price improvement as negative slippage", () => {
     const probe = attempt({ order: order({ maxSlippageBps: 10_000 }) });
     const slip = probe.slippageBps ?? 0;
@@ -243,7 +256,8 @@ describe("slippage", () => {
     expect(remainingSlippageBps("buy", 1500, 1600)).toBeNull();
     expect(remainingSlippageBps("buy", 1500, 0)).toBe(Math.floor((0.15 / 1.15) * 10_000));
     expect(remainingSlippageBps("sell", 2000, 500)).toBe(Math.floor((0.15 / 0.95) * 10_000));
-    expect(remainingSlippageBps("sell", 2000, -1000)).toBe(Math.floor((0.3 / 1.1) * 10_000));
+    expect(remainingSlippageBps("sell", 2000, -1000)).toBe(2000);
+    expect(remainingSlippageBps("buy", 1500, -5000)).toBe(1500);
     expect(remainingSlippageBps("sell", 10_000, 10_000)).toBe(10_000);
     expect(remainingSlippageBps("sell", 9_000, 10_000)).toBeNull();
     const buyBound = (1 + 0.05) * (1 + (remainingSlippageBps("buy", 1500, 500) ?? 0) / 10_000);
@@ -323,6 +337,13 @@ describe("venues", () => {
     expect(outcome.networkFee).toBeGreaterThan(0n);
     expect(outcome.trade).toBeNull();
     expect(attempt({ view: curveView({ venue: "curve_post_complete" }) }).error).toBe("curve_complete");
+  });
+
+  it("refuses a retry on a completed curve locally without charging it, like the live builder", () => {
+    const retry = attempt({ view: curveView({ complete: true }), attempt: 2 });
+    expect(retry.error).toBe("curve_complete");
+    expect(retry.sent).toBe(false);
+    expect(retry.networkFee).toBe(0n);
   });
 
   it("refuses to price a migrated coin until pool reserves are known", () => {

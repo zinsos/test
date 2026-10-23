@@ -25,7 +25,7 @@ export interface AggregateDelta {
   trades: number;
   buys: number;
   sells: number;
-  newTraders: number;
+  walletsSeen: number;
   last: LastTrade | null;
   peak: PeakPoint | null;
   completedAtMs: number | null;
@@ -52,7 +52,6 @@ export class LaunchAggregate {
   private trades = 0;
   private buys = 0;
   private sells = 0;
-  private newTraders = 0;
   private readonly wallets = new Set<Pubkey>();
   private last: LastTrade | null = null;
   private peak: PeakPoint | null = null;
@@ -66,23 +65,25 @@ export class LaunchAggregate {
   constructor(
     readonly launchId: number,
     readonly mint: Pubkey,
-    private readonly tokenTotalSupply: bigint
+    private readonly tokenTotalSupply: bigint,
+    public needsWalletSeed = false
   ) {}
 
   get walletCount(): number {
     return this.wallets.size;
   }
 
-  applyTrade(event: TradeEvent, atMs: number): void {
-    this.trades += 1;
-    if (event.isBuy) {
-      this.buys += 1;
-    } else {
-      this.sells += 1;
+  seedWallets(wallets: Iterable<Pubkey>): void {
+    for (const wallet of wallets) {
+      this.wallets.add(wallet);
     }
+    this.needsWalletSeed = false;
+  }
+
+  applyTrade(event: TradeEvent, atMs: number): void {
     if (!this.wallets.has(event.wallet)) {
       this.wallets.add(event.wallet);
-      this.newTraders += 1;
+      this.dirty = true;
     }
     const candidate: LastTrade = {
       atMs,
@@ -103,6 +104,16 @@ export class LaunchAggregate {
     }
     if (event.venue === "pool" && event.pool && !this.pool) {
       this.pool = event.pool;
+    }
+    this.dirty = true;
+  }
+
+  countInserted(isBuy: boolean): void {
+    this.trades += 1;
+    if (isBuy) {
+      this.buys += 1;
+    } else {
+      this.sells += 1;
     }
     this.dirty = true;
   }
@@ -130,7 +141,7 @@ export class LaunchAggregate {
       trades: this.trades,
       buys: this.buys,
       sells: this.sells,
-      newTraders: this.newTraders,
+      walletsSeen: this.wallets.size,
       last: this.last,
       peak: this.peak,
       completedAtMs: this.completedAtMs,
@@ -142,7 +153,6 @@ export class LaunchAggregate {
     this.trades = 0;
     this.buys = 0;
     this.sells = 0;
-    this.newTraders = 0;
     this.dirty = false;
     return delta;
   }
@@ -151,7 +161,6 @@ export class LaunchAggregate {
     this.trades += delta.trades;
     this.buys += delta.buys;
     this.sells += delta.sells;
-    this.newTraders += delta.newTraders;
     this.dirty = true;
   }
 }
@@ -179,7 +188,7 @@ const AGGREGATE_CASTS = [
 ] as const;
 
 const AGGREGATE_COLUMNS =
-  "id, trade_delta, buy_delta, sell_delta, new_traders, last_at, last_slot, last_vt, last_vq, last_rt, last_rq, peak, peak_at, peak_slot, completed_at, completed_slot, migrated_at, migrated_slot, pool";
+  "id, trade_delta, buy_delta, sell_delta, wallets_seen, last_at, last_slot, last_vt, last_vq, last_rt, last_rq, peak, peak_at, peak_slot, completed_at, completed_slot, migrated_at, migrated_slot, pool";
 
 const NEWER_LAST = "(v.last_slot IS NOT NULL AND (l.last_trade_slot IS NULL OR v.last_slot >= l.last_trade_slot))";
 const HIGHER_PEAK = "(v.peak IS NOT NULL AND (l.peak_mcap_quote IS NULL OR v.peak > l.peak_mcap_quote))";
@@ -188,7 +197,7 @@ const AGGREGATE_SET = `
   trade_count = l.trade_count + v.trade_delta,
   buy_count = l.buy_count + v.buy_delta,
   sell_count = l.sell_count + v.sell_delta,
-  unique_traders = l.unique_traders + v.new_traders,
+  unique_traders = GREATEST(l.unique_traders, v.wallets_seen),
   last_trade_at = CASE WHEN ${NEWER_LAST} THEN v.last_at ELSE l.last_trade_at END,
   last_trade_slot = CASE WHEN ${NEWER_LAST} THEN v.last_slot ELSE l.last_trade_slot END,
   last_virtual_token = CASE WHEN ${NEWER_LAST} THEN v.last_vt ELSE l.last_virtual_token END,
@@ -210,7 +219,7 @@ function deltaRow(delta: AggregateDelta): unknown[] {
     delta.trades,
     delta.buys,
     delta.sells,
-    delta.newTraders,
+    delta.walletsSeen,
     dateOrNull(delta.last?.atMs ?? null),
     delta.last?.slot ?? null,
     delta.last?.virtualToken ?? null,
@@ -234,6 +243,24 @@ export interface AggregateWriteResult {
   updated: number;
   failed: AggregateDelta[];
   error: unknown;
+}
+
+export async function loadLaunchWallets(db: Db, launchIds: readonly number[]): Promise<Map<number, Pubkey[]>> {
+  const wallets = new Map<number, Pubkey[]>();
+  if (launchIds.length === 0) {
+    return wallets;
+  }
+  const result = await db.query<{ launch_id: unknown; wallet: string }>(
+    "SELECT DISTINCT launch_id, wallet FROM trades WHERE launch_id = ANY($1::bigint[])",
+    [launchIds.map(String)]
+  );
+  for (const row of result.rows) {
+    const launchId = Number(row.launch_id);
+    const list = wallets.get(launchId) ?? [];
+    list.push(row.wallet);
+    wallets.set(launchId, list);
+  }
+  return wallets;
 }
 
 export async function writeAggregateDeltas(db: Db, deltas: readonly AggregateDelta[]): Promise<AggregateWriteResult> {

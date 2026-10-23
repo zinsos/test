@@ -1,7 +1,7 @@
 import type { ExecutionConfig, ExitConfig } from "../config/strategy.js";
 import type { Bus } from "../core/bus.js";
 import type { Clock, TimerHandle } from "../core/clock.js";
-import { SOL_QUOTE } from "../core/constants.js";
+import { MAX_BLOCKHASH_AGE_MS, SLOT_MS, SOL_QUOTE } from "../core/constants.js";
 import type { Executor, MarketDataSource, RiskGate, TradingStore } from "../core/contracts.js";
 import { moduleLogger } from "../core/logger.js";
 import type {
@@ -14,7 +14,8 @@ import type {
   Signal,
   TradingMode
 } from "../core/types.js";
-import { failedFill } from "../execution/fill.js";
+import { failedFill, sentAtMsOf, UNCONFIRMED_ERROR, withEarlierAttempts } from "../execution/fill.js";
+import type { RefusalCode } from "../execution/instructions.js";
 import { awaitingMigration, evaluateExit } from "../exits/engine.js";
 import { planChunk } from "../exits/liquidity.js";
 import { isUsablePrice } from "../exits/math.js";
@@ -26,21 +27,26 @@ import {
   applySellFill,
   closedTradeOf,
   closePosition,
+  externalExitFill,
   failedEntryPosition,
   isDust,
   openPositionFromFill,
   sellOrderFor,
   syntheticCloseFill,
   unrealizedPnlOf,
+  walletBalanceEntryFill,
   type PositionSeed,
   type SellIntent
 } from "./accounting.js";
 import { entryKey, orderKeyOf, positionIdFor, shadowIdFor, shadowKeyFor, withNextFillSeq } from "./ids.js";
+import { openPendingPosition, pendingEntryOf, pendingEntryPosition, type PendingEntry } from "./pending.js";
 
 const log = moduleLogger("trader");
 
 export const KILL_SWITCH_REASON = "kill_switch";
 export const INCOMPLETE_DATA_REASON = "incomplete_data";
+const NO_BALANCE_REFUSAL: RefusalCode = "no_balance";
+const WALLET_EMPTY_MIN_AGE_MS = 30_000;
 
 export type FillReconciler = (order: OrderRequest, signature: string) => Promise<FillResult | null>;
 
@@ -93,6 +99,7 @@ export interface TraderStats {
   closed: number;
   unpricedEvaluations: number;
   unconfirmedFills: number;
+  externalExits: number;
 }
 
 interface Slot {
@@ -100,6 +107,7 @@ interface Slot {
   executor: Executor;
   primary: boolean;
   sellInFlight: boolean;
+  walletCheck: boolean;
 }
 
 interface EntryContext {
@@ -111,6 +119,7 @@ interface EntryContext {
   signalSettled: boolean;
   pending: number;
   closed: Map<string, Position>;
+  pendingRow: Position | null;
 }
 
 function sameExitState(a: Position, b: Position): boolean {
@@ -155,10 +164,13 @@ export class Trader {
   private readonly byMint = new Map<Pubkey, Set<string>>();
   private readonly entries = new Map<string, EntryContext>();
   private readonly pendingMints = new Map<Pubkey, number>();
+  private readonly resuming = new Set<string>();
   private readonly tasks = new Set<Promise<unknown>>();
   private unsubscribers: Array<() => void> = [];
   private timer: TimerHandle | null = null;
   private running = false;
+  private halted = false;
+  private stopped = false;
   private readonly counters = {
     signals: 0,
     skipped: 0,
@@ -172,7 +184,8 @@ export class Trader {
     sellsFailed: 0,
     closed: 0,
     unpricedEvaluations: 0,
-    unconfirmedFills: 0
+    unconfirmedFills: 0,
+    externalExits: 0
   };
 
   constructor(options: TraderOptions) {
@@ -198,7 +211,7 @@ export class Trader {
   }
 
   start(): void {
-    if (this.running) {
+    if (this.running || this.halted) {
       return;
     }
     this.running = true;
@@ -209,10 +222,11 @@ export class Trader {
     this.ensureTimer();
   }
 
-  async stop(): Promise<void> {
-    if (!this.running) {
+  halt(): void {
+    if (this.halted) {
       return;
     }
+    this.halted = true;
     this.running = false;
     for (const unsubscribe of this.unsubscribers) {
       unsubscribe();
@@ -222,6 +236,15 @@ export class Trader {
       this.clock.cancel(this.timer);
       this.timer = null;
     }
+    this.executor.halt?.();
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopped) {
+      return;
+    }
+    this.stopped = true;
+    this.halt();
     if (!this.clock.virtual) {
       await this.waitForTasks(this.stopWaitMs);
     }
@@ -235,7 +258,14 @@ export class Trader {
   restore(positions: readonly Position[]): number {
     let restored = 0;
     for (const position of positions) {
-      if (position.status !== "open" || this.slots.has(position.id)) {
+      if (this.slots.has(position.id) || this.resuming.has(position.id)) {
+        continue;
+      }
+      if (position.status === "pending") {
+        restored += this.resumePendingEntry(position) ? 1 : 0;
+        continue;
+      }
+      if (position.status !== "open") {
         continue;
       }
       const primary = position.shadowOf === null;
@@ -244,9 +274,11 @@ export class Trader {
         log.warn({ positionId: position.id }, "shadow position restored without a shadow executor, left untouched");
         continue;
       }
-      this.addSlot({ position, executor, primary, sellInFlight: false });
+      const slot: Slot = { position, executor, primary, sellInFlight: false, walletCheck: false };
+      this.addSlot(slot);
       if (primary) {
         this.risk.onPositionOpened(position);
+        this.verifyWalletHoldings(slot);
       }
       restored += 1;
     }
@@ -270,7 +302,8 @@ export class Trader {
       devWallet: launch.info.devWallet,
       signal,
       nowMs,
-      openPositions: this.primaryPositions()
+      openPositions: this.primaryPositions(),
+      pendingMints: [...this.pendingMints.keys()]
     });
     if (!decision.allowed) {
       this.counters.rejectedByRisk += 1;
@@ -312,13 +345,11 @@ export class Trader {
     const nowMs = this.clock.nowMs();
     let closed = 0;
     for (const slot of [...this.slots.values()]) {
-      if (slot.sellInFlight) {
+      if (slot.sellInFlight || slot.walletCheck) {
         continue;
       }
-      const launch = this.market.launch(slot.position.mint);
       const view = this.market.view(slot.position.mint);
-      const spot = launch?.price() ?? 0;
-      const price = isUsablePrice(spot) ? spot : slot.position.lastPrice;
+      const price = this.markPrice(slot.position);
       const { order, fill } = syntheticCloseFill(slot.position, view, price, this.execution, nowMs, reason, orderKeyOf(slot.position));
       this.applySell(slot, order, fill);
       closed += 1;
@@ -332,11 +363,19 @@ export class Trader {
   }
 
   isBusy(): boolean {
-    return this.slots.size > 0 || this.pendingMints.size > 0;
+    if (this.pendingMints.size > 0) {
+      return true;
+    }
+    for (const slot of this.slots.values()) {
+      if (slot.primary) {
+        return true;
+      }
+    }
+    return false;
   }
 
   inFlightCount(): number {
-    let count = 0;
+    let count = this.resuming.size;
     for (const entry of this.entries.values()) {
       count += entry.pending;
     }
@@ -373,7 +412,7 @@ export class Trader {
         sellsInFlight += 1;
       }
     }
-    let pendingEntries = 0;
+    let pendingEntries = this.resuming.size;
     for (const entry of this.entries.values()) {
       pendingEntries += entry.pending;
     }
@@ -433,12 +472,16 @@ export class Trader {
       signalId: null,
       signalSettled: false,
       pending: 0,
-      closed: new Map()
+      closed: new Map(),
+      pendingRow: null
     };
     this.entries.set(key, entry);
     this.pendingMints.set(signal.mint, (this.pendingMints.get(signal.mint) ?? 0) + 1);
     this.counters.entriesAttempted += 1;
     this.recordActedSignal(entry);
+    if (this.mode === "live") {
+      this.persistPendingEntry(entry, order, nowMs);
+    }
     this.launchEntry(entry, this.executor, order, true);
     if (this.shadowExecutor) {
       this.launchEntry(entry, this.shadowExecutor, { ...order, positionId: shadowKeyFor(key) }, false);
@@ -458,8 +501,27 @@ export class Trader {
     );
   }
 
+  private persistPendingEntry(entry: EntryContext, order: OrderRequest, nowMs: number): void {
+    entry.pendingRow = pendingEntryPosition(this.seedFor(entry, order, true, nowMs), order, this.entrySettleAfterMs(order));
+    this.store.savePosition(entry.pendingRow);
+    this.track(this.store.flush());
+  }
+
+  private entrySettleAfterMs(order: OrderRequest): number {
+    const { maxRetries, fillTimeoutMs, retryDelaySlots } = this.execution;
+    return order.signalAtMs + (maxRetries + 1) * fillTimeoutMs + maxRetries * retryDelaySlots * SLOT_MS + MAX_BLOCKHASH_AGE_MS;
+  }
+
   private async runEntry(entry: EntryContext, executor: Executor, order: OrderRequest, primary: boolean): Promise<void> {
-    const fill = await this.settleUnconfirmed(order, await this.executeSafely(executor, order));
+    const settled = await this.settleUnconfirmed(order, await this.executeSafely(executor, order));
+    const fill = primary ? await this.resolveUnknownEntry(order, executor, settled, sentAtMsOf(settled) + MAX_BLOCKHASH_AGE_MS) : settled;
+    if (!fill) {
+      log.error(
+        { mint: order.mint, signature: settled.signature },
+        "trader halted before the live buy outcome was known; the pending position is resolved from the wallet on the next start"
+      );
+      return;
+    }
     try {
       this.finishEntry(entry, executor, order, fill, primary);
     } catch (error) {
@@ -488,9 +550,13 @@ export class Trader {
   private finishEntry(entry: EntryContext, executor: Executor, order: OrderRequest, fill: FillResult, primary: boolean): void {
     const nowMs = this.clock.nowMs();
     const seed = this.seedFor(entry, order, primary, nowMs);
+    const hadPendingRow = primary && entry.pendingRow !== null;
+    if (primary) {
+      entry.pendingRow = null;
+    }
     if (fill.success && fill.tokenAmount > 0n) {
       const position = withNextFillSeq(openPositionFromFill(seed, fill));
-      this.addSlot({ position, executor, primary, sellInFlight: false });
+      this.addSlot({ position, executor, primary, sellInFlight: false, walletCheck: false });
       this.store.savePosition(position);
       this.store.recordFill(position, order, fill);
       if (primary) {
@@ -503,7 +569,7 @@ export class Trader {
       this.ensureTimer();
       return;
     }
-    this.failEntry(entry, seed, order, fill, primary, nowMs);
+    this.failEntry(entry, seed, order, fill, primary, nowMs, hadPendingRow);
   }
 
   private failEntry(
@@ -512,7 +578,8 @@ export class Trader {
     order: OrderRequest,
     fill: FillResult,
     primary: boolean,
-    nowMs: number
+    nowMs: number,
+    hadPendingRow: boolean
   ): void {
     if (primary) {
       this.counters.entriesFailed += 1;
@@ -521,6 +588,9 @@ export class Trader {
     const failed = withNextFillSeq(failedEntryPosition(seed, fill));
     log.info({ mint: order.mint, primary, error: fill.error?.slice(0, 120) ?? null, cost: failed.entryCost.toString() }, "entry not filled");
     if (failed.entryCost <= 0n) {
+      if (hadPendingRow) {
+        this.store.discardPendingPosition?.(failed.id);
+      }
       return;
     }
     entry.closed.set(failed.id, failed);
@@ -570,6 +640,10 @@ export class Trader {
     entry.signalSettled = true;
     entry.signalId = signalId;
     if (signalId !== null) {
+      if (entry.pendingRow && entry.pendingRow.signalId === null) {
+        entry.pendingRow = { ...entry.pendingRow, signalId };
+        this.store.savePosition(entry.pendingRow);
+      }
       const primaryId = positionIdFor(this.runId, entry.key);
       for (const id of [primaryId, shadowIdFor(primaryId)]) {
         const slot = this.slots.get(id);
@@ -612,23 +686,168 @@ export class Trader {
   }
 
   private async settleUnconfirmed(order: OrderRequest, fill: FillResult): Promise<FillResult> {
-    if (fill.success || fill.error !== "unconfirmed" || !fill.signature || !this.reconcile) {
+    if (fill.success || fill.error !== UNCONFIRMED_ERROR || !fill.signature || !this.reconcile) {
       return fill;
     }
     this.counters.unconfirmedFills += 1;
-    for (let attempt = 0; attempt < this.reconcileAttempts; attempt += 1) {
+    for (let attempt = 0; attempt < this.reconcileAttempts && !this.halted; attempt += 1) {
       await this.clock.sleepUntil(this.clock.nowMs() + this.reconcileIntervalMs);
       try {
         const resolved = await this.reconcile(order, fill.signature);
         if (resolved) {
-          return resolved;
+          return withEarlierAttempts(resolved, fill.attempts);
         }
       } catch (error) {
         log.warn({ err: error, signature: fill.signature }, "reconcile failed, will retry");
       }
     }
-    log.error({ signature: fill.signature, mint: order.mint, side: order.side }, "fill outcome still unknown; check the hot wallet");
+    log.error({ signature: fill.signature, mint: order.mint, side: order.side }, "fill outcome still unknown after reconciling; checking the wallet balance");
     return fill;
+  }
+
+  private async resolveUnknownEntry(order: OrderRequest, executor: Executor, fill: FillResult, notBeforeMs: number): Promise<FillResult | null> {
+    if (fill.success || fill.error !== UNCONFIRMED_ERROR || !executor.tokenBalance) {
+      return fill;
+    }
+    const balance = await this.walletBalanceAfter(executor, order.mint, notBeforeMs);
+    if (balance === null) {
+      return null;
+    }
+    if (!this.holdsTokens(order.mint, balance)) {
+      log.warn({ mint: order.mint, signature: fill.signature }, "unconfirmed live buy did not land: the wallet holds none of the token");
+      return fill;
+    }
+    log.warn(
+      { mint: order.mint, signature: fill.signature, tokens: balance.toString() },
+      "unconfirmed live buy landed: the wallet balance becomes the position, its cost is estimated at the full budget"
+    );
+    return walletBalanceEntryFill(order, fill, balance, this.execution);
+  }
+
+  private async walletBalanceAfter(executor: Executor, mint: Pubkey, notBeforeMs: number): Promise<bigint | null> {
+    if (notBeforeMs > this.clock.nowMs() && !this.halted) {
+      await this.clock.sleepUntil(notBeforeMs);
+    }
+    for (;;) {
+      if (this.halted) {
+        return null;
+      }
+      const balance = await this.readWalletBalance(executor, mint);
+      if (balance !== null) {
+        return balance;
+      }
+      await this.clock.sleepUntil(this.clock.nowMs() + this.reconcileIntervalMs);
+    }
+  }
+
+  private async readWalletBalance(executor: Executor, mint: Pubkey): Promise<bigint | null> {
+    if (!executor.tokenBalance) {
+      return null;
+    }
+    try {
+      return await executor.tokenBalance(mint);
+    } catch (error) {
+      log.warn({ err: error, mint }, "wallet token balance lookup failed");
+      return null;
+    }
+  }
+
+  private holdsTokens(mint: Pubkey, tokens: bigint): boolean {
+    return !isDust(tokens, this.market.launch(mint)?.price() ?? 0, this.dustLamports);
+  }
+
+  private resumePendingEntry(position: Position): boolean {
+    const pending = pendingEntryOf(position);
+    if (!pending || position.shadowOf !== null || !this.executor.tokenBalance) {
+      log.error({ positionId: position.id, mint: position.mint }, "pending live entry cannot be resolved here; check the hot wallet for this mint");
+      return false;
+    }
+    this.resuming.add(position.id);
+    this.pendingMints.set(position.mint, (this.pendingMints.get(position.mint) ?? 0) + 1);
+    this.track(
+      this.resolvePendingEntry(position, pending).finally(() => {
+        this.resuming.delete(position.id);
+        this.releasePendingMint(position.mint);
+      })
+    );
+    return true;
+  }
+
+  private async resolvePendingEntry(position: Position, pending: PendingEntry): Promise<void> {
+    const venue = this.market.view(position.mint)?.venue ?? "curve";
+    const unresolved = failedFill(pending.order, UNCONFIRMED_ERROR, [], venue);
+    const fill = await this.resolveUnknownEntry(pending.order, this.executor, unresolved, pending.settleAfterMs);
+    if (!fill) {
+      return;
+    }
+    if (!fill.success) {
+      this.risk.releaseEntry?.(position.mint, this.clock.nowMs());
+      this.store.discardPendingPosition?.(position.id);
+      return;
+    }
+    const opened = withNextFillSeq(openPendingPosition(position, fill));
+    this.addSlot({ position: opened, executor: this.executor, primary: true, sellInFlight: false, walletCheck: false });
+    this.store.savePosition(opened);
+    this.store.recordFill(opened, pending.order, fill);
+    this.counters.entriesFilled += 1;
+    this.risk.onPositionOpened(opened);
+    this.bus.emit("positionOpened", opened);
+    this.ensureTimer();
+  }
+
+  private verifyWalletHoldings(slot: Slot): void {
+    if (!slot.executor.tokenBalance) {
+      return;
+    }
+    slot.walletCheck = true;
+    this.track(
+      this.readWalletBalance(slot.executor, slot.position.mint).then((balance) => {
+        slot.walletCheck = false;
+        if (balance !== null && this.slots.get(slot.position.id) === slot) {
+          this.reconcileWalletBalance(slot, balance, this.clock.nowMs());
+        }
+      })
+    );
+  }
+
+  private async walletBalanceAfterSell(slot: Slot, fill: FillResult): Promise<bigint | null> {
+    if (!slot.primary || fill.success || this.halted) {
+      return null;
+    }
+    if (fill.error === NO_BALANCE_REFUSAL) {
+      return slot.executor.tokenBalance ? this.readWalletBalance(slot.executor, slot.position.mint) : 0n;
+    }
+    return fill.error === UNCONFIRMED_ERROR ? this.readWalletBalance(slot.executor, slot.position.mint) : null;
+  }
+
+  private reconcileWalletBalance(slot: Slot, balance: bigint, nowMs: number): void {
+    const position = slot.position;
+    if (position.status !== "open" || balance >= position.tokensHeld) {
+      return;
+    }
+    if (balance <= 0n && nowMs - position.openedAtMs < WALLET_EMPTY_MIN_AGE_MS) {
+      return;
+    }
+    const missing = position.tokensHeld - (balance > 0n ? balance : 0n);
+    const view = this.market.view(position.mint);
+    const { order, fill } = externalExitFill(position, missing, view, this.markPrice(position), this.execution, nowMs, orderKeyOf(position));
+    this.counters.externalExits += 1;
+    log.warn(
+      {
+        positionId: position.id,
+        mint: position.mint,
+        tokensHeld: position.tokensHeld.toString(),
+        walletTokens: balance.toString(),
+        estimatedProceeds: fill.userQuote.toString()
+      },
+      "wallet holds fewer tokens than the position; the difference is booked as an external exit at the current quote"
+    );
+    this.applySell(slot, order, fill);
+  }
+
+  private markPrice(position: Position): number {
+    const spot = this.market.launch(position.mint)?.price() ?? 0;
+    return isUsablePrice(spot) ? spot : position.lastPrice;
   }
 
   private onChain(event: ChainEvent): void {
@@ -679,6 +898,7 @@ export class Trader {
       return;
     }
     const price = launch.price();
+    const busy = slot.sellInFlight || slot.walletCheck;
     const decision = evaluateExit({
       position,
       view,
@@ -687,7 +907,7 @@ export class Trader {
       events: this.eventsFor(position),
       config: this.exits,
       execution: this.execution,
-      sellInFlight: slot.sellInFlight,
+      sellInFlight: busy,
       migratedSlot: launch.migratedSlot
     });
     const updated = applyExitUpdates(position, decision.updates);
@@ -695,7 +915,7 @@ export class Trader {
       slot.position = updated;
       this.store.savePosition(updated);
     }
-    if (slot.sellInFlight) {
+    if (busy) {
       return;
     }
     const intent = this.risk.shouldFlattenAll() ? this.flattenIntent(updated, view, price) : decision.actions[0] ?? null;
@@ -731,12 +951,16 @@ export class Trader {
 
   private async runSell(slot: Slot, order: OrderRequest): Promise<void> {
     const fill = await this.settleUnconfirmed(order, await this.executeSafely(slot.executor, order));
+    const walletTokens = await this.walletBalanceAfterSell(slot, fill);
     slot.sellInFlight = false;
     if (this.slots.get(slot.position.id) !== slot) {
       return;
     }
     try {
       this.applySell(slot, order, fill);
+      if (walletTokens !== null && this.slots.get(slot.position.id) === slot && !slot.sellInFlight) {
+        this.reconcileWalletBalance(slot, walletTokens, this.clock.nowMs());
+      }
     } catch (error) {
       log.error({ err: error, positionId: slot.position.id }, "sell bookkeeping failed");
     }

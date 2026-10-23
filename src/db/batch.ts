@@ -8,15 +8,26 @@ export interface BatchTableSpec {
   table: string;
   columns: readonly string[];
   conflict: string;
-}
-
-export interface BatchWriterOptions {
-  flushIntervalMs: number;
-  maxBufferedRows: number;
-  maxRetries: number;
+  returning?: string;
 }
 
 export type Row = readonly unknown[];
+export type ReturnedRow = Record<string, unknown>;
+
+export interface BatchWriterHooks {
+  onInserted?: (table: string, rows: readonly ReturnedRow[]) => void;
+  onDropped?: (table: string, rows: readonly Row[], error: unknown) => void;
+}
+
+export interface BatchWriterOptions extends BatchWriterHooks {
+  flushIntervalMs: number;
+  maxBufferedRows: number;
+  maxRetries: number;
+  maxBackoffMs?: number;
+  retriesWhenStopping?: number;
+}
+
+const BASE_BACKOFF_MS = 250;
 
 export class BatchWriter {
   private readonly buffers = new Map<string, Row[]>();
@@ -25,6 +36,8 @@ export class BatchWriter {
   private flushing: Promise<void> | null = null;
   private droppedRows = 0;
   private writtenRows = 0;
+  private stopping = false;
+  private readonly wakers = new Set<() => void>();
 
   constructor(
     private readonly db: Db,
@@ -47,11 +60,19 @@ export class BatchWriter {
   }
 
   async stop(): Promise<void> {
+    this.beginStop();
+    await this.flush();
+  }
+
+  beginStop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
-    await this.flush();
+    this.stopping = true;
+    for (const wake of [...this.wakers]) {
+      wake();
+    }
   }
 
   push(table: string, row: Row): void {
@@ -114,20 +135,52 @@ export class BatchWriter {
       }
       tuples.push(`(${placeholders.join(",")})`);
     }
-    const sql = `INSERT INTO ${spec.table} (${spec.columns.join(",")}) VALUES ${tuples.join(",")} ${spec.conflict}`;
-    for (let attempt = 0; attempt <= this.options.maxRetries; attempt += 1) {
+    const returning = spec.returning ? ` RETURNING ${spec.returning}` : "";
+    const sql = `INSERT INTO ${spec.table} (${spec.columns.join(",")}) VALUES ${tuples.join(",")} ${spec.conflict}${returning}`;
+    for (let attempt = 0; ; attempt += 1) {
       try {
-        await this.db.query(sql, params);
+        const result = await this.db.query<ReturnedRow>(sql, params);
         this.writtenRows += rows.length;
+        if (spec.returning) {
+          this.notify(() => this.options.onInserted?.(spec.table, result.rows));
+        }
         return;
       } catch (error) {
-        if (attempt === this.options.maxRetries) {
+        if (attempt >= this.retryLimit()) {
           this.droppedRows += rows.length;
-          log.error({ err: error, table: spec.table, rows: rows.length }, "batch insert failed, rows dropped");
+          log.error({ err: error, table: spec.table, rows: rows.length, attempts: attempt + 1 }, "batch insert failed, rows dropped");
+          this.notify(() => this.options.onDropped?.(spec.table, rows, error));
           return;
         }
-        await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+        await this.sleep(Math.min(this.options.maxBackoffMs ?? Number.POSITIVE_INFINITY, BASE_BACKOFF_MS * 2 ** attempt));
       }
     }
+  }
+
+  private retryLimit(): number {
+    return this.stopping ? Math.min(this.options.maxRetries, this.options.retriesWhenStopping ?? 2) : this.options.maxRetries;
+  }
+
+  private notify(hook: () => void): void {
+    try {
+      hook();
+    } catch (error) {
+      log.error({ err: error }, "batch writer hook failed");
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    if (this.stopping) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const wake = (): void => {
+        clearTimeout(timer);
+        this.wakers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      this.wakers.add(wake);
+    });
   }
 }

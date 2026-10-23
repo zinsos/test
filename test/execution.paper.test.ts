@@ -106,7 +106,7 @@ describe("PaperExecutor latency", () => {
     expect(fill.tokenAmount).toBe(expected.tokensOut);
   });
 
-  it("fails on slippage when a sniper moves the price beyond the limit, then retries at later prices", async () => {
+  it("fails on slippage when a sniper moves the price beyond the limit, then refuses the retry locally without a fee", async () => {
     const h = harness();
     const executor = new PaperExecutor({ clock: h.clock, market: h.source, config: quietConfig({ maxRetries: 1 }), seed: "s" });
     const request = order({ quoteBudget: SOL / 10n, maxSlippageBps: 1500, referencePrice: spotPrice(h.reserves) });
@@ -117,7 +117,8 @@ describe("PaperExecutor latency", () => {
     expect(fill.success).toBe(false);
     expect(fill.error).toBe("slippage_exceeded");
     expect(fill.attempts.map((attempt) => attempt.atMs)).toEqual([T0 + 2 * SLOT_MS, T0 + 5 * SLOT_MS]);
-    expect(fill.networkFees).toBe(2n * BigInt(quietConfig().baseFeeLamports + quietConfig().priorityFeeLamports));
+    expect(fill.attempts.map((attempt) => attempt.networkFee)).toEqual([BigInt(quietConfig().baseFeeLamports + quietConfig().priorityFeeLamports), 0n]);
+    expect(fill.networkFees).toBe(BigInt(quietConfig().baseFeeLamports + quietConfig().priorityFeeLamports));
     expect(fill.tokenAmount).toBe(0n);
     expect(fill.slippageBps).toBeGreaterThan(1500);
   });

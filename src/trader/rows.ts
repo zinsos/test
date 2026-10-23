@@ -91,7 +91,8 @@ export const POSITION_UPSERT_CONFLICT = `ON CONFLICT (id) DO UPDATE SET
   launch_id = COALESCE(EXCLUDED.launch_id, positions.launch_id),
   signal_id = COALESCE(EXCLUDED.signal_id, positions.signal_id),
   ${UPDATABLE_POSITION_COLUMNS.map((column) => `${column} = EXCLUDED.${column}`).join(",\n  ")}
-WHERE positions.status <> 'closed' OR EXCLUDED.status = 'closed'`;
+WHERE (positions.status <> 'closed' OR EXCLUDED.status = 'closed')
+  AND (EXCLUDED.status <> 'pending' OR positions.status = 'pending')`;
 
 export const FILL_INSERT_CONFLICT = "ON CONFLICT (position_id, fill_seq) WHERE fill_seq IS NOT NULL DO NOTHING";
 export const SIGNAL_INSERT_CONFLICT = "ON CONFLICT (id) DO NOTHING";
@@ -241,7 +242,7 @@ export function positionFromRow(row: DbRecord): Position {
     lastPrice: toNumber(row.last_price),
     takeProfitLevelsHit: toNumber(row.take_profit_levels_hit),
     migratedSeen: row.migrated_seen === true,
-    status: row.status === "closed" ? "closed" : "open",
+    status: row.status === "closed" || row.status === "pending" ? row.status : "open",
     closedAtMs: msOf(row.closed_at),
     exitReason: typeof row.exit_reason === "string" ? row.exit_reason : null,
     shadowOf: typeof row.shadow_of === "string" ? row.shadow_of : null,

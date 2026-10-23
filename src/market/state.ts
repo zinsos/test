@@ -1,4 +1,5 @@
 import { curvePrice, marketCapQuote } from "../chain/curve.js";
+import { isCanonicalPumpPool } from "../chain/pda.js";
 import { LAMPORTS_PER_SOL, SOL_QUOTE } from "../core/constants.js";
 import type { DecodedChainEvent } from "../chain/events.js";
 import type {
@@ -208,7 +209,7 @@ export class LaunchState {
     if (event.venue === "pool") {
       this.migrated = true;
       this.complete = true;
-      if (event.pool) {
+      if (event.pool && !this.pool) {
         this.pool = event.pool;
       }
     }
@@ -427,7 +428,8 @@ export class MarketState {
 
   resolve(decoded: DecodedChainEvent): ChainEvent | null {
     if (decoded.kind === "poolCreated") {
-      if (this.launches.has(decoded.baseMint) || this.poolToMint.has(decoded.pool)) {
+      const launch = this.launches.get(decoded.baseMint);
+      if (launch && isCanonicalPumpPool(decoded.pool, decoded.baseMint, launch.info.quoteMint)) {
         this.registerPool(decoded.pool, decoded.baseMint);
       }
       return null;
@@ -493,6 +495,9 @@ export class MarketState {
         launch.migrated = true;
         launch.migratedAtMs = event.timestampMs;
         launch.migratedSlot = event.tx.slot;
+        if (launch.pool && launch.pool !== event.pool && this.poolToMint.get(launch.pool) === event.mint) {
+          this.poolToMint.delete(launch.pool);
+        }
         launch.pool = event.pool;
         this.poolToMint.set(event.pool, event.mint);
         return { kind: "migrate", launch };

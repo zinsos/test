@@ -1,5 +1,8 @@
 import type { FillAttempt, FillResult, OrderRequest, TradeVenue } from "../core/types.js";
 
+export const UNCONFIRMED_ERROR = "unconfirmed";
+export const HALTED_ERROR = "halted";
+
 export interface FillAmounts {
   venue: TradeVenue;
   tokenAmount: bigint;
@@ -113,4 +116,17 @@ export function successfulFill(input: SuccessfulFillInput): FillResult {
 export function walletOutflow(fill: FillResult): bigint {
   const tradeFlow = fill.side === "buy" ? fill.userQuote : -fill.userQuote;
   return tradeFlow + fill.networkFees + fill.tips + fill.rentPaid - fill.rentRefunded;
+}
+
+export function withEarlierAttempts(fill: FillResult, earlier: readonly FillAttempt[]): FillResult {
+  const prior = earlier.filter((attempt) => attempt.error !== UNCONFIRMED_ERROR);
+  if (prior.length === 0) {
+    return fill;
+  }
+  const attempts = [...prior, ...fill.attempts];
+  return { ...fill, attempts, ...sumAttemptCosts(attempts) };
+}
+
+export function sentAtMsOf(fill: Pick<FillResult, "attempts" | "requestedAtMs">): number {
+  return fill.attempts.at(-1)?.atMs ?? fill.requestedAtMs;
 }

@@ -23,7 +23,13 @@ export function poolTradeToChain(event: PoolTradeEvent, mint: Pubkey): TradeEven
 }
 
 export function gapAffectsLaunch(gap: IngestGap, launch: Pick<LaunchState, "info">): boolean {
-  return gap.fromSlot !== null ? launch.info.createdSlot <= gap.fromSlot : launch.info.createdAtMs <= gap.endedAtMs;
+  if (gap.fromSlot !== null) {
+    return launch.info.createdSlot <= gap.fromSlot;
+  }
+  if (gap.toSlot !== null) {
+    return launch.info.createdSlot < gap.toSlot;
+  }
+  return launch.info.createdAtMs <= gap.endedAtMs;
 }
 
 export function markGapInMemory(market: MarketState, gap: IngestGap): number {

@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
+import { Keypair } from "@solana/web3.js";
 import { describe, expect, it } from "vitest";
-import { decodeLogs, type DecodedChainEvent, type PoolTradeEvent } from "../src/chain/events.js";
+import { decodeLogs, type DecodedChainEvent, type PoolCreatedEvent, type PoolTradeEvent } from "../src/chain/events.js";
+import { canonicalPumpPoolAddress } from "../src/chain/pda.js";
 import { Bus } from "../src/core/bus.js";
 import { VirtualClock } from "../src/core/clock.js";
 import type { ChainEvent, IngestGap, LaunchCreatedEvent, MigrationEvent } from "../src/core/types.js";
@@ -135,6 +137,76 @@ describe("ingest pipeline", () => {
     expect(launch?.pool).toBe(migration.pool);
     expect(launch?.trades.at(-1)?.venue).toBe("pool");
     expect(market.mintForPool(migration.pool)).toBe(migration.mint);
+  });
+
+  it("ignores a permissionless PumpSwap pool for a coin still on its curve and after it migrated", () => {
+    const { market, pipeline, events } = harness();
+    const migration = migrationIn("GK5Z3vZ6WS");
+    const create = syntheticCreateFor(migration, createTemplate());
+    feedCreate(pipeline, create.event);
+    const tx = fixtureBySignature("GK5Z3vZ6WS");
+    const decoded = decodeLogs(tx.logs, { signature: tx.signature, slot: tx.slot, seq: 2, receivedAtMs: 0 });
+    const realTrade = decoded.events.find((event): event is PoolTradeEvent => event.kind === "poolTrade");
+    if (!realTrade) {
+      throw new Error("pool trade missing");
+    }
+    const attackerPool = Keypair.generate().publicKey.toBase58();
+    const attackerTx = { ...realTrade.tx, signature: "attacker", slot: migration.tx.slot - 10 };
+    const attackerCreate: PoolCreatedEvent = {
+      kind: "poolCreated",
+      tx: attackerTx,
+      pool: attackerPool,
+      baseMint: migration.mint,
+      quoteMint: "SOL",
+      coinCreator: null,
+      timestampMs: migration.timestampMs - 10_000
+    };
+    const attackerTrade: PoolTradeEvent = {
+      ...realTrade,
+      tx: { ...attackerTx, eventIndex: 1 },
+      pool: attackerPool,
+      virtualTokenReserves: 1_000_000n,
+      virtualQuoteReserves: 900_000_000_000n
+    };
+    const launch = market.get(migration.mint);
+    const reservesBefore = launch?.virtualQuoteReserves;
+    pipeline.handleBatch(
+      { events: [attackerCreate, attackerTrade], truncated: false, incomplete: 0, unknown: 0 },
+      { signature: "attacker", slot: attackerTx.slot, seq: 1, receivedAtMs: 0 }
+    );
+    expect({ migrated: launch?.migrated, pool: launch?.pool, reserves: launch?.virtualQuoteReserves }).toEqual({
+      migrated: false,
+      pool: null,
+      reserves: reservesBefore
+    });
+    expect(market.mintForPool(attackerPool)).toBeUndefined();
+    pipeline.handleBatch(decoded, { signature: tx.signature, slot: tx.slot, seq: 2, receivedAtMs: 0 });
+    expect(launch?.pool).toBe(migration.pool);
+    const afterMigration = launch?.virtualQuoteReserves;
+    pipeline.handleBatch(
+      { events: [attackerCreate, { ...attackerTrade, tx: { ...attackerTrade.tx, slot: tx.slot + 5 } }], truncated: false, incomplete: 0, unknown: 0 },
+      { signature: "attacker", slot: tx.slot + 5, seq: 3, receivedAtMs: 0 }
+    );
+    expect({ pool: launch?.pool, reserves: launch?.virtualQuoteReserves }).toEqual({ pool: migration.pool, reserves: afterMigration });
+    expect(events.filter((event) => event.kind === "trade" && event.venue === "pool").map((event) => event.kind === "trade" && event.pool)).toEqual([
+      migration.pool
+    ]);
+  });
+
+  it("registers the canonical pool from its creation event alone", () => {
+    const { market, pipeline } = harness();
+    const migration = migrationIn("GK5Z3vZ6WS");
+    feedCreate(pipeline, syntheticCreateFor(migration, createTemplate()).event);
+    const tx = fixtureBySignature("GK5Z3vZ6WS");
+    const created = decodeTx(tx).find((event): event is PoolCreatedEvent => event.kind === "poolCreated");
+    expect(created?.pool).toBe(canonicalPumpPoolAddress(migration.mint, "SOL"));
+    pipeline.handleBatch(
+      { events: created ? [created] : [], truncated: false, incomplete: 0, unknown: 0 },
+      { signature: tx.signature, slot: tx.slot, seq: 2, receivedAtMs: 0 }
+    );
+    expect(market.mintForPool(migration.pool)).toBe(migration.mint);
+    expect(canonicalPumpPoolAddress(migration.mint, "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn")).not.toBe(migration.pool);
+    expect(canonicalPumpPoolAddress("not a key", "SOL")).toBeNull();
   });
 
   it("falls back to the pool lookup for launches that are no longer in memory", () => {

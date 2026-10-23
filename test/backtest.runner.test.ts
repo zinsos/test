@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultStrategyConfig, type StrategyConfig } from "../src/config/strategy.js";
 import type { ClosedTrade } from "../src/core/types.js";
 import { runBacktest, type BacktestResult } from "../src/backtest/runner.js";
+import { INCOMPLETE_DATA_REASON } from "../src/trader/trader.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 import { CLEAN_DEEP_FEATURES, convergenceTrades, seedLaunch, seedRankRun, seedStoredScore } from "./backtest.seed.js";
 
@@ -94,7 +95,7 @@ describe.skipIf(!hasTestDatabase)("backtest runner", () => {
     expect(signals.get(LAUNCHES.hardBlocked.mint)).toEqual([{ acted: false, skip: "hard_blocked" }]);
     expect(signals.has(LAUNCHES.futureRun.mint)).toBe(false);
     expect(signals.has(LAUNCHES.beforeMidRun.mint)).toBe(false);
-    expect(signals.has(LAUNCHES.incomplete.mint)).toBe(false);
+    expect(signals.get(LAUNCHES.incomplete.mint)).toEqual([{ acted: false, skip: INCOMPLETE_DATA_REASON }]);
     expect(signals.has(LAUNCHES.outside.mint)).toBe(false);
 
     const tradedMints = first.closedTrades.map((trade) => trade.mint).sort();
@@ -105,7 +106,8 @@ describe.skipIf(!hasTestDatabase)("backtest runner", () => {
       expect(trade.pnl).toBe(trade.proceeds - trade.cost);
     }
     const summary = first.summary;
-    expect(summary.counts.launches).toBe(5);
+    expect(summary.counts.launches).toBe(6);
+    expect(summary.counts.incompleteLaunches).toBe(1);
     expect(summary.counts.entriesFilled).toBe(2);
     expect(summary.trades.n).toBe(2);
     expect(summary.counts.storedScoreLaunches).toBe(4);
@@ -141,7 +143,7 @@ describe.skipIf(!hasTestDatabase)("backtest runner", () => {
     expect(second.summary.exitReasons).toEqual(first.summary.exitReasons);
   }, 120_000);
 
-  it("replays launches with ingest gaps only when asked", async () => {
+  it("trades launches with ingest gaps only when asked", async () => {
     const result = await runBacktest({ db: database.db, fromMs: FROM, toMs: TO, config: config(), includeIncomplete: true });
     const signals = await signalsFor(result.runId);
     expect(signals.get(LAUNCHES.incomplete.mint)).toEqual([{ acted: true, skip: null }]);

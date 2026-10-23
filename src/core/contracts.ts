@@ -20,6 +20,8 @@ export interface MarketDataSource {
 export interface Executor {
   readonly mode: TradingMode;
   execute(order: OrderRequest): Promise<FillResult>;
+  tokenBalance?(mint: Pubkey): Promise<bigint | null>;
+  halt?(): void;
 }
 
 export interface ScoreProvider {
@@ -47,6 +49,7 @@ export interface RiskEntryInput {
   signal: Signal;
   nowMs: number;
   openPositions: readonly Position[];
+  pendingMints?: readonly Pubkey[];
 }
 
 export interface RiskDecision {
@@ -96,6 +99,7 @@ export interface TradingStore {
   }): Promise<number>;
   recordSignal(runId: number, record: SignalRecord): Promise<number | null>;
   savePosition(position: Position): void;
+  discardPendingPosition?(positionId: string): void;
   recordFill(position: Position, order: OrderRequest, fill: FillResult): void;
   recordRiskEvent(runId: number, atMs: number, kind: string, detail: Record<string, unknown>): void;
   saveRiskState(status: RiskStatus, extra: Record<string, unknown>): void;

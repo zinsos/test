@@ -1,16 +1,17 @@
-import type { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
+import { PublicKey, type Connection, type Keypair, type VersionedTransaction } from "@solana/web3.js";
 import type { ExecutionConfig } from "../config/strategy.js";
 import type { Clock } from "../core/clock.js";
 import { SLOT_MS, SOL_QUOTE } from "../core/constants.js";
 import type { Executor, MarketDataSource } from "../core/contracts.js";
 import { moduleLogger } from "../core/logger.js";
 import { createRng } from "../core/rng.js";
-import type { FillAttempt, FillResult, OrderRequest, TradeVenue } from "../core/types.js";
+import type { FillAttempt, FillResult, OrderRequest, Pubkey, TradeVenue } from "../core/types.js";
 import { ConfirmationTracker, type SentTransaction } from "./confirmation.js";
-import { failedFill, successfulFill, type FillAmounts } from "./fill.js";
+import { failedFill, HALTED_ERROR, successfulFill, UNCONFIRMED_ERROR, type FillAmounts } from "./fill.js";
 import { parseFill, type ConfirmedTransaction } from "./fillParser.js";
 import {
   PumpInstructionBuilder,
+  tokenAccountAmount,
   TradeRefusedError,
   type BuiltTrade,
   type ComputeUnitLimits,
@@ -44,7 +45,13 @@ const log = moduleLogger("execution.live");
 
 export type LiveConnection = Pick<
   Connection,
-  "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getSignatureStatuses" | "getBlockHeight" | "getParsedTransaction"
+  | "getLatestBlockhash"
+  | "simulateTransaction"
+  | "sendRawTransaction"
+  | "getSignatureStatuses"
+  | "getBlockHeight"
+  | "getParsedTransaction"
+  | "getTokenAccountsByOwner"
 >;
 
 export interface LiveExecutorOptions {
@@ -103,6 +110,7 @@ export class LiveExecutor implements Executor {
   private readonly confirmations: ConfirmationTracker;
   private readonly pollIntervalMs: number;
   private readonly fetchAttempts: number;
+  private halted = false;
 
   constructor(options: LiveExecutorOptions) {
     this.#keypair = options.keypair;
@@ -130,6 +138,23 @@ export class LiveExecutor implements Executor {
     });
     if (options.config.useJito && !options.sender && !options.jitoEndpoint) {
       log.warn("useJito is on without a Jito endpoint: tips are added but transactions go through the RPC without bundle protection");
+    }
+  }
+
+  halt(): void {
+    if (!this.halted) {
+      this.halted = true;
+      log.warn({ wallet: this.wallet }, "live executor halted: no further transactions are sent");
+    }
+  }
+
+  async tokenBalance(mint: Pubkey): Promise<bigint | null> {
+    try {
+      const accounts = await this.connection.getTokenAccountsByOwner(this.#keypair.publicKey, { mint: new PublicKey(mint) }, "confirmed");
+      return accounts.value.reduce((total, entry) => total + tokenAccountAmount(entry.account), 0n);
+    } catch (error) {
+      log.warn({ err: error, mint }, "wallet token balance lookup failed");
+      return null;
     }
   }
 
@@ -163,6 +188,9 @@ export class LiveExecutor implements Executor {
     for (let attempt = 0; attempt <= this.config.maxRetries; attempt += 1) {
       if (attempt > 0) {
         await this.clock.sleepUntil(this.clock.nowMs() + this.config.retryDelaySlots * SLOT_MS);
+      }
+      if (this.halted) {
+        return failedFill(order, HALTED_ERROR, attempts, venue);
       }
       const step = await this.runAttempt(order, attempt, attempts);
       if (step.kind === "done") {
@@ -269,6 +297,9 @@ export class LiveExecutor implements Executor {
     transaction.sign([this.#keypair]);
     if (this.dryRun) {
       return { kind: "done", fill: await this.dryRunFill(order, transaction, built, attempts, guard) };
+    }
+    if (this.halted) {
+      return { kind: "done", fill: failedFill(order, HALTED_ERROR, attempts, built.venue) };
     }
     const sent = await this.send(transaction, blockhash.lastValidBlockHeight, tip, order, built);
     return this.settle(order, sent, built, attempts, guard);
@@ -380,8 +411,8 @@ export class LiveExecutor implements Executor {
         return { kind: "retry", error: "expired" };
       case "unknown": {
         log.error({ signature: sent.signature, mint: order.mint }, "transaction unconfirmed at timeout, not retrying");
-        attempts.push({ ...this.localAttempt("unconfirmed"), atMs: sent.sentAtMs });
-        const fill = failedFill(order, "unconfirmed", attempts, built.venue);
+        attempts.push({ ...this.localAttempt(UNCONFIRMED_ERROR), atMs: sent.sentAtMs });
+        const fill = failedFill(order, UNCONFIRMED_ERROR, attempts, built.venue);
         return { kind: "done", fill: { ...fill, signature: sent.signature } };
       }
     }
@@ -412,7 +443,7 @@ export class LiveExecutor implements Executor {
     const tx = await this.fetchConfirmed(sent.signature);
     if (!tx) {
       attempts.push({ atMs: sent.sentAtMs, slot, success: true, error: null, networkFee: this.networkFeeOf(built), tip: tipLamports });
-      return this.expectedFill(order, sent, built, slot, attempts, guard);
+      return this.expectedFill(order, sent, built, slot, attempts, guard, await this.receivedTokens(order, built));
     }
     return this.fillFromTransaction(order, tx, {
       pool: built.pool,
@@ -453,17 +484,28 @@ export class LiveExecutor implements Executor {
     });
   }
 
+  private async receivedTokens(order: OrderRequest, built: BuiltTrade): Promise<bigint> {
+    if (order.side === "sell") {
+      return built.tokenAmount;
+    }
+    const balance = await this.tokenBalance(order.mint);
+    const received = balance === null ? 0n : balance - built.tokenBalanceBefore;
+    return received > 0n ? received : built.expectedTokens;
+  }
+
   private expectedFill(
     order: OrderRequest,
     sent: SentTransaction,
     built: BuiltTrade,
     slot: number,
     attempts: FillAttempt[],
-    guard: SlippageGuard
+    guard: SlippageGuard,
+    tokenAmount: bigint
   ): FillResult {
+    const rent = BigInt(this.config.ataRentLamports);
     const amounts: FillAmounts = {
       venue: built.venue,
-      tokenAmount: built.expectedTokens,
+      tokenAmount,
       quoteAmount: built.expectedQuote,
       userQuote: built.expectedQuote,
       protocolFee: 0n,
@@ -479,8 +521,8 @@ export class LiveExecutor implements Executor {
       attempts,
       filledAtMs: this.clock.nowMs(),
       filledSlot: slot,
-      rentPaid: 0n,
-      rentRefunded: 0n,
+      rentPaid: order.side === "buy" && built.createsTokenAccount ? rent : 0n,
+      rentRefunded: order.side === "sell" && built.closesTokenAccount ? rent : 0n,
       signature: sent.signature,
       note: "fill_unparsed"
     });

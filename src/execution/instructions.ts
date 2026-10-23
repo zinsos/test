@@ -51,6 +51,8 @@ export interface BuiltTrade {
   expectedTokens: bigint;
   expectedQuote: bigint;
   closesTokenAccount: boolean;
+  createsTokenAccount: boolean;
+  tokenBalanceBefore: bigint;
   instructionSet: string;
 }
 
@@ -281,7 +283,7 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
           amount: tokens,
           quoteAmount: toBn(budget)
         });
-        return this.curveTrade("buy", instructions, budget, fromBn(tokens), budget, false, "buy_exact_quote_in_v3");
+        return this.curveTrade("buy", instructions, budget, fromBn(tokens), budget, false, "buy_exact_quote_in_v3", state.associatedUserAccountInfo);
       } catch (error) {
         if (!(error instanceof sdk.CashbackCoinNotSupportedError)) {
           throw error;
@@ -318,13 +320,17 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
       amount: tokens,
       quoteAmount: toBn(quoteAmount)
     });
-    return this.curveTrade("buy", instructions, fromBn(tokens), fromBn(tokens), quoteAmount, false, "buy_v2");
+    return this.curveTrade("buy", instructions, fromBn(tokens), fromBn(tokens), quoteAmount, false, "buy_v2", state.associatedUserAccountInfo);
   }
 
-  private async userTokenBalance(owner: PublicKey, mint: PublicKey, tokenProgram: PublicKey): Promise<{ account: PublicKey; balance: bigint }> {
+  private async userTokenBalance(
+    owner: PublicKey,
+    mint: PublicKey,
+    tokenProgram: PublicKey
+  ): Promise<{ account: PublicKey; info: AccountInfo<Buffer> | null; balance: bigint }> {
     const account = associatedTokenAddress(owner, mint, tokenProgram);
     const info = await this.connection.getAccountInfo(account, "confirmed");
-    return { account, balance: tokenAccountAmount(info) };
+    return { account, info, balance: tokenAccountAmount(info) };
   }
 
   private async buildCurveSell(request: BuildRequest, mint: PublicKey, tokenProgram: PublicKey): Promise<BuiltTrade> {
@@ -372,7 +378,7 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
     if (closes) {
       instructions.push(closeTokenAccountInstruction(holding.account, request.user, tokenProgram));
     }
-    return this.curveTrade("sell", instructions, tokens, tokens, fromBn(expectedQuote), closes, instructionSet);
+    return this.curveTrade("sell", instructions, tokens, tokens, fromBn(expectedQuote), closes, instructionSet, holding.info);
   }
 
   private async curveSellInstructions(
@@ -402,7 +408,8 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
     expectedTokens: bigint,
     expectedQuote: bigint,
     closesTokenAccount: boolean,
-    instructionSet: string
+    instructionSet: string,
+    userTokenAccount: Pick<AccountInfo<Buffer>, "data"> | null
   ): BuiltTrade {
     return {
       venue: "curve",
@@ -413,6 +420,8 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
       expectedTokens,
       expectedQuote,
       closesTokenAccount,
+      createsTokenAccount: side === "buy" && userTokenAccount === null,
+      tokenBalanceBefore: tokenAccountAmount(userTokenAccount),
       instructionSet
     };
   }
@@ -483,6 +492,8 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
       expectedTokens,
       expectedQuote: spend,
       closesTokenAccount: false,
+      createsTokenAccount: !state.userBaseAccountInfo,
+      tokenBalanceBefore: tokenAccountAmount(state.userBaseAccountInfo ?? null),
       instructionSet: tradeV2 ? "buy_exact_quote_in_v2" : "buy"
     };
   }
@@ -514,6 +525,8 @@ export class PumpInstructionBuilder implements TradeInstructionBuilder {
       expectedTokens: tokens,
       expectedQuote: fromBn(quote.uiQuote),
       closesTokenAccount: closes,
+      createsTokenAccount: false,
+      tokenBalanceBefore: balance,
       instructionSet: swapSdk.supportsTradeV2(state.pool) ? "sell_v2" : "sell"
     };
   }

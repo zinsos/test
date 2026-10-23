@@ -342,6 +342,9 @@ export class RiskManager implements RiskGate {
     for (const mint of this.reservations.keys()) {
       held.add(mint);
     }
+    for (const mint of input.pendingMints ?? []) {
+      held.add(mint);
+    }
     if (held.size >= this.config.maxConcurrent) {
       return { reason: "max_concurrent" };
     }
@@ -426,15 +429,16 @@ export class RiskManager implements RiskGate {
     if (this.dayStartEquity <= 0n) {
       return false;
     }
-    const limit = scaleLamports(this.dayStartEquity, this.config.dailyLossLimitFraction);
-    return equity - this.dayStartEquity <= -limit;
+    const loss = this.dayStartEquity - equity;
+    return loss > 0n && loss >= scaleLamports(this.dayStartEquity, this.config.dailyLossLimitFraction);
   }
 
   private drawdownBreached(equity: bigint): boolean {
     if (this.peakEquity <= 0n) {
       return false;
     }
-    return this.peakEquity - equity >= scaleLamports(this.peakEquity, this.config.killSwitchDrawdownFraction);
+    const drawdown = this.peakEquity - equity;
+    return drawdown > 0n && drawdown >= scaleLamports(this.peakEquity, this.config.killSwitchDrawdownFraction);
   }
 
   private drawdownFraction(equity: bigint): number {

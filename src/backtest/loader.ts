@@ -1,3 +1,4 @@
+import type { Clock } from "../core/clock.js";
 import { moduleLogger } from "../core/logger.js";
 import type {
   ChainEvent,
@@ -27,6 +28,7 @@ export interface ReplayEvent {
   tiebreak: string;
   launchId: number;
   event: ChainEvent;
+  incompleteFromMs?: number | null;
 }
 
 type DbRecord = Record<string, unknown>;
@@ -34,7 +36,7 @@ type DbRecord = Record<string, unknown>;
 export const LAUNCH_SELECT = `id, mint, bonding_curve, dev_wallet, creator, name, symbol, uri, quote_mint, token_program,
   is_mayhem, is_cashback, is_holder_reward, creator_fee_bps, depth, create_signature, create_slot, created_at,
   token_total_supply, initial_virtual_token, initial_virtual_quote, initial_real_token, pool,
-  completed_at, completed_slot, migrated_at, migrated_slot, data_complete`;
+  completed_at, completed_slot, migrated_at, migrated_slot, data_complete, data_incomplete_at`;
 
 export const TRADE_SELECT = `t.launch_id, l.mint, l.pool AS launch_pool, t.block_time, t.slot, t.seq, t.signature, t.event_index,
   t.venue, t.wallet, t.is_buy, t.token_amount, t.quote_amount, t.user_quote, t.protocol_fee, t.creator_fee, t.lp_fee,
@@ -157,6 +159,32 @@ export function migrateEventFromRow(row: DbRecord): MigrationEvent | null {
   };
 }
 
+export function incompleteFromOf(row: DbRecord): number | null {
+  if (row.data_incomplete_at instanceof Date) {
+    return row.data_incomplete_at.getTime();
+  }
+  return row.data_complete === false ? msOf(row.created_at) : null;
+}
+
+export function scheduleIncomplete(clock: Clock, market: MarketState, replay: ReplayEvent): void {
+  const fromMs = replay.incompleteFromMs ?? null;
+  if (replay.event.kind !== "create" || fromMs === null) {
+    return;
+  }
+  const mint = replay.event.mint;
+  const mark = (): void => {
+    const launch = market.get(mint);
+    if (launch && launch.launchId === replay.launchId) {
+      launch.dataComplete = false;
+    }
+  };
+  if (fromMs <= clock.nowMs()) {
+    mark();
+  } else {
+    clock.schedule(fromMs, mark);
+  }
+}
+
 export function replayEventOf(event: ChainEvent, launchId: number): ReplayEvent {
   const base = { launchId, event, atMs: event.timestampMs, slot: event.tx.slot, tiebreak: event.tx.signature };
   switch (event.kind) {
@@ -196,6 +224,7 @@ export interface BacktestLoaderOptions {
 
 export interface LoaderCounts {
   launches: number;
+  incompleteLaunches: number;
   trades: number;
   lifecycle: number;
   windows: number;
@@ -210,7 +239,7 @@ export class BacktestLoader {
   private readonly windowMs: number;
   private lifecycle: ReplayEvent[] = [];
   private lifecycleIndex = 0;
-  private readonly counts: LoaderCounts = { launches: 0, trades: 0, lifecycle: 0, windows: 0 };
+  private readonly counts: LoaderCounts = { launches: 0, incompleteLaunches: 0, trades: 0, lifecycle: 0, windows: 0 };
 
   constructor(options: BacktestLoaderOptions) {
     if (!(options.toMs > options.fromMs)) {
@@ -232,10 +261,9 @@ export class BacktestLoader {
     const result = await this.db.query<DbRecord>(
       `SELECT ${LAUNCH_SELECT} FROM launches
         WHERE created_at >= $1 AND created_at < $2
-          AND ($3 OR data_complete)
-          AND ($4::text[] IS NULL OR quote_mint = ANY($4::text[]))
+          AND ($3::text[] IS NULL OR quote_mint = ANY($3::text[]))
           AND (completed_at IS NOT NULL OR migrated_at IS NOT NULL)`,
-      [new Date(this.fromMs), new Date(this.toMs), this.includeIncomplete, this.tradeQuoteMints]
+      [new Date(this.fromMs), new Date(this.toMs), this.tradeQuoteMints]
     );
     const events: ReplayEvent[] = [];
     for (const row of result.rows) {
@@ -282,6 +310,7 @@ export class BacktestLoader {
     const endMs = Math.min(startMs + this.windowMs, this.toMs);
     const [launches, trades] = await Promise.all([this.loadLaunches(startMs, endMs), this.loadTrades(startMs, endMs)]);
     this.counts.launches += launches.length;
+    this.counts.incompleteLaunches += launches.filter((launch) => launch.incompleteFromMs !== null).length;
     this.counts.trades += trades.length;
     return [...launches, ...trades];
   }
@@ -289,11 +318,14 @@ export class BacktestLoader {
   private async loadLaunches(startMs: number, endMs: number): Promise<ReplayEvent[]> {
     const result = await this.db.query<DbRecord>(
       `SELECT ${LAUNCH_SELECT} FROM launches
-        WHERE created_at >= $1 AND created_at < $2 AND ($3 OR data_complete)
+        WHERE created_at >= $1 AND created_at < $2
         ORDER BY created_at, create_slot, id`,
-      [new Date(startMs), new Date(endMs), this.includeIncomplete]
+      [new Date(startMs), new Date(endMs)]
     );
-    return result.rows.map((row) => replayEventOf(launchEventFromRow(row), toNumber(row.id)));
+    return result.rows.map((row) => ({
+      ...replayEventOf(launchEventFromRow(row), toNumber(row.id)),
+      incompleteFromMs: this.includeIncomplete ? null : incompleteFromOf(row)
+    }));
   }
 
   private async loadTrades(startMs: number, endMs: number): Promise<ReplayEvent[]> {
@@ -302,10 +334,9 @@ export class BacktestLoader {
          FROM trades t JOIN launches l ON l.id = t.launch_id
         WHERE t.block_time >= $1 AND t.block_time < $2
           AND l.created_at >= $3 AND l.created_at < $4
-          AND ($5 OR l.data_complete)
-          AND ($6::text[] IS NULL OR l.quote_mint = ANY($6::text[]))
+          AND ($5::text[] IS NULL OR l.quote_mint = ANY($5::text[]))
         ORDER BY t.block_time, t.slot, t.seq, t.event_index, t.signature`,
-      [new Date(startMs), new Date(endMs), new Date(this.fromMs), new Date(this.toMs), this.includeIncomplete, this.tradeQuoteMints]
+      [new Date(startMs), new Date(endMs), new Date(this.fromMs), new Date(this.toMs), this.tradeQuoteMints]
     );
     return result.rows.map((row) => replayEventOf(tradeEventFromRow(row), toNumber(row.launch_id)));
   }
@@ -352,7 +383,7 @@ export async function hydrateLaunch(db: Db, market: MarketState, mint: Pubkey, o
   const launch = market.get(mint);
   if (launch) {
     launch.launchId = launchId;
-    if (row.data_complete === false) {
+    if (incompleteFromOf(row) !== null) {
       launch.dataComplete = false;
     }
   }

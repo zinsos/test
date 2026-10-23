@@ -94,6 +94,7 @@ export class PgTradingStore implements TradingStore {
   private readonly signalIdBlock: number;
   private readonly maxBufferedRows: number;
   private readonly positions = new Map<string, Position>();
+  private readonly discards = new Set<string>();
   private fills: Row[] = [];
   private signalsWithId: BufferedSignal[] = [];
   private signalsWithoutId: BufferedSignal[] = [];
@@ -182,6 +183,16 @@ export class PgTradingStore implements TradingStore {
     this.maybeFlushEarly();
   }
 
+  discardPendingPosition(positionId: string): void {
+    const buffered = this.positions.get(positionId);
+    if (buffered && buffered.status !== "pending") {
+      return;
+    }
+    this.positions.delete(positionId);
+    this.discards.add(positionId);
+    this.maybeFlushEarly();
+  }
+
   recordFill(position: Position, order: OrderRequest, fill: FillResult): void {
     this.fills.push(fillRow(position, order, fill));
     this.counters.droppedRows += capFront(this.fills, this.maxBufferedRows);
@@ -221,7 +232,14 @@ export class PgTradingStore implements TradingStore {
   }
 
   private bufferedRows(): number {
-    return this.positions.size + this.fills.length + this.signalsWithId.length + this.signalsWithoutId.length + this.riskEvents.length;
+    return (
+      this.positions.size +
+      this.discards.size +
+      this.fills.length +
+      this.signalsWithId.length +
+      this.signalsWithoutId.length +
+      this.riskEvents.length
+    );
   }
 
   private maybeFlushEarly(): void {
@@ -263,6 +281,7 @@ export class PgTradingStore implements TradingStore {
     this.counters.flushes += 1;
     await this.resolveLaunchIds();
     await this.writePositions();
+    await this.writeDiscards();
     await this.writeFills();
     await this.writeSignals();
     await this.writeRiskStates();
@@ -355,8 +374,23 @@ export class PgTradingStore implements TradingStore {
       return;
     }
     for (const position of batch) {
-      if (!this.positions.has(position.id)) {
+      if (!this.positions.has(position.id) && !this.discards.has(position.id)) {
         this.positions.set(position.id, position);
+      }
+    }
+  }
+
+  private async writeDiscards(): Promise<void> {
+    if (this.discards.size === 0) {
+      return;
+    }
+    const ids = [...this.discards];
+    const ok = await this.withRetries("position_discards", ids.length, async () => {
+      await this.db.query("DELETE FROM positions WHERE id = ANY($1::text[]) AND status = 'pending'", [ids]);
+    });
+    if (ok) {
+      for (const id of ids) {
+        this.discards.delete(id);
       }
     }
   }

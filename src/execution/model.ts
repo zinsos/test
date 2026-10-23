@@ -291,7 +291,7 @@ export function remainingSlippageBps(
     return maxSlippageBps >= FULL_RANGE_BPS ? FULL_RANGE_BPS : null;
   }
   const remaining = side === "buy" ? (max - expected) / (1 + max) : (max - expected) / (1 - expected);
-  return Math.min(FULL_RANGE_BPS, Math.max(0, Math.floor(remaining * FULL_RANGE_BPS)));
+  return Math.min(maxSlippageBps, FULL_RANGE_BPS, Math.max(0, Math.floor(remaining * FULL_RANGE_BPS)));
 }
 
 export function fillPriceOf(leg: Pick<TradeLeg, "userQuote" | "tokenAmount">): number | null {
@@ -302,6 +302,11 @@ export function fillPriceOf(leg: Pick<TradeLeg, "userQuote" | "tokenAmount">): n
 }
 
 const SENT_ON_CHAIN: ReadonlySet<AttemptError> = new Set<AttemptError>(["tx_failed", "slippage_exceeded", "curve_complete"]);
+const REFUSED_BEFORE_SENDING_ON_RETRY: ReadonlySet<AttemptError> = new Set<AttemptError>(["slippage_exceeded", "curve_complete"]);
+
+function attemptSentOnChain(error: AttemptError, attempt: number): boolean {
+  return SENT_ON_CHAIN.has(error) && !(attempt > 0 && REFUSED_BEFORE_SENDING_ON_RETRY.has(error));
+}
 
 export function attemptCosts(
   config: ExecutionConfig,
@@ -319,13 +324,12 @@ export function attemptCosts(
 }
 
 function failedOutcome(
-  config: ExecutionConfig,
-  view: CurveView,
+  input: SimulateAttemptInput,
   error: AttemptError,
-  leg: TradeLeg | null,
-  order: OrderRequest
+  leg: TradeLeg | null
 ): AttemptOutcome {
-  const sent = SENT_ON_CHAIN.has(error);
+  const { config, view, order } = input;
+  const sent = attemptSentOnChain(error, input.attempt);
   const costs = attemptCosts(config, sent, false);
   const fillPrice = leg ? fillPriceOf(leg) : null;
   return {
@@ -358,16 +362,20 @@ export function simulateAttempt(input: SimulateAttemptInput): AttemptOutcome {
   const failureDraw = input.rng();
   const computed = computeTradeLeg(order, view, config);
   if ("error" in computed) {
-    return failedOutcome(config, view, computed.error, null, order);
+    return failedOutcome(input, computed.error, null);
   }
   const leg = computed.leg;
-  if (failureDraw < config.failureRate) {
-    return failedOutcome(config, view, "tx_failed", leg, order);
-  }
   const fillPrice = fillPriceOf(leg);
   const slippageBps = fillPrice === null ? null : slippageVersusReference(order.side, fillPrice, order.referencePrice);
-  if (slippageBps !== null && slippageBps > order.maxSlippageBps) {
-    return failedOutcome(config, view, "slippage_exceeded", leg, order);
+  const slippageExceeded = slippageBps !== null && slippageBps > order.maxSlippageBps;
+  if (slippageExceeded && input.attempt > 0) {
+    return failedOutcome(input, "slippage_exceeded", leg);
+  }
+  if (failureDraw < config.failureRate) {
+    return failedOutcome(input, "tx_failed", leg);
+  }
+  if (slippageExceeded) {
+    return failedOutcome(input, "slippage_exceeded", leg);
   }
   const costs = attemptCosts(config, true, true);
   return {

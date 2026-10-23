@@ -194,7 +194,7 @@ export interface FillResult {
   error: string | null;
 }
 
-export type PositionStatus = "open" | "closed";
+export type PositionStatus = "pending" | "open" | "closed";
 
 export interface Position {
   id: string;

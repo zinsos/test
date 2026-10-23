@@ -57,6 +57,12 @@ export class MemoryTradingStore implements TradingStore {
     this.positions.set(position.id, position);
   }
 
+  discardPendingPosition(positionId: string): void {
+    if (this.positions.get(positionId)?.status === "pending") {
+      this.positions.delete(positionId);
+    }
+  }
+
   recordFill(position: Position, order: OrderRequest, fill: FillResult): void {
     this.fills.push({ position, order, fill });
   }
@@ -79,6 +85,10 @@ export class MemoryTradingStore implements TradingStore {
 
   async flush(): Promise<void> {
     this.flushes += 1;
+  }
+
+  pendingPositions(): Position[] {
+    return [...this.positions.values()].filter((position) => position.status === "pending");
   }
 
   openPositions(): Position[] {
