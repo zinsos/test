@@ -42,4 +42,13 @@ describe("DASHBOARD_ALLOW_OPEN", () => {
     expect(loadEnv({ DASHBOARD_ALLOW_OPEN: " Yes " }).DASHBOARD_ALLOW_OPEN).toBe(true);
     expect(() => loadEnv({ DASHBOARD_ALLOW_OPEN: "open" })).toThrow(/DASHBOARD_ALLOW_OPEN/);
   });
+
+  it("treats blank values from env files as unset", () => {
+    const env = loadEnv({ RPC_HTTP_URL: "", RPC_WS_URL: "  ", HOST: "", LIVE_DRY_RUN: "", DASHBOARD_TOKEN: "" });
+    expect(env.RPC_HTTP_URL).toBeUndefined();
+    expect(env.RPC_WS_URL).toBeUndefined();
+    expect(env.HOST).toBeUndefined();
+    expect(env.DASHBOARD_TOKEN).toBeUndefined();
+    expect(env.LIVE_DRY_RUN).toBe(true);
+  });
 });

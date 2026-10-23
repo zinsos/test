@@ -73,8 +73,18 @@ const EnvSchema = z.object({
 
 export type Env = z.infer<typeof EnvSchema>;
 
+function withoutBlankValues(source: NodeJS.ProcessEnv): Record<string, string> {
+  const present: Record<string, string> = {};
+  for (const [name, value] of Object.entries(source)) {
+    if (value !== undefined && value.trim().length > 0) {
+      present[name] = value;
+    }
+  }
+  return present;
+}
+
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
-  const parsed = EnvSchema.safeParse(source);
+  const parsed = EnvSchema.safeParse(withoutBlankValues(source));
   if (!parsed.success) {
     const issues = parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ");
     throw new Error(`invalid environment: ${issues}`);
