@@ -324,7 +324,7 @@ export class DesktopShell {
     if (localSession.listenerCount("will-download") === 0) {
       localSession.on("will-download", (event) => event.preventDefault());
       localSession.webRequest.onBeforeRequest((details, callback) => {
-        callback({ cancel: !(details.url.startsWith("file:") || details.url.startsWith("devtools:")) });
+        callback({ cancel: !(pageNameOf(details.url, this.paths.pages) !== null || details.url.startsWith("devtools:")) });
       });
     }
   }

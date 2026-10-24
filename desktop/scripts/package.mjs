@@ -1,3 +1,4 @@
+import { FuseState, FuseV1Options, FuseVersion, flipFuses, getCurrentFuseWire } from "@electron/fuses";
 import { packager } from "@electron/packager";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -44,6 +45,37 @@ const appPaths = await packager({
     : {})
 });
 
+const fuses = {
+  version: FuseVersion.V1,
+  resetAdHocDarwinSignature: platform === "darwin" && arch === "arm64",
+  [FuseV1Options.RunAsNode]: false,
+  [FuseV1Options.EnableCookieEncryption]: true,
+  [FuseV1Options.EnableNodeOptionsEnvironmentVariable]: false,
+  [FuseV1Options.EnableNodeCliInspectArguments]: false,
+  [FuseV1Options.OnlyLoadAppFromAsar]: true,
+  [FuseV1Options.GrantFileProtocolExtraPrivileges]: true
+};
+
+function electronBinary(appPath) {
+  if (platform === "darwin" || platform === "mas") {
+    return path.join(appPath, `${manifest.productName}.app`);
+  }
+  return path.join(appPath, platform === "win32" ? `${manifest.productName}.exe` : manifest.productName);
+}
+
+async function lockFuses(binary) {
+  await flipFuses(binary, fuses);
+  const wire = await getCurrentFuseWire(binary);
+  const wrong = Object.entries(fuses)
+    .filter(([key]) => /^\d+$/.test(key))
+    .filter(([key, wanted]) => wire[key] !== (wanted ? FuseState.ENABLE : FuseState.DISABLE))
+    .map(([key]) => FuseV1Options[key]);
+  if (wrong.length > 0) {
+    throw new Error(`fuses not set on ${binary}: ${wrong.join(", ")}`);
+  }
+}
+
 for (const appPath of appPaths) {
-  console.log(`packaged ${path.relative(root, appPath)}`);
+  await lockFuses(electronBinary(appPath));
+  console.log(`packaged ${path.relative(root, appPath)} with hardened fuses`);
 }

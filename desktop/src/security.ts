@@ -14,6 +14,10 @@ export function applyPermissionPolicy(target: Session, policy: PermissionPolicy 
 }
 
 export function hardenApp(): void {
+  app.on("select-client-certificate", (event, _contents, _url, _certificates, callback) => {
+    event.preventDefault();
+    callback();
+  });
   app.on("session-created", (created) => applyPermissionPolicy(created));
   app.on("web-contents-created", (_event, contents) => {
     contents.on("will-attach-webview", (event) => event.preventDefault());

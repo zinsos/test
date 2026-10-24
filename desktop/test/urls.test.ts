@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
-  dashboardSeedUrl,
   externalHttpsUrl,
   isBlobOfOrigin,
   isSameOrigin,
   isValidToken,
   parseDashboardUrl,
-  webVersionUrl
+  requestOriginOf,
+  webVersionUrl,
+  withDashboardAuthorization
 } from "../src/urls.js";
 
 describe("parseDashboardUrl", () => {
@@ -54,9 +55,35 @@ describe("tokens", () => {
     assert.equal(isValidToken("line\nbreak"), false);
     assert.equal(isValidToken("x".repeat(513)), false);
   });
+});
 
-  it("encodes the token in the seed url", () => {
-    assert.equal(dashboardSeedUrl("https://alpha.example.com", "a&b=c"), "https://alpha.example.com/?token=a%26b%3Dc");
+describe("dashboard authorization header", () => {
+  const origin = "https://alpha.example.com";
+  const token = "test-token-0123456789";
+
+  it("adds the bearer token to requests for the dashboard origin and replaces any page header", () => {
+    const headers = withDashboardAuthorization(`${origin}/api/live/stream`, { Accept: "text/event-stream", authorization: "Bearer page-token" }, origin, token);
+    assert.deepEqual(headers, { Accept: "text/event-stream", Authorization: `Bearer ${token}` });
+  });
+
+  it("never sends the token to another origin or scheme", () => {
+    const page = { Accept: "application/json" };
+    assert.deepEqual(withDashboardAuthorization("https://evil.example.com/api/rpc", page, origin, token), page);
+    assert.deepEqual(withDashboardAuthorization("http://alpha.example.com/api/rpc", page, origin, token), page);
+    assert.deepEqual(withDashboardAuthorization("https://alpha.example.com.evil.example/api", page, origin, token), page);
+    assert.deepEqual(withDashboardAuthorization("data:text/plain,hi", page, origin, token), page);
+  });
+
+  it("leaves headers alone without a usable token", () => {
+    const page = { Authorization: "Bearer page-token" };
+    assert.deepEqual(withDashboardAuthorization(`${origin}/api/rpc`, page, origin, null), page);
+    assert.deepEqual(withDashboardAuthorization(`${origin}/api/rpc`, page, origin, "bad\r\nX-Injected: 1"), page);
+  });
+
+  it("maps websocket urls to their http origin", () => {
+    assert.equal(requestOriginOf("wss://alpha.example.com/socket"), origin);
+    assert.equal(requestOriginOf("ws://127.0.0.1:8790/socket"), "http://127.0.0.1:8790");
+    assert.equal(requestOriginOf("blob:https://alpha.example.com/2f0c"), null);
   });
 });
 

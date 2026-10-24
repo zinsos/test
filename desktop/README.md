@@ -33,11 +33,13 @@ Only one copy of the app runs at a time; starting it again brings the open windo
 
 Everything lives in `%APPDATA%\snypra-edge`:
 
-- `config.json`: the dashboard address and the token. The token is encrypted with Windows' data protection (Electron `safeStorage`), so the file is useless on another PC or another Windows account.
+- `config.json`: the dashboard address and the token. The token is encrypted with Windows' data protection (Electron `safeStorage`), so the file is useless on another PC or another Windows account. This is the only place the app keeps the token.
 - `window-state.json`: window size and position.
-- `Partitions\dashboard`: the dashboard's browser storage (its saved token and view preferences).
+- `Partitions\dashboard`: the dashboard's browser storage (view preferences only).
 
 Delete that folder to reset the app.
+
+The app never hands the token to the dashboard page: it adds `Authorization: Bearer <token>` itself to requests for the saved address only, so the token never appears in an address, in the page's storage or in a file other than `config.json`. The dashboard's own "Forget token on this device" button therefore has nothing to forget in the app: change the token in Settings, or delete the folder to remove it. If the server rejects the saved token (for example after `DASHBOARD_TOKEN` was changed), the app opens Settings and asks for the current one.
 
 ## Security
 
@@ -46,6 +48,8 @@ Delete that folder to reset the app.
 - Every permission request (camera, microphone, location, notifications and so on) is refused. The one exception is clipboard writing for the dashboard's copy buttons.
 - Downloads are allowed only for files the dashboard itself produces (CSV exports).
 - Developer tools are disabled in the packaged app.
+- The packaged exe has Electron's hardening fuses set: it cannot be run as plain Node.js (`ELECTRON_RUN_AS_NODE`), ignores `NODE_OPTIONS` and `--inspect`, loads its code only from `app.asar`, and encrypts its cookies. `GrantFileProtocolExtraPrivileges` stays on because the app's own pages are `file://` pages inside `app.asar`; those views may only load their own page files.
+- When a server asks for a client certificate, the app sends none (Electron would otherwise pick the first certificate in the Windows store).
 
 ## Keyboard
 
@@ -58,7 +62,7 @@ Delete that folder to reset the app.
 
 ## Build it yourself on Windows
 
-You need Node.js 22 or newer.
+You need Node.js 22.12 or newer.
 
 ```bat
 cd desktop
@@ -73,6 +77,6 @@ The app is written to `desktop\out\snypra-edge-win32-x64\`; run `snypra-edge.exe
 - `npm run typecheck`
 - `npm run icon`: redraws `assets/icon.png` and `assets/icon.ico` (the amber underscore mark).
 
-`npm run package` also works on Linux and macOS (the exe icon and version info are written without Wine). If the Electron download fails behind a proxy, download `electron-v45.0.0-win32-x64.zip` from the Electron releases yourself, check it against that release's `SHASUMS256.txt`, and run `node scripts/package.mjs --electron-zip-dir <folder with the zip>` after `npm run build`.
+`npm run package` also sets the hardening fuses on the packaged exe and checks them. It works on Linux and macOS too (the exe icon and version info are written without Wine). If the Electron download fails behind a proxy, download `electron-v45.0.0-win32-x64.zip` from the Electron releases yourself, check it against that release's `SHASUMS256.txt`, and run `node scripts/package.mjs --electron-zip-dir <folder with the zip>` after `npm run build`.
 
 This folder is separate from the main service: it has its own `package.json` and is not part of the root `npm run check`.
