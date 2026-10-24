@@ -89,8 +89,12 @@ export {
   DEFAULT_ANALYTICS_SETTINGS,
   type AnalyticsSettings,
   type ExtraHealth,
-  type ScoreLookup
+  type ScoreLookup,
+  type TradingControls,
+  type WalletSnapshot,
+  type WalletSource
 } from "./routes.js";
+export { DEFAULT_PRICE_SOURCES, positivePrice, SolPriceFeed, type PriceSource, type SolPrice, type SolPriceLookup } from "./solPrice.js";
 export {
   createAnalyticsHandler,
   DEFAULT_CACHE_TTL_MS,

@@ -52,6 +52,9 @@ export type FillReconciler = (order: OrderRequest, signature: string) => Promise
 
 export interface TraderRisk extends RiskGate {
   releaseEntry?(mint: Pubkey, nowMs?: number): void;
+  killNow?(reason: string, nowMs?: number): boolean;
+  resetKill?(reason?: string, nowMs?: number): void;
+  isKilled?(): boolean;
 }
 
 export interface ExitEventSource {
@@ -356,6 +359,32 @@ export class Trader {
     }
     this.markToMarket(nowMs);
     return closed;
+  }
+
+  closeAll(reason: string): number {
+    if (!this.risk.killNow) {
+      throw new Error("this trader's risk manager cannot close all positions");
+    }
+    const nowMs = this.clock.nowMs();
+    this.risk.killNow(reason, nowMs);
+    log.warn({ runId: this.runId, open: this.slots.size, reason }, "close all requested, selling every open position and pausing entries");
+    for (const slot of [...this.slots.values()]) {
+      this.evaluateSlot(slot, nowMs);
+    }
+    return this.primaryPositions().length;
+  }
+
+  resumeEntries(reason: string): boolean {
+    if (!this.risk.resetKill || !this.risk.isKilled?.()) {
+      return false;
+    }
+    this.risk.resetKill(reason, this.clock.nowMs());
+    log.warn({ runId: this.runId, reason }, "entries resumed");
+    return true;
+  }
+
+  entriesPaused(): boolean {
+    return this.risk.isKilled?.() ?? false;
   }
 
   hasOpenPosition(mint: Pubkey): boolean {

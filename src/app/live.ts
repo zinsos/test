@@ -1,4 +1,14 @@
-import { entryRulesOf, latestSkipReason, LiveHub, sellFeeDefaultsOf, startAnalyticsServer, thresholdsOf } from "../analytics/index.js";
+import {
+  entryRulesOf,
+  latestSkipReason,
+  LiveHub,
+  sellFeeDefaultsOf,
+  SolPriceFeed,
+  startAnalyticsServer,
+  thresholdsOf,
+  type TradingControls,
+  type WalletSnapshot
+} from "../analytics/index.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
 import type { StrategyConfig } from "../config/strategy.js";
@@ -36,6 +46,30 @@ const MINUTE_MS = 60_000;
 const MIN_DASHBOARD_TOKEN_LENGTH = 24;
 const SKIP_REASON_LOOKBACK_MS = 1_000;
 const PLACEHOLDER_DASHBOARD_TOKEN = "change-me-to-a-long-random-string";
+
+
+function walletSnapshotOf(parts: TradingParts): WalletSnapshot {
+  const status = parts.risk.status();
+  return {
+    mode: parts.mode,
+    address: parts.live?.wallet ?? null,
+    walletLamports: parts.live ? parts.risk.availableBalanceLamports() : null,
+    equityLamports: status.equityLamports,
+    entriesPaused: status.killed,
+    killReason: status.killReason,
+    haltedForDay: status.haltedForDay
+  };
+}
+
+function tradingControlsOf(parts: () => TradingParts | null): TradingControls {
+  return {
+    closeAll: (reason) => parts()?.trader.closeAll(reason) ?? null,
+    resume: (reason) => {
+      const current = parts();
+      return current ? current.trader.resumeEntries(reason) : null;
+    }
+  };
+}
 
 export function dashboardTokenProblem(token: string | undefined): string | null {
   const value = token?.trim() ?? "";
@@ -316,7 +350,10 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
             entryRules: entryRulesOf(config),
             dayResetUtcHour: config.risk.dayResetUtcHour
           },
-          live: liveHub
+          live: liveHub,
+          price: new SolPriceFeed({ clock }),
+          wallet: () => (tradingParts ? walletSnapshotOf(tradingParts) : null),
+          trading: tradingControlsOf(() => tradingParts)
         })
       : await startHealthServer({
           db,

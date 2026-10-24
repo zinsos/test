@@ -6,6 +6,8 @@ import { DASHBOARD_SCRIPT } from "../src/analytics/dashboardScript.js";
 import { DASHBOARD_CSS } from "../src/analytics/dashboardStyle.js";
 import { cacheKey, HttpError, parseInteger, parseMint, parseMode, parseTime, toJson, tokensMatch } from "../src/analytics/http.js";
 import { PUMP_COIN_URL } from "../src/analytics/positionQueries.js";
+
+const SOLSCAN_ACCOUNT_URL = "https://solscan.io/account/";
 import { resolveRoute } from "../src/analytics/routes.js";
 import {
   jsonResponse,
@@ -31,13 +33,16 @@ function hashOf(source: string): string {
 describe("dashboard html", () => {
   const html = renderDashboardHtml();
 
-  it("is self-contained with no external URLs except the pump.fun coin link prefix, script src or stylesheet links", () => {
+  it("is self-contained with no external URLs except the pump.fun coin and Solscan account link prefixes, script src or stylesheet links", () => {
     expect(html).toContain(`var PUMP_COIN_URL = "${PUMP_COIN_URL}";`);
+    expect(html).toContain(`var SOLSCAN_ACCOUNT_URL = "${SOLSCAN_ACCOUNT_URL}";`);
     expect(html.split(PUMP_COIN_URL)).toHaveLength(2);
-    const withoutCoinLinks = html.split(PUMP_COIN_URL).join("");
-    expect(withoutCoinLinks).not.toMatch(/https?:/i);
-    expect(withoutCoinLinks).not.toMatch(/\/\//);
+    expect(html.split(SOLSCAN_ACCOUNT_URL)).toHaveLength(2);
+    const withoutLinks = html.split(PUMP_COIN_URL).join("").split(SOLSCAN_ACCOUNT_URL).join("");
+    expect(withoutLinks).not.toMatch(/https?:/i);
+    expect(withoutLinks).not.toMatch(/\/\//);
     expect(DASHBOARD_SCRIPT).toContain('href: PUMP_COIN_URL + encodeURIComponent(mint), target: "_blank", rel: "noopener noreferrer"');
+    expect(DASHBOARD_SCRIPT).toContain('href: SOLSCAN_ACCOUNT_URL + encodeURIComponent(address), target: "_blank", rel: "noopener noreferrer"');
     expect(html).not.toMatch(/<script[^>]*\ssrc\s*=/i);
     expect(html).not.toMatch(/<link\b/i);
     expect(html).not.toMatch(/@import/i);
@@ -45,10 +50,12 @@ describe("dashboard html", () => {
     expect(html).not.toContain("${");
   });
 
-  it("is mobile-first and themed for light and dark", () => {
+  it("is mobile-first and uses the dark loadstring theme", () => {
     expect(html).toContain('name="viewport" content="width=device-width, initial-scale=1');
-    expect(html).toContain("prefers-color-scheme: dark");
-    expect(html).toContain(':root[data-theme="dark"]');
+    expect(html).toContain('<meta name="color-scheme" content="dark">');
+    expect(DASHBOARD_CSS).toContain("color-scheme: dark;");
+    expect(DASHBOARD_CSS).toContain("--accent: #f3c24b;");
+    expect(DASHBOARD_CSS).toContain("--page: #090909;");
     expect(DASHBOARD_CSS).toContain("min-height: 44px");
     expect(DASHBOARD_CSS).toContain("overflow-x: hidden");
     expect(html).toContain("<title>SNYPRA edge</title>");

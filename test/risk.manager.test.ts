@@ -222,6 +222,20 @@ describe("risk manager kill switch", () => {
     expect(store.kinds()).toContain("kill_switch");
   });
 
+  it("kills on request, flattens even when flattenOnKill is off, and clears on reset", () => {
+    const { risk, store } = manager({ config: { ...riskConfig(), flattenOnKill: false } });
+    expect(risk.killNow("dashboard: close all", NOON_UTC)).toBe(true);
+    expect(risk.status().killed).toBe(true);
+    expect(risk.status().killReason).toBe("dashboard: close all");
+    expect(risk.shouldFlattenAll()).toBe(true);
+    expect(risk.evaluateEntry(entry("MintA", DEV_A, NOON_UTC + 1000)).reason).toBe("killed");
+    expect(risk.killNow("again", NOON_UTC + 2000)).toBe(false);
+    expect(store.kinds().filter((kind) => kind === "kill_switch")).toHaveLength(1);
+    risk.resetKill("dashboard: resume", NOON_UTC + 3000);
+    expect(risk.status().killed).toBe(false);
+    expect(risk.shouldFlattenAll()).toBe(false);
+  });
+
   it("stays killed across days until reset", () => {
     const { risk, store } = manager();
     risk.onPositionClosed(closedTrade("p1", "MintA", -1_250_000_000n, NOON_UTC));

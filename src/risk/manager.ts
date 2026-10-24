@@ -103,6 +103,7 @@ export class RiskManager implements RiskGate {
   private killed: boolean;
   private killReason: string | null;
   private killedAtMs: number | null;
+  private forceFlatten = false;
   private availableBalance: bigint | null = null;
   private devEntries: Map<Pubkey, number>;
   private readonly reservations = new Map<Pubkey, Reservation>();
@@ -246,7 +247,20 @@ export class RiskManager implements RiskGate {
   }
 
   shouldFlattenAll(): boolean {
-    return this.killed && this.config.flattenOnKill;
+    return this.killed && (this.config.flattenOnKill || this.forceFlatten);
+  }
+
+  killNow(reason: string, nowMs: number = this.clock.nowMs()): boolean {
+    this.forceFlatten = true;
+    if (this.killed) {
+      return false;
+    }
+    this.killed = true;
+    this.killedAtMs = nowMs;
+    this.killReason = reason;
+    this.emitEvent(nowMs, "kill_switch", { manual: true, reason, equityLamports: this.equity().toString(), flatten: true });
+    this.persist(nowMs);
+    return true;
   }
 
   isKilled(): boolean {
@@ -263,6 +277,7 @@ export class RiskManager implements RiskGate {
     }
     const previous = this.killReason;
     this.killed = false;
+    this.forceFlatten = false;
     this.killReason = null;
     this.killedAtMs = null;
     this.peakEquity = this.equity();

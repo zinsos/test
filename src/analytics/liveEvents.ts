@@ -447,6 +447,9 @@ export function riskEventDraft(event: RiskEvent): LiveEventDraft | null {
   const base = { category: "system" as const, atMs: event.atMs, mint: null, symbol: null, data: { kind: event.kind } };
   switch (event.kind) {
     case "kill_switch": {
+      if (event.detail.manual === true) {
+        return { ...base, kind: "risk", tone: "bad", text: "Close all requested: selling every open position. New buys are paused until you resume." };
+      }
       const peak = lamportsDetail(event.detail.peakEquityLamports);
       const equity = lamportsDetail(event.detail.equityLamports);
       const drawdown = peak !== null && equity !== null && peak > 0n ? lamportsRatio(peak - equity, peak) : null;

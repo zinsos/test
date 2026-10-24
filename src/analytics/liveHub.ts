@@ -252,6 +252,18 @@ export class LiveHub {
     };
   }
 
+  openValue(): { count: number; valueSol: number } {
+    const nowMs = this.clock.nowMs();
+    const positions = this.positions ? this.openPrimaryPositions() : [];
+    let valueSol = 0;
+    for (const position of positions) {
+      const view = this.viewOf(position, nowMs);
+      const booked = view.costSol - view.proceedsSol;
+      valueSol += view.pnlEstimateSol === null ? Math.max(0, booked) : view.pnlEstimateSol + booked;
+    }
+    return { count: positions.length, valueSol };
+  }
+
   series(positionId: string): PositionSeries | null {
     const position = this.findOpen(positionId);
     if (!position) {

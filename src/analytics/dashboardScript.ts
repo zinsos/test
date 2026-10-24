@@ -10,6 +10,9 @@ export const DASHBOARD_SCRIPT = String.raw`
   var LIVE_REFRESH_MS = 10000;
   var STALL_MS = 30000;
   var TICK_MS = 1000;
+  var WALLET_MS = 15000;
+  var ARM_MS = 6000;
+  var SOLSCAN_ACCOUNT_URL = "https://solscan.io/account/";
   var PREFS_VERSION = "2";
   var PUMP_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
   var PUMP_COIN_URL = "https://pump.fun/coin/";
@@ -120,6 +123,8 @@ export const DASHBOARD_SCRIPT = String.raw`
     if (value < 0) { return "-" + digits; }
     return signed === false ? digits : "+" + digits;
   }
+  function fmtUsd(value) { return isNum(value) ? (value < 0 ? "-$" : "$") + Math.abs(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : DASH; }
+  function fmtSolAmount(value) { return isNum(value) ? value.toFixed(4) : DASH; }
   function fmtPct(value, decimals) { return isNum(value) ? (value * 100).toFixed(decimals === undefined ? 1 : decimals) + "%" : DASH; }
   function fmtNum(value, decimals) { return isNum(value) ? value.toFixed(decimals === undefined ? 2 : decimals) : DASH; }
   function fmtInt(value) { return isNum(value) ? Math.round(value).toLocaleString("en-US") : DASH; }
@@ -161,18 +166,24 @@ export const DASHBOARD_SCRIPT = String.raw`
     if (current) { headers.Authorization = "Bearer " + current; }
     return headers;
   }
-  function api(path, params) {
-    return fetch(path + queryString(params), { headers: authHeaders(), cache: "no-store", credentials: "same-origin" }).then(function (res) {
-      if (res.status === 401) { var authError = new Error("unauthorized"); authError.auth = true; throw authError; }
-      return res.json().catch(function () { return null; }).then(function (body) {
-        if (!res.ok) {
-          var error = new Error(body && body.message ? body.message : "Request failed (" + res.status + ")");
-          error.status = res.status;
-          throw error;
-        }
-        return body;
-      });
+  function readJson(res) {
+    if (res.status === 401) { var authError = new Error("unauthorized"); authError.auth = true; throw authError; }
+    return res.json().catch(function () { return null; }).then(function (body) {
+      if (!res.ok) {
+        var error = new Error(body && body.message ? body.message : "Request failed (" + res.status + ")");
+        error.status = res.status;
+        throw error;
+      }
+      return body;
     });
+  }
+  function api(path, params) {
+    return fetch(path + queryString(params), { headers: authHeaders(), cache: "no-store", credentials: "same-origin" }).then(readJson);
+  }
+  function apiPost(path) {
+    var headers = authHeaders();
+    headers["Content-Type"] = "application/json";
+    return fetch(path, { method: "POST", headers: headers, body: "{}", cache: "no-store", credentials: "same-origin" }).then(readJson);
   }
 
   function card(title, hint) {
@@ -712,7 +723,7 @@ export const DASHBOARD_SCRIPT = String.raw`
       el("div", { class: "row" }, el("h2", { text: modeWord(run.mode) + " run #" + run.id + (run.label ? DOT + run.label : "") }), riskBadge(data)),
       figure ? el("div", { class: "figure", text: figure }) : null,
       figure ? el("div", { class: "figure-unit", text: "SOL equity, open positions at their estimated exit value" }) : el("p", { class: "detail", text: "No bankroll saved for this run yet. It appears with the first trade, or within a minute while positions are open." }),
-      b && b.killed ? el("p", { class: "detail", text: "Kill switch: " + (b.killReason || "tripped") + ". New entries stay blocked until it is reset from the CLI." }) : null,
+      b && b.killed ? el("p", { class: "detail", text: "Kill switch: " + (b.killReason || "tripped") + ". New buys stay paused until you tap Resume buying on the wallet card." }) : null,
       b && b.haltedForDay ? el("p", { class: "detail", text: "Daily loss limit reached. Entries resume " + fmtTime(b.haltedUntilMs) + "." }) : null,
       el("p", { class: "subline", text: last24hText(data) }),
       el("p", { class: "subline", text: "Started " + fmtTime(run.startedAtMs) + (run.active ? DOT + "updates every " + LIVE_REFRESH_MS / 1000 + "s while this tab is open" : DOT + "ended " + fmtTime(run.endedAtMs)) }));
@@ -812,9 +823,109 @@ export const DASHBOARD_SCRIPT = String.raw`
     a.skipReasons.forEach(function (item) { pairs.push(["skipped: " + readable(item.reason), fmtInt(item.count)]); });
     return card("Entry signals, last " + a.windowHours + "h", "Every signal this run received, and why the rest were not traded.", kv(pairs));
   }
+  var wallet = { data: null, lastMs: 0, loading: false, busy: false, armed: null, armedUntil: 0, note: "", card: null };
+  function walletLive() { return !!(wallet.data && wallet.data.mode === "live"); }
+  function renderBalance() {
+    if (!dom.balance) { return; }
+    var w = wallet.data;
+    if (!w || !w.enabled) { dom.balance.replaceChildren(); return; }
+    dom.balance.replaceChildren(
+      el("span", { class: "bal-tag", text: walletLive() ? "live" : "paper" }),
+      el("span", { class: "bal-sol", text: fmtSolAmount(w.totalSol) + " SOL" }),
+      el("span", { class: "bal-usd", text: fmtUsd(w.totalUsd) }),
+      w.entriesPaused ? el("span", { class: "bal-flag", text: "buys paused" }) : null);
+  }
+  function addressLink(address) {
+    if (!MINT_PATTERN.test(address || "")) { return null; }
+    return el("a", { class: "ext-link", href: SOLSCAN_ACCOUNT_URL + encodeURIComponent(address), target: "_blank", rel: "noopener noreferrer", text: shortAddr(address) + " ↗" });
+  }
+  function walletArmed(action) { return wallet.armed === action && Date.now() < wallet.armedUntil; }
+  function walletControls(w) {
+    var paused = w.entriesPaused;
+    var action = paused ? "resume" : "close";
+    var armed = walletArmed(action);
+    var label = paused ? (armed ? "Tap again to resume buying" : "Resume buying") : (armed ? "Tap again: sell everything now" : "Close all & pause buying");
+    return el("div", { class: "actions" },
+      el("button", { type: "button", class: "btn " + (paused ? "primary" : "danger") + (armed ? " armed" : ""), text: label, disabled: wallet.busy, onclick: function () { walletAction(action); } }));
+  }
+  function renderWalletCard() {
+    var node = wallet.card;
+    if (!node) { return; }
+    var w = wallet.data;
+    if (!w || !w.enabled) { node.hidden = true; node.replaceChildren(); return; }
+    node.hidden = false;
+    var live = walletLive();
+    node.replaceChildren(
+      el("div", { class: "row" }, el("p", { class: "eyebrow", text: live ? "Hot wallet" : "Paper bankroll" }), w.entriesPaused ? badge("Buys paused", "bad") : badge(live ? "Trading live" : "Paper trading", "good")),
+      el("div", { class: "figure", text: fmtUsd(w.totalUsd) }),
+      el("div", { class: "figure-unit", text: fmtSolAmount(w.totalSol) + " SOL" + (live ? " in the wallet and open trades" : " paper equity") }),
+      grid([
+        live ? stat("In wallet", fmtSolAmount(w.walletSol), fmtUsd(w.walletUsd)) : null,
+        stat("In open trades", fmtSolAmount(w.openValueSol), fmtInt(w.openPositions) + " open" + DOT + fmtUsd(w.openValueUsd)),
+        stat("SOL price", fmtUsd(w.solUsd), w.priceSource ? w.priceSource + DOT + fmtAgo(w.priceAtMs) : "price unavailable"),
+        live ? stat("Address", w.address ? shortAddr(w.address) : DASH, "the bot's own trading wallet") : null
+      ]),
+      live ? addressLink(w.address) : null,
+      w.entriesPaused && w.killReason ? el("p", { class: "detail", text: "Paused: " + w.killReason + "." }) : null,
+      w.canControl ? walletControls(w) : null,
+      wallet.note ? el("p", { class: "subline", text: wallet.note }) : null);
+  }
+  function walletCardNode() {
+    if (!wallet.card) { wallet.card = el("section", { class: "card wallet-card", hidden: true }); }
+    renderWalletCard();
+    return wallet.card;
+  }
+  function loadWallet(force) {
+    if (wallet.loading) { return Promise.resolve(wallet.data); }
+    if (!force && (!autoRefreshAllowed() || Date.now() - wallet.lastMs < WALLET_MS)) { return Promise.resolve(wallet.data); }
+    wallet.loading = true;
+    wallet.lastMs = Date.now();
+    return api("/api/wallet").then(function (data) {
+      wallet.data = data;
+      renderBalance();
+      renderWalletCard();
+      return data;
+    }).catch(function () { return wallet.data; }).then(function (data) {
+      wallet.loading = false;
+      return data;
+    });
+  }
+  function walletAction(action) {
+    if (wallet.busy) { return; }
+    if (!walletArmed(action)) {
+      wallet.armed = action;
+      wallet.armedUntil = Date.now() + ARM_MS;
+      wallet.note = action === "close" ? "This sells every open position at market and pauses new buys until you resume." : "Buying starts again on the next signal.";
+      renderWalletCard();
+      return;
+    }
+    wallet.armed = null;
+    wallet.busy = true;
+    wallet.note = action === "close" ? "Closing all positions…" : "Resuming…";
+    renderWalletCard();
+    apiPost(action === "close" ? "/api/actions/close-all" : "/api/actions/resume").then(function (result) {
+      var closing = result && isNum(result.closing) ? result.closing : 0;
+      wallet.note = action === "close" ? "Selling " + fmtInt(closing) + (closing === 1 ? " position" : " positions") + ". New buys are paused." : (result && result.resumed ? "Buying resumed." : "Buying was not paused.");
+    }).catch(function (error) {
+      wallet.note = "Failed: " + (error && error.message ? error.message : "request failed");
+    }).then(function () {
+      wallet.busy = false;
+      return loadWallet(true);
+    }).then(function () {
+      if (state.tab === "trades") { render(true); }
+    });
+  }
+  function walletTick() {
+    if (wallet.armed && Date.now() >= wallet.armedUntil) {
+      wallet.armed = null;
+      wallet.note = "";
+      renderWalletCard();
+    }
+    loadWallet(false);
+  }
   function tradesView() {
     return api("/api/positions", { runId: tradesRunParam() }).then(function (data) {
-      var out = [];
+      var out = [walletCardNode()];
       var runOptions = tradesRunOptions();
       if (runOptions) {
         out.push(el("div", { class: "controls" }, field("Run", selectBox(runOptions, state.tradesRun, function (value) { state.tradesRun = value; savePrefs(); render(); }, "Run"))));
@@ -963,6 +1074,7 @@ ${LAB_VIEW_SCRIPT}
   }
   function tick() {
     showUpdated();
+    walletTick();
     liveTick();
     if (liveRefreshDue()) { render(true); }
   }
@@ -998,11 +1110,12 @@ ${LAB_VIEW_SCRIPT}
     }));
     dom.filters = el("div", { class: "filters" });
     dom.main = el("main", { id: "main" });
+    dom.balance = el("div", { class: "balance", role: "status", "aria-live": "polite" });
     var header = el("header", { class: "top" },
       el("div", { class: "bar" },
-        el("div", { class: "brand" }, dom.dot, "SNYPRA edge"),
+        el("div", { class: "brand" }, dom.dot, el("span", { class: "wordmark", "aria-label": "SNYPRA edge" }, "snypra", el("span", { class: "amber", text: "_" })), el("span", { class: "brand-sub", text: "edge" })),
         el("div", { class: "brand" }, dom.updated, el("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", text: "↻", onclick: function () { refresh(false); } }))),
-      dom.tabs, dom.filters);
+      dom.balance, dom.tabs, dom.filters);
     var footer = el("footer", { class: "footer" }, "Numbers are after fees. Expectancy decides, not win rate.", el("br"),
       el("button", { type: "button", text: "Forget token on this device", onclick: function () { storageSet(TOKEN_KEY, null); refresh(false); } }));
     document.body.replaceChildren(header, dom.main, footer);

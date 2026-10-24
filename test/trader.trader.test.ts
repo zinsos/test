@@ -324,6 +324,33 @@ describe("trader risk protections", () => {
     expect(store.signals.at(-1)?.skipReason).toBe("killed");
   });
 
+  it("closes every position on request even with flattenOnKill off, pauses entries, then resumes", async () => {
+    const env = createEnv();
+    const config = strategy((c) => {
+      c.risk.flattenOnKill = false;
+    });
+    const { trader, store, risk } = buildTrader(env, { config });
+    await createLaunch(env, MINT_A, T0);
+    await env.clock.advanceTo(T0 + 5_000);
+    trader.handleSignal(signalFor(env, MINT_A));
+    await env.clock.advanceTo(T0 + 6_000);
+    expect(trader.openPositions()).toHaveLength(1);
+    expect(trader.closeAll("dashboard: close all")).toBe(1);
+    expect(trader.entriesPaused()).toBe(true);
+    await env.clock.advanceTo(T0 + 8_000);
+    expect(trader.openPositions()).toHaveLength(0);
+    const [closed] = store.closedPositions();
+    expect(closed?.exitReason).toBe(KILL_SWITCH_REASON);
+    expect(store.fillsFor(closed?.id ?? "").at(-1)?.order.urgency).toBe("emergency");
+    trader.handleSignal(signalFor(env, MINT_A));
+    await flushMicrotasks();
+    expect(store.signals.at(-1)?.skipReason).toBe("killed");
+    expect(trader.resumeEntries("dashboard: resume")).toBe(true);
+    expect(trader.entriesPaused()).toBe(false);
+    expect(risk.isKilled()).toBe(false);
+    expect(trader.resumeEntries("again")).toBe(false);
+  });
+
   it("liquidates open positions at the current quote and restores positions after a restart", async () => {
     const env = createEnv();
     const first = buildTrader(env);

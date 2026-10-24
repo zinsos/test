@@ -45,6 +45,8 @@ import {
 import { latestScore, recentLaunches, recentSignals, trackedWallets } from "./activityQueries.js";
 import { loadLabOverview } from "./labQueries.js";
 import type { LiveHub, LiveStatus } from "./liveHub.js";
+import type { SolPriceLookup } from "./solPrice.js";
+import { lamportsToSol } from "./units.js";
 import { recorderHealth } from "./recorderQueries.js";
 import { scoreCheckpoints, scorerCalibration } from "./scorerQueries.js";
 import {
@@ -94,6 +96,23 @@ export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
 export type ScoreLookup = (mint: Pubkey) => LaunchScore | null;
 export type ExtraHealth = () => Record<string, unknown>;
 
+export interface WalletSnapshot {
+  mode: TradingMode;
+  address: string | null;
+  walletLamports: bigint | null;
+  equityLamports: bigint | null;
+  entriesPaused: boolean;
+  killReason: string | null;
+  haltedForDay: boolean;
+}
+
+export type WalletSource = () => WalletSnapshot | null;
+
+export interface TradingControls {
+  closeAll(reason: string): number | null;
+  resume(reason: string): boolean | null;
+}
+
 export interface AnalyticsContext {
   db: Db;
   clock: Clock;
@@ -102,6 +121,9 @@ export interface AnalyticsContext {
   scoreLookup: ScoreLookup | null;
   extraHealth: ExtraHealth | null;
   live: LiveHub | null;
+  wallet: WalletSource | null;
+  price: SolPriceLookup | null;
+  trading: TradingControls | null;
 }
 
 export interface ApiRequest {
@@ -121,7 +143,8 @@ export type StreamRoute = {
   kind: "stream";
   handle: (ctx: AnalyticsContext, request: ApiRequest, req: IncomingMessage, res: ServerResponse) => void;
 };
-export type ApiRoute = JsonRoute | CsvRoute | StreamRoute;
+export type ActionRoute = { kind: "action"; handle: (ctx: AnalyticsContext, request: ApiRequest) => Promise<unknown> };
+export type ApiRoute = JsonRoute | CsvRoute | StreamRoute | ActionRoute;
 
 const BREAKDOWN_ALL = "all";
 
@@ -385,6 +408,61 @@ function scorerDatasetRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStre
   };
 }
 
+async function walletRoute(ctx: AnalyticsContext): Promise<unknown> {
+  const snapshot = ctx.wallet ? ctx.wallet() : null;
+  const price = ctx.price ? await ctx.price.current().catch(() => null) : null;
+  const open = snapshot && ctx.live ? ctx.live.openValue() : null;
+  const walletSol = snapshot?.walletLamports === null || snapshot?.walletLamports === undefined ? null : lamportsToSol(snapshot.walletLamports);
+  const equitySol = snapshot?.equityLamports === null || snapshot?.equityLamports === undefined ? null : lamportsToSol(snapshot.equityLamports);
+  const openValueSol = open ? open.valueSol : null;
+  const totalSol = walletSol === null ? equitySol : walletSol + (openValueSol ?? 0);
+  const usd = (sol: number | null): number | null => (sol === null || price === null ? null : sol * price.usd);
+  return {
+    enabled: snapshot !== null,
+    mode: snapshot?.mode ?? null,
+    address: snapshot?.address ?? null,
+    walletSol,
+    walletUsd: usd(walletSol),
+    openPositions: open?.count ?? 0,
+    openValueSol,
+    openValueUsd: usd(openValueSol),
+    totalSol,
+    totalUsd: usd(totalSol),
+    equitySol,
+    entriesPaused: snapshot?.entriesPaused ?? false,
+    killReason: snapshot?.killReason ?? null,
+    haltedForDay: snapshot?.haltedForDay ?? false,
+    canControl: snapshot !== null && ctx.trading !== null,
+    solUsd: price?.usd ?? null,
+    priceSource: price?.source ?? null,
+    priceAtMs: price?.atMs ?? null,
+    readAtMs: ctx.clock.nowMs()
+  };
+}
+
+function tradingControls(ctx: AnalyticsContext): TradingControls {
+  if (!ctx.trading) {
+    throw new HttpError(409, "trading_unavailable", "no trader runs in this service");
+  }
+  return ctx.trading;
+}
+
+function closeAllRoute(ctx: AnalyticsContext): Promise<unknown> {
+  const closing = tradingControls(ctx).closeAll("dashboard: close all");
+  if (closing === null) {
+    throw new HttpError(409, "trading_unavailable", "the trader has not started yet");
+  }
+  return Promise.resolve({ ok: true, closing, entriesPaused: true });
+}
+
+function resumeRoute(ctx: AnalyticsContext): Promise<unknown> {
+  const resumed = tradingControls(ctx).resume("dashboard: resume");
+  if (resumed === null) {
+    throw new HttpError(409, "trading_unavailable", "the trader has not started yet");
+  }
+  return Promise.resolve({ ok: true, resumed, entriesPaused: false });
+}
+
 function tradesCsvRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStream {
   const filter = tradeFilterFrom(request.params);
   return {
@@ -410,6 +488,9 @@ const ROUTES: ReadonlyMap<string, ApiRoute> = new Map<string, ApiRoute>([
   ["live/status", { kind: "json", cacheable: false, handle: (ctx) => liveStatusRoute(ctx) }],
   ["live/stream", { kind: "stream", handle: liveStreamRoute }],
   ["live/events", { kind: "json", cacheable: false, handle: liveEventsRoute }],
+  ["wallet", { kind: "json", cacheable: false, handle: (ctx) => walletRoute(ctx) }],
+  ["actions/close-all", { kind: "action", handle: (ctx) => closeAllRoute(ctx) }],
+  ["actions/resume", { kind: "action", handle: (ctx) => resumeRoute(ctx) }],
   ["export/scorer-dataset.csv", { kind: "csv", handle: scorerDatasetRoute }],
   ["export/trades.csv", { kind: "csv", handle: tradesCsvRoute }]
 ]);

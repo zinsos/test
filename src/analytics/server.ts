@@ -5,7 +5,7 @@ import { moduleLogger } from "../core/logger.js";
 import type { Db } from "../db/pool.js";
 import { TtlCache } from "./cache.js";
 import { dashboardContentSecurityPolicy, renderDashboardHtml } from "./dashboard.js";
-import { HttpError, isAuthorized, sendEmpty, sendHtml, sendJson, startCsv, writeChunk } from "./http.js";
+import { bearerToken, HttpError, isAuthorized, sendEmpty, sendHtml, sendJson, startCsv, tokensMatch, writeChunk } from "./http.js";
 import type { LiveHub } from "./liveHub.js";
 import {
   DEFAULT_ANALYTICS_SETTINGS,
@@ -16,8 +16,11 @@ import {
   type ApiRequest,
   type CsvRoute,
   type ExtraHealth,
-  type ScoreLookup
+  type ScoreLookup,
+  type TradingControls,
+  type WalletSource
 } from "./routes.js";
+import type { SolPriceLookup } from "./solPrice.js";
 
 const log = moduleLogger("analytics");
 
@@ -41,6 +44,9 @@ export interface AnalyticsServerOptions {
   cacheMaxEntries?: number;
   settings?: Partial<AnalyticsSettings>;
   live?: LiveHub | null;
+  wallet?: WalletSource | null;
+  price?: SolPriceLookup | null;
+  trading?: TradingControls | null;
 }
 
 export interface AnalyticsServer {
@@ -152,7 +158,36 @@ async function handleApi(ctx: AnalyticsContext, access: ApiAccess, url: URL, req
     resolved.route.handle(ctx, request, req, res);
     return;
   }
+  if (resolved.route.kind === "action") {
+    sendJson(res, 405, { error: "method_not_allowed", message: "use POST" }, { Allow: "POST" });
+    return;
+  }
   sendJson(res, 200, await runJsonRoute(ctx, resolved.route, request));
+}
+
+async function handleAction(ctx: AnalyticsContext, access: ApiAccess, url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  req.resume();
+  if (access.token === null) {
+    sendJson(res, 403, { error: "actions_need_token", message: "set DASHBOARD_TOKEN to use dashboard actions" });
+    return;
+  }
+  const provided = bearerToken(req);
+  if (provided === null || !tokensMatch(provided, access.token)) {
+    sendJson(res, 401, { error: "unauthorized", message: "actions need Authorization: Bearer <token>" }, {
+      "WWW-Authenticate": 'Bearer realm="snypra-edge"'
+    });
+    return;
+  }
+  const resolved = resolveRoute(normalizedPath(url.pathname).slice(API_PREFIX.length));
+  if (!resolved) {
+    throw new HttpError(404, "not_found", "unknown api route");
+  }
+  if (resolved.route.kind !== "action") {
+    sendJson(res, 405, { error: "method_not_allowed", message: "only GET is supported" }, { Allow: "GET, HEAD" });
+    return;
+  }
+  const request: ApiRequest = { url, params: url.searchParams, segments: resolved.segments };
+  sendJson(res, 200, await resolved.route.handle(ctx, request));
 }
 
 function parseUrl(raw: string | undefined): URL | null {
@@ -176,7 +211,10 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
     settings: { ...DEFAULT_ANALYTICS_SETTINGS, ...options.settings },
     scoreLookup: options.scoreLookup ?? null,
     extraHealth: options.extraHealth ?? null,
-    live: options.live ?? null
+    live: options.live ?? null,
+    wallet: options.wallet ?? null,
+    price: options.price ?? null,
+    trading: options.trading ?? null
   };
   const access: ApiAccess = {
     token: options.token && options.token.length > 0 ? options.token : null,
@@ -192,6 +230,10 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
     try {
       if (!url) {
         throw new HttpError(400, "bad_request", "malformed url");
+      }
+      if (req.method === "POST" && path.startsWith(API_PREFIX)) {
+        await handleAction(ctx, access, url, req, res);
+        return;
       }
       if (req.method !== "GET" && req.method !== "HEAD") {
         sendJson(res, 405, { error: "method_not_allowed", message: "only GET is supported" }, { Allow: "GET, HEAD" });
