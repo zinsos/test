@@ -14,6 +14,7 @@ import {
   MINT,
   neverResponds,
   PENDING_MINT,
+  PLOT_WIDTH,
   READ_AT_MS,
   renderTradesView,
   startDashboard,
@@ -62,10 +63,12 @@ describe("dashboard html", () => {
   });
 
   it("has every tab, keeps the token in localStorage and sends it as a bearer", () => {
-    for (const tab of ["Trades", "Live", "Edge", "Lab", "Breakdowns", "Paper vs Live", "Scorer", "Recorder", "Signals", "Launches", "Wallets"]) {
+    for (const tab of ["Overview", "Live", "Performance", "Lab", "Breakdowns", "Paper vs Live", "Scorer", "Recorder", "Signals", "Launches", "Wallets", "Settings"]) {
       expect(DASHBOARD_SCRIPT).toContain(`"${tab}"`);
     }
-    expect(DASHBOARD_SCRIPT).toMatch(/var TABS = \[\s*\["trades", "Trades"\], \["live", "Live"\], \["edge", "Edge"\], \["lab", "Lab"\],/);
+    expect(DASHBOARD_SCRIPT).toMatch(
+      /var TABS = \[\s*\["trades", "Overview", "primary", "overview", "[^"]+"\],\s*\["live", "Live", "primary", "live", "[^"]+"\],\s*\["edge", "Performance", "primary", "performance", "[^"]+"\],\s*\["lab", "Lab", "primary", "lab", "[^"]+"\],/
+    );
     expect(DASHBOARD_SCRIPT).toContain("localStorage");
     expect(DASHBOARD_SCRIPT).toContain('"Bearer "');
     expect(DASHBOARD_SCRIPT).toContain('params.get("token")');
@@ -73,7 +76,7 @@ describe("dashboard html", () => {
   });
 
   it("opens on the Trades tab and refreshes it every 10 seconds only while the page is visible", () => {
-    expect(DASHBOARD_SCRIPT).toMatch(/var TABS = \[\s*\["trades", "Trades"\],/);
+    expect(DASHBOARD_SCRIPT).toMatch(/var TABS = \[\s*\["trades", "Overview",/);
     expect(DASHBOARD_SCRIPT).toContain('tab: "trades"');
     expect(DASHBOARD_SCRIPT).toContain('if (prefs.v !== PREFS_VERSION) { prefs.v = PREFS_VERSION; prefs.tab = "trades"; }');
     expect(DASHBOARD_SCRIPT).toContain("var LIVE_REFRESH_MS = 10000;");
@@ -98,6 +101,10 @@ describe("dashboard html", () => {
     expect(rendered.text).toContain("Recent closed trades");
     expect(rendered.links).toEqual([`${PUMP_COIN_URL}${MINT}`, `${PUMP_COIN_URL}${PENDING_MINT}`, `${PUMP_COIN_URL}${MINT}`]);
     expect(rendered.authHeaders).toEqual(["Bearer dom-token", "Bearer dom-token"]);
+    for (const expected of ["Equity5.397SOL+7.9% vs start", "Today+0.2973SOLday 2026-10-23", "Open11 awaiting fill · est. +0.1473 SOL", "Win rate100%1 of 1 won", "Expectancy+0.060SOL+60.0% per trade", "Trades11 closed in 24h"]) {
+      expect(rendered.text).toContain(expected);
+    }
+    expect(rendered.text).not.toMatch(/null|undefined|NaN/);
     const fixture = tradesFixture();
     const counts = { ...(fixture.counts as Record<string, unknown>), open: 0, pending: 0, openedLast24h: 0 };
     const empty = await renderTradesView({ ...fixture, open: [], counts });
@@ -199,9 +206,12 @@ describe("dashboard html", () => {
     expect(() => new Function(DASHBOARD_SCRIPT)).not.toThrow();
     expect(DASHBOARD_SCRIPT).not.toContain("</script");
     const innerHtmlUses = DASHBOARD_SCRIPT.split("innerHTML").length - 1;
-    expect(innerHtmlUses).toBe(3);
-    expect(DASHBOARD_SCRIPT).toContain("box.innerHTML = markup;");
+    expect(innerHtmlUses).toBe(1);
+    expect(DASHBOARD_SCRIPT).toContain("function svgInto(box, markup) { box.innerHTML = markup; return box; }");
     expect(DASHBOARD_SCRIPT).not.toMatch(/markup \+= [^;]*(text|symbol|label|name)\b/);
+    expect(DASHBOARD_SCRIPT).not.toMatch(/svgInto\([^;]*\b(text|symbol|label|name|mint)\b/);
+    expect(DASHBOARD_SCRIPT).not.toMatch(/\bsvg\.push\([^;]*\b(text|symbol|label|name|mint|reason)\b/);
+    expect(DASHBOARD_SCRIPT).not.toMatch(/style=/);
     expect(DASHBOARD_SCRIPT).not.toContain("outerHTML");
     expect(DASHBOARD_SCRIPT).not.toContain("insertAdjacentHTML");
     expect(DASHBOARD_SCRIPT).not.toContain("eval(");
@@ -350,7 +360,7 @@ function liveEvent(id: number, kind: string, category: string, text: string, dat
   return { id, kind, category, tone: kind === "closed" ? "good" : "info", atMs: READ_AT_MS - 1_000 + id, mint: MINT, symbol: "GEN", text, data };
 }
 
-function liveResponder(status: Record<string, unknown>): Responder {
+function liveResponder(status: Record<string, unknown>, position: Record<string, unknown> = liveView()): Responder {
   return (path) => {
     if (path.startsWith("/api/runs")) {
       return Promise.resolve(jsonResponse({ runs: [], modes: [] }));
@@ -372,13 +382,17 @@ function liveResponder(status: Record<string, unknown>): Responder {
     if (path.startsWith("/api/live/position/")) {
       return Promise.resolve(
         jsonResponse({
-          position: liveView(),
+          position,
           fromMs: READ_AT_MS - 180_000,
           totalTrades: 3,
           points: [
             { atMs: READ_AT_MS - 150_000, price: 0.00004 },
             { atMs: READ_AT_MS - 100_000, price: 0.00005 },
             { atMs: READ_AT_MS - 2_000, price: 0.0001 }
+          ],
+          fills: [
+            { side: "buy", atMs: READ_AT_MS - 100_000, price: 0.00005, reason: "score_momentum", pctOfEntry: 100, sol: 0.075, source: "fill" },
+            { side: "sell", atMs: READ_AT_MS - 2_000, price: 0.0001, reason: "take_profit", pctOfEntry: 50, sol: 0.07, source: "fill" }
           ],
           inMemory: true
         })
@@ -419,16 +433,49 @@ describe("live tab", () => {
     const feed = (): string[] => dashboard.find("feed-text").map((node) => node.textContent);
     expect(feed()).toEqual(["Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL", "Scored $GEN 60s: 18 (clean)"]);
     const chart = dashboard.find("live-chart")[0];
-    for (const line of ["lv-price", "lv-entry", "lv-stop", "lv-trail", "lv-tp"]) {
-      expect(chart?.innerHTML).toContain(`class="${line}"`);
+    const art = chart?.descendants().find((node) => node.className === "chart-art");
+    for (const line of ["lv-price", "lv-entry", "lv-stop", "lv-trail", "lv-tp", "lv-open", "lv-area"]) {
+      expect(art?.innerHTML).toContain(`class="${line}"`);
     }
-    expect(chart?.innerHTML).not.toMatch(/style=|GEN/);
+    expect(art?.innerHTML).toMatch(/<linearGradient id="cgrad\d+"/);
+    expect(art?.innerHTML).toMatch(/fill="url\(#cgrad\d+\)"/);
+    expect(art?.innerHTML).not.toMatch(/style=|GEN|Genesis|score_momentum|take_profit/);
+    expect(chart?.getAttribute("aria-label")).toBe("Price since 1 minute before entry, now 2.00× of entry");
     const labels = dashboard.find("lv-label");
-    expect(labels.map((node) => node.textContent)).toEqual(["TP 3.00×", "trail 1.72×", "entry 1.00×", "stop 0.65×"]);
-    const tops = labels.map((node) => Number.parseFloat(node.style.top ?? ""));
+    expect(labels.map((node) => node.textContent)).toEqual(["TP 3.00×", "Trail 1.72×", "Entry 1.00×", "Stop 0.65×"]);
+    const now = dashboard.find("lv-now");
+    expect(now.map((node) => node.textContent)).toEqual(["2.00×"]);
+    expect(now[0]?.className).toContain("pos");
+    const tags = dashboard.find("chart-tags")[0]?.children.filter((node) => node.className.startsWith("lv-")) ?? [];
+    const tops = tags.map((node) => Number.parseFloat(node.style.top ?? ""));
+    expect(tops).toHaveLength(5);
     expect(tops.every((top, index) => index === 0 || top - (tops[index - 1] ?? 0) >= 10)).toBe(true);
     expect(Math.min(...tops)).toBeGreaterThanOrEqual(5);
     expect(Math.max(...tops)).toBeLessThanOrEqual(95);
+    const grid = dashboard.find("chart-ylab").map((node) => node.textContent);
+    expect(grid.length).toBeGreaterThan(0);
+    expect(grid.every((text) => /^\d+(\.\d+)?×$/.test(text))).toBe(true);
+    expect(dashboard.find("chart-xlab").map((node) => node.textContent)).toEqual(["−1:00", "0:00", "1:00", "2:00"]);
+    const marks = dashboard.find("fill-mark");
+    expect(marks.map((node) => [node.textContent, node.className])).toEqual([["B", "fill-mark buy"], ["S", "fill-mark sell"]]);
+    for (const mark of marks) {
+      const left = Number.parseFloat(mark.style.left ?? "");
+      expect(left).toBeGreaterThan(0);
+      expect(left).toBeLessThan(100);
+      expect(mark.style.top).toMatch(/^\d+(\.\d+)?%$/);
+    }
+    expect(dashboard.find("now-dot")).toHaveLength(1);
+    await dashboard.pointer("chart-plot", "pointermove", PLOT_WIDTH * (80 / 180));
+    const tip = dashboard.find("tooltip")[0];
+    expect(tip?.style.display).toBe("block");
+    expect(tip?.textContent).toContain("1.00×0.0% vs entry");
+    expect(tip?.textContent).toContain("0:20 since entry");
+    expect(tip?.textContent).toContain("Bought 0.075 SOL at 1.00×");
+    expect(dashboard.find("chart-ytag")[0]?.textContent).toBe("1.00×");
+    await dashboard.pointer("chart-plot", "pointermove", PLOT_WIDTH * 0.99);
+    expect(dashboard.find("tooltip")[0]?.textContent).toContain("Sold 50% for 0.070 SOL at 2.00× · take profit");
+    await dashboard.pointer("chart-plot", "pointerleave", 0);
+    expect(dashboard.find("tooltip")[0]?.style.display).toBe("none");
 
     await dashboard.change("Show", "scores");
     expect(feed()).toEqual(["Scored $GEN 60s: 18 (clean)"]);
@@ -450,6 +497,23 @@ describe("live tab", () => {
     expect(feed()[0]).toBe("Closed $GEN: +0.025 SOL (+33.3%), trailing stop after 5m");
     expect(text()).not.toContain("Exits:");
     expect(text()).toContain("No open positions.");
+  });
+
+  it("pins exit levels far outside the price range to the chart edge instead of squashing the chart", async () => {
+    const levels = { ...(liveView().levels as Record<string, unknown>), nextTakeProfit: { multiple: 10, price: 0.0005, sellPctOfInitial: 25 } };
+    const far = liveView({ levels });
+    const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder: liveResponder(LIVE_STATUS, far) });
+    const stream = dashboard.streams[0];
+    stream?.open();
+    stream?.send("hello", { streamId: "s5", serverTimeMs: READ_AT_MS, tradingActive: true, maxClients: 10, clients: 1, heartbeatMs: 15_000, positions: [far] });
+    await dashboard.flush();
+    const art = dashboard.find("chart-art")[0];
+    expect(art?.innerHTML).not.toContain('class="lv-tp"');
+    expect(art?.innerHTML).toContain('class="lv-stop"');
+    const tp = dashboard.find("lv-tp").find((node) => node.tagName === "span");
+    expect(tp?.textContent).toBe("TP 10.00× ↑");
+    expect(tp?.className).toBe("lv-label lv-tp off");
+    expect(Number.parseFloat(tp?.style.top ?? "")).toBeLessThanOrEqual(5);
   });
 
   it("keeps rare trade events in the feed while hundreds of scores stream past", async () => {
@@ -604,7 +668,7 @@ describe("lab tab", () => {
     }
     expect(dashboard.find("baseline")).toHaveLength(1);
     expect(dashboard.find("baseline")[0]?.textContent).toContain("Baseline");
-    await dashboard.click("Open in Edge");
+    await dashboard.click("Open in Performance");
     expect(JSON.parse(dashboard.storage.get("snypra-edge-prefs") ?? "{}")).toMatchObject({ runId: "41", mode: "backtest" });
     expect(dashboard.location.hash).toBe("edge");
   });
@@ -632,5 +696,166 @@ describe("lab tab", () => {
     expect(dashboard.paths).toContain("/api/summary?runId=41");
     expect(dashboard.bodyText()).toContain("#41 (opened from Lab)");
     expect(dashboard.bodyText()).toContain("#9 backtest bt (3)");
+  });
+});
+
+describe("navigation", () => {
+  const ALL_TABS = ["trades", "live", "edge", "lab", "breakdowns", "compare", "scorer", "recorder", "signals", "launches", "wallets", "settings"];
+
+  it("puts the main views in the sidebar and the bottom bar, the analysis views behind More, and keeps every hash route", async () => {
+    const dashboard = await startDashboard(tradesFixture());
+    const side = dashboard.find("side-link");
+    expect(side.map((node) => node.getAttribute("href"))).toEqual(ALL_TABS.map((tab) => `#${tab}`));
+    expect(side.map((node) => node.textContent)).toEqual(["Overview", "Live", "Performance", "Lab", "Breakdowns", "Paper vs Live", "Scorer", "Recorder", "Signals", "Launches", "Wallets", "Settings"]);
+    expect(dashboard.find("side-label").map((node) => node.textContent)).toEqual(["Trading", "Analysis", "System"]);
+    const bottom = dashboard.find("nav-tab");
+    expect(bottom.map((node) => node.textContent)).toEqual(["Overview", "Live", "Performance", "Lab", "More"]);
+    expect(bottom.slice(0, 4).map((node) => node.getAttribute("href"))).toEqual(["#trades", "#live", "#edge", "#lab"]);
+    expect(side[0]?.getAttribute("aria-current")).toBe("page");
+    expect(bottom[0]?.getAttribute("aria-current")).toBe("page");
+    expect(dashboard.find("page-title")[0]?.textContent).toBe("Overview");
+
+    await dashboard.click("More");
+    const more = dashboard.find("more-link");
+    expect(more.map((node) => node.getAttribute("href"))).toEqual(["#breakdowns", "#compare", "#scorer", "#recorder", "#signals", "#launches", "#wallets", "#settings"]);
+    expect(dashboard.bodyText()).toContain("Whether the recorder sees every launch and trade.");
+    more[3]?.dispatch("click");
+    expect(dashboard.find("more-link")).toHaveLength(0);
+
+    await dashboard.navigate("#recorder");
+    expect(dashboard.paths).toContain("/api/recorder/health");
+    expect(dashboard.find("page-title")[0]?.textContent).toBe("Recorder");
+    expect(side[7]?.getAttribute("aria-current")).toBe("page");
+    expect(side[0]?.getAttribute("aria-current")).toBe("false");
+    expect(bottom[4]?.className).toBe("nav-tab active");
+    expect(JSON.parse(dashboard.storage.get("snypra-edge-prefs") ?? "{}")).toMatchObject({ tab: "recorder" });
+
+    const reads = dashboard.paths.length;
+    await dashboard.navigate("#not-a-view");
+    expect(dashboard.paths.length).toBe(reads);
+    expect(dashboard.find("page-title")[0]?.textContent).toBe("Recorder");
+
+    await dashboard.navigate("#edge");
+    expect(dashboard.find("page-title")[0]?.textContent).toBe("Performance");
+    expect(bottom[2]?.getAttribute("aria-current")).toBe("page");
+    expect(bottom[4]?.className).toBe("nav-tab");
+  });
+
+  it("opens straight on any view named in the address", async () => {
+    for (const [hash, path, title] of [
+      ["#wallets", "/api/wallets/tracked?limit=100", "Wallets"],
+      ["#signals", "/api/signals/recent?limit=50", "Signals"],
+      ["#settings", "/api/rpc", "Settings"],
+      ["#compare", "/api/compare", "Paper vs Live"]
+    ] as const) {
+      const dashboard = await startDashboard({}, { hash });
+      expect(dashboard.paths).toContain(path);
+      expect(dashboard.find("page-title")[0]?.textContent).toBe(title);
+    }
+  });
+});
+
+describe("top bar and wallet", () => {
+  const WALLET = {
+    enabled: true,
+    mode: "live",
+    address: MINT,
+    walletSol: 0.4012,
+    walletUsd: 73.17,
+    openPositions: 1,
+    openValueSol: 0.0819,
+    openValueUsd: 14.94,
+    totalSol: 0.4831,
+    totalUsd: 88.11,
+    equitySol: 0.48,
+    todayPnlSol: -0.0125,
+    todayPnlUsd: -2.28,
+    entriesPaused: false,
+    killReason: null,
+    haltedForDay: false,
+    canControl: true,
+    marketData: { connected: false, lastDataAgoMs: 1_380_000, stale: true },
+    solUsd: 182.37,
+    priceSource: "coinbase",
+    priceAtMs: READ_AT_MS - 22_000,
+    readAtMs: READ_AT_MS
+  };
+
+  it("shows mode, balance, today's PnL and market data health, and never prints empty values", async () => {
+    const fixture = tradesFixture();
+    const responder: Responder = (path) =>
+      Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : path === "/api/wallet" ? WALLET : path.startsWith("/api/lab") ? { available: true, run: null } : fixture));
+    const dashboard = await startDashboard(fixture, { responder });
+    await dashboard.advance(1_000);
+    expect(dashboard.paths).toContain("/api/wallet");
+    expect(dashboard.find("mode-badge")[0]?.textContent).toBe("Live");
+    expect(dashboard.find("mode-badge")[0]?.className).toBe("mode-badge live");
+    const ticker = (): string => dashboard.find("ticker")[0]?.textContent ?? "";
+    expect(ticker()).toBe("Balance0.4831 SOL$88.11Today+0.2973 SOL");
+    expect(dashboard.find("dot")[0]?.className).toBe("dot bad");
+    expect(dashboard.find("health-text")[0]?.textContent).toBe("No market data");
+    expect(dashboard.find("alert")[0]?.textContent).toContain("No market data for 23m.");
+    expect(dashboard.find("alert")[0]?.textContent).toContain("Change key");
+    const wallet = dashboard.find("wallet-card")[0];
+    expect(wallet?.textContent).toContain("Hot wallet");
+    expect(wallet?.textContent).toContain("$88.11");
+    expect(wallet?.textContent).toContain("In wallet0.4012 SOL · $73.17");
+    expect(wallet?.textContent).toContain("Close all & pause buying");
+    expect(dashboard.view().links).toContain(`${SOLSCAN_ACCOUNT_URL}${MINT}`);
+    expect(dashboard.bodyText()).not.toMatch(/null|undefined|NaN/);
+
+    await dashboard.navigate("#lab");
+    await dashboard.advance(31_000);
+    expect(ticker()).toBe("Balance0.4831 SOL$88.11Today-0.0125 SOL");
+    await dashboard.click("Change key");
+    expect(dashboard.location.hash).toBe("settings");
+  });
+});
+
+describe("performance and lab charts", () => {
+  it("draws the equity curve with gridlines, axis labels, the last value and a crosshair", async () => {
+    const points = Array.from({ length: 41 }, (_, index) => ({
+      index,
+      atMs: READ_AT_MS - (40 - index) * 3_600_000,
+      equitySol: index === 0 ? 0 : Math.sin(index / 5) * 0.05 + index * 0.004,
+      pnlSol: 0.004,
+      drawdownSol: 0.01
+    }));
+    const summary = { n: 40, wins: 16, losses: 24, winRate: 0.4, lossRate: 0.6, expectancySol: 0.004, verdict: "insufficient_data", minTrades: 100, tradesNeeded: 120, significance: "none" };
+    const responder: Responder = (path) =>
+      Promise.resolve(
+        jsonResponse(
+          path.startsWith("/api/runs")
+            ? { runs: [], modes: [] }
+            : path.startsWith("/api/summary")
+              ? { summary, narrative: { tone: "warn", headline: "Too early", detail: "" } }
+              : { points }
+        )
+      );
+    const dashboard = await startDashboard({}, { hash: "#edge", responder });
+    const chart = dashboard.find("equity-chart")[0];
+    expect(chart?.getAttribute("aria-label")).toMatch(/^Equity curve over 40 trades, ending at \+0\.\d+ SOL$/);
+    const art = dashboard.find("chart-art")[0]?.innerHTML ?? "";
+    for (const cls of ["eq-area", "eq-line", "zero", "cg"]) {
+      expect(art).toContain(`class="${cls}"`);
+    }
+    expect(art).not.toMatch(/style=/);
+    expect(dashboard.find("chart-xlab").map((node) => node.textContent)).toEqual(["#10", "#20", "#30", "#40"]);
+    expect(dashboard.find("eq-now")[0]?.textContent).toMatch(/^\+0\.\d+$/);
+    expect(dashboard.find("chart-ylab").length).toBeGreaterThan(1);
+    await dashboard.pointer("chart-plot", "pointermove", PLOT_WIDTH / 2);
+    expect(dashboard.find("tooltip")[0]?.textContent).toContain("Trade #20");
+  });
+
+  it("charts the lab baseline over time with its 95% band and shows each variant's range against zero", async () => {
+    const dashboard = await startDashboard({}, { hash: "#lab", responder: (path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : labFixture())) });
+    const art = dashboard.find("lab-chart")[0]?.descendants().find((node) => node.className === "chart-art")?.innerHTML ?? "";
+    expect(art).toContain('class="ci-band"');
+    expect(art).toContain('class="lab-line"');
+    expect(dashboard.find("pt-mark")).toHaveLength(2);
+    expect(dashboard.find("lab-chart")[0]?.descendants().filter((node) => node.className.startsWith("chart-xlab")).map((node) => node.textContent)).toEqual(["#1", "#2"]);
+    const ranges = dashboard.find("lb-range");
+    expect(ranges).toHaveLength(2);
+    expect(ranges[0]?.getAttribute("aria-label")).toBe("Expectancy +0.006 SOL per trade, 95% range -0.001 to +0.013");
   });
 });

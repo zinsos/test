@@ -17,6 +17,7 @@ export const DEFAULT_OPEN_POSITION_LIMIT = 200;
 export const DEFAULT_RECENT_CLOSED_LIMIT = 50;
 export const MAX_RECENT_CLOSED_LIMIT = 500;
 export const ACTIVITY_WINDOW_HOURS = 24;
+export const MAX_POSITION_FILLS = 100;
 const HOUR_MS = 3_600_000;
 const BPS_SCALE = 10_000;
 const MAX_SKIP_REASONS = 6;
@@ -147,10 +148,22 @@ export interface ClosedPositionView {
   pumpUrl: string | null;
 }
 
+export interface StoredFill {
+  side: string;
+  reason: string | null;
+  atMs: number;
+  price: number | null;
+  tokenAmount: bigint;
+  userQuote: bigint;
+}
+
 export interface PositionCounts {
   open: number;
   pending: number;
   closed: number;
+  wins: number;
+  realizedSol: number;
+  closedCostSol: number;
   openedLast24h: number;
   closedLast24h: number;
   winsLast24h: number;
@@ -554,6 +567,9 @@ export async function loadPositionCounts(db: Db, runId: number, sinceMs: number)
     `SELECT count(*) FILTER (WHERE status = 'open')::int AS open,
             count(*) FILTER (WHERE status = 'pending')::int AS pending,
             count(*) FILTER (WHERE status = 'closed')::int AS closed,
+            count(*) FILTER (WHERE status = 'closed' AND coalesce(realized_pnl, proceeds - entry_cost) > 0)::int AS wins,
+            coalesce(sum(coalesce(realized_pnl, proceeds - entry_cost)) FILTER (WHERE status = 'closed'), 0)::bigint AS pnl_closed,
+            coalesce(sum(entry_cost) FILTER (WHERE status = 'closed'), 0)::bigint AS cost_closed,
             count(*) FILTER (WHERE opened_at >= $2)::int AS opened_recent,
             count(*) FILTER (WHERE status = 'closed' AND closed_at >= $2)::int AS closed_recent,
             count(*) FILTER (WHERE status = 'closed' AND closed_at >= $2 AND coalesce(realized_pnl, proceeds - entry_cost) > 0)::int AS wins_recent,
@@ -570,6 +586,9 @@ export async function loadPositionCounts(db: Db, runId: number, sinceMs: number)
     open: toNumber(row.open),
     pending: toNumber(row.pending),
     closed: toNumber(row.closed),
+    wins: toNumber(row.wins),
+    realizedSol: lamportsToSol(toBigInt(row.pnl_closed)),
+    closedCostSol: lamportsToSol(toBigInt(row.cost_closed)),
     openedLast24h: toNumber(row.opened_recent),
     closedLast24h: toNumber(row.closed_recent),
     winsLast24h: toNumber(row.wins_recent),
@@ -577,6 +596,29 @@ export async function loadPositionCounts(db: Db, runId: number, sinceMs: number)
     lastOpenedAtMs: msOf(row.last_opened),
     lastClosedAtMs: msOf(row.last_closed)
   };
+}
+
+function storedFillFromRecord(row: DbRecord): StoredFill {
+  return {
+    side: text(row.side, ""),
+    reason: textOrNull(row.reason),
+    atMs: msOf(row.at) ?? 0,
+    price: toNullableNumber(row.fill_price),
+    tokenAmount: toBigInt(row.token_amount),
+    userQuote: toBigInt(row.user_quote)
+  };
+}
+
+export async function loadPositionFills(db: Db, positionId: string): Promise<StoredFill[]> {
+  const result = await db.query<DbRecord>(
+    `SELECT side, reason, coalesce(filled_at, requested_at) AS at, fill_price, token_amount, user_quote
+     FROM fills
+     WHERE position_id = $1 AND success
+     ORDER BY coalesce(filled_at, requested_at), id
+     LIMIT $2`,
+    [positionId, MAX_POSITION_FILLS]
+  );
+  return result.rows.map(storedFillFromRecord);
 }
 
 export async function loadSignalActivity(db: Db, runId: number, sinceMs: number): Promise<SignalActivity> {
@@ -621,6 +663,9 @@ function emptyCounts(): PositionCounts {
     open: 0,
     pending: 0,
     closed: 0,
+    wins: 0,
+    realizedSol: 0,
+    closedCostSol: 0,
     openedLast24h: 0,
     closedLast24h: 0,
     winsLast24h: 0,

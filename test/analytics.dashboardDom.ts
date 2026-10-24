@@ -7,6 +7,7 @@ export const MINT = mintAt(40);
 export const PENDING_MINT = mintAt(41);
 export const READ_AT_MS = Date.UTC(2026, 9, 23, 12, 0, 0);
 const TOKEN = "dom-token";
+export const PLOT_WIDTH = 400;
 
 type Listener = (event: unknown) => void;
 
@@ -57,10 +58,14 @@ export class FakeNode {
     return child;
   }
 
-  dispatch(type: string): void {
+  dispatch(type: string, extra: Record<string, unknown> = {}): void {
     for (const listener of this.listeners.get(type) ?? []) {
-      listener({ target: this });
+      listener({ target: this, preventDefault: () => undefined, ...extra });
     }
+  }
+
+  getBoundingClientRect(): { left: number; top: number; width: number; height: number } {
+    return { left: 0, top: 0, width: PLOT_WIDTH, height: 200 };
   }
 
   get classList(): { add(name: string): void; remove(name: string): void } {
@@ -243,6 +248,8 @@ export interface DashboardHarness {
   storage: Map<string, string>;
   streams: FakeEventSource[];
   location: { hash: string };
+  navigate(hash: string): Promise<void>;
+  pointer(className: string, type: string, clientX: number): Promise<void>;
   change(label: string, value: string): Promise<void>;
   click(text: string): Promise<void>;
   find(className: string): FakeNode[];
@@ -286,6 +293,7 @@ export async function startDashboard(positions: Record<string, unknown>, options
   let responder: Responder =
     options.responder ?? ((path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : positions)));
   const streams: FakeEventSource[] = [];
+  const windowListeners = new Map<string, Listener[]>();
   const document = {
     readyState: "complete",
     visibilityState: "visible",
@@ -305,7 +313,9 @@ export async function startDashboard(positions: Record<string, unknown>, options
     },
     location: { hash: options.hash ?? "", search: options.search ?? `?token=${TOKEN}`, pathname: "/" },
     history: { replaceState: () => undefined },
-    addEventListener: () => undefined,
+    addEventListener: (type: string, listener: Listener) => {
+      windowListeners.set(type, [...(windowListeners.get(type) ?? []), listener]);
+    },
     setInterval: (run: () => void, everyMs: number) => {
       intervals.push({ run, everyMs, lastMs: nowMs });
       return intervals.length;
@@ -347,6 +357,21 @@ export async function startDashboard(positions: Record<string, unknown>, options
     storage,
     streams,
     location: window.location,
+    async navigate(hash) {
+      window.location.hash = hash;
+      for (const listener of windowListeners.get("hashchange") ?? []) {
+        listener({});
+      }
+      await settle();
+    },
+    async pointer(className, type, clientX) {
+      const node = nodes().find((item) => item.className.split(" ").includes(className));
+      if (!node) {
+        throw new Error(`no node ${className}`);
+      }
+      node.dispatch(type, { clientX, pointerType: "mouse" });
+      await settle();
+    },
     async change(label, value) {
       const select = nodes().find((node) => node.tagName === "select" && node.getAttribute("aria-label") === label);
       if (!select) {
@@ -535,6 +560,9 @@ export function tradesFixture(): Record<string, unknown> {
       open: 1,
       pending: 1,
       closed: 1,
+      wins: 1,
+      realizedSol: 0.06,
+      closedCostSol: 0.1,
       openedLast24h: 2,
       closedLast24h: 1,
       winsLast24h: 1,

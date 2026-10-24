@@ -23,7 +23,7 @@ export const LAB_VIEW_SCRIPT = String.raw`
     var latest = lab.latest;
     var when = isNum(run.finishedAtMs) ? "Finished " + fmtAgo(run.finishedAtMs) + DOT + fmtTime(run.finishedAtMs) : "Started " + fmtAgo(run.startedAtMs);
     var out = [
-      el("div", { class: "row" }, el("h2", { text: "Lab run #" + run.id }), labStatusBadge(run)),
+      el("div", { class: "row" }, el("h2", { class: "card-title", text: "Lab run #" + run.id }), labStatusBadge(run)),
       el("p", { class: "subline", text: when + DOT + fmtInt(lab.runs) + (lab.runs === 1 ? " run so far" : " runs so far") }),
       el("p", { class: "subline", text: "Data window: " + labWindow(run) })
     ];
@@ -46,7 +46,36 @@ export const LAB_VIEW_SCRIPT = String.raw`
   function labRange(s) {
     return isNum(s.ciLowSol) && isNum(s.ciHighSol) ? fmtSol(s.ciLowSol) + " to " + fmtSol(s.ciHighSol) : DASH;
   }
-  function labVariantItem(row) {
+  function labScale(variants) {
+    var lo = 0;
+    var hi = 0;
+    variants.forEach(function (row) {
+      var s = row.summary;
+      if (!s || !(s.trades > 0)) { return; }
+      [s.expectancySol, s.ciLowSol, s.ciHighSol].forEach(function (value) { if (isNum(value)) { lo = Math.min(lo, value); hi = Math.max(hi, value); } });
+    });
+    if (hi - lo < 1e-9) { return null; }
+    var pad = (hi - lo) * 0.06;
+    return { lo: lo - pad, hi: hi + pad };
+  }
+  function labRangeBar(s, scale) {
+    if (!scale || !s || !(s.trades > 0) || !isNum(s.expectancySol)) { return null; }
+    function at(value) { return ((value - scale.lo) / (scale.hi - scale.lo)) * 100; }
+    var zero = el("span", { class: "lb-zero" });
+    zero.style.left = at(0).toFixed(2) + "%";
+    var parts = [el("span", { class: "lb-axis" }), zero];
+    if (isNum(s.ciLowSol) && isNum(s.ciHighSol)) {
+      var ci = el("span", { class: "lb-ci " + (s.ciLowSol > 0 ? "pos" : s.ciHighSol < 0 ? "neg" : "") });
+      ci.style.left = at(s.ciLowSol).toFixed(2) + "%";
+      ci.style.width = Math.max(0.5, at(s.ciHighSol) - at(s.ciLowSol)).toFixed(2) + "%";
+      parts.push(ci);
+    }
+    var point = el("span", { class: "lb-pt" });
+    point.style.left = at(s.expectancySol).toFixed(2) + "%";
+    parts.push(point);
+    return el("div", { class: "lb-range", role: "img", "aria-label": "Expectancy " + fmtSol(s.expectancySol) + " SOL per trade, 95% range " + labRange(s) }, parts);
+  }
+  function labVariantItem(row, scale) {
     var s = row.summary;
     var traded = !!(s && s.trades > 0);
     var badges = [];
@@ -68,16 +97,18 @@ export const LAB_VIEW_SCRIPT = String.raw`
     if (s) {
       out.push(el("div", { class: "meta", text: fmtInt(s.trades) + " trades" + DOT + "win " + fmtPct(s.winRate, 0) + DOT + "total " + fmtSol(s.totalPnlSol) + " SOL" + DOT + "max drawdown " + (isNum(s.maxDrawdownSol) ? fmtSol(-Math.abs(s.maxDrawdownSol)) : DASH) }));
       out.push(el("div", { class: "meta", text: "95% range " + labRange(s) + (isNum(row.vsBaselineSol) ? DOT + "vs baseline " + fmtSol(row.vsBaselineSol) + " per trade" : "") + (isNum(s.avgHoldSec) ? DOT + "avg hold " + fmtDur(s.avgHoldSec) : "") }));
+      out.push(labRangeBar(s, scale));
     }
     if (row.error) { out.push(el("div", { class: skipped ? "meta" : "error-text", text: skipped ? "Not run: " + row.error.slice(9) : row.error })); }
     out.push(el("div", { class: "row" }, el("div", { class: "badges" }, badges),
-      row.strategyRunId ? el("button", { class: "link-btn", type: "button", text: "Open in Edge", onclick: function () { openLabRun(row.strategyRunId); } }) : null));
+      row.strategyRunId ? el("button", { class: "link-btn", type: "button", text: "Open in Performance", onclick: function () { openLabRun(row.strategyRunId); } }) : null));
     return el("li", { class: "item lab-variant" + (row.isBaseline ? " baseline" : "") }, out);
   }
   function labLeaderboard(lab) {
     if (!lab.variants.length) { return empty("No strategies in this run", "The lab run finished without variants. Check config/lab-variants.json and the lab job's log."); }
-    return card("Strategy leaderboard", "Each strategy replayed over the same recorded data with the real trader, fills and fees. Sorted by expectancy (SOL per trade after fees); the baseline is the current strategy.",
-      el("ul", { class: "list" }, lab.variants.map(labVariantItem)));
+    var scale = labScale(lab.variants);
+    return card("Strategy leaderboard", "Each strategy replayed over the same recorded data with the real trader, fills and fees. Sorted by expectancy (SOL per trade after fees); the baseline is the current strategy. Bars show the 95% range against zero.",
+      el("ul", { class: "list" }, lab.variants.map(function (row) { return labVariantItem(row, scale); })));
   }
   function labImportance(feature) { return isNum(feature.auc) ? Math.min(1, Math.abs(feature.auc - 0.5) * 2) : 0; }
   function labFeatureBars(features) {
@@ -124,8 +155,8 @@ export const LAB_VIEW_SCRIPT = String.raw`
         cell(fmtSol(point.expectancySol), signClass(point.expectancySol)),
         cell(isNum(point.ciLowSol) && isNum(point.ciHighSol) ? fmtSol(point.ciLowSol) + " to " + fmtSol(point.ciHighSol) : DASH, "hide-narrow"));
     });
-    return card("Baseline over time", "The current strategy's expectancy in each lab run. A drifting number means the market changed, not the code.",
-      table(["Run", "Trades", "Exp/trade", "95% range"], rows, { 3: true }));
+    return card("Baseline over time", "The current strategy's expectancy in each lab run, with its 95% range. A drifting number means the market changed, not the code.",
+      labHistoryChart(history), table(["Run", "Trades", "Exp/trade", "95% range"], rows, { 3: true }));
   }
   function labView() {
     return api("/api/lab").then(function (lab) {

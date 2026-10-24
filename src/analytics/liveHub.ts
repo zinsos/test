@@ -24,7 +24,17 @@ import {
   type LiveKind,
   type LiveThresholds
 } from "./liveEvents.js";
-import { cleanSymbol, livePositionView, positionSeries, type LiveConfig, type LiveMarket, type LivePositionView, type PositionSeries } from "./liveSeries.js";
+import {
+  cleanSymbol,
+  livePositionView,
+  MAX_SERIES_POINTS,
+  positionSeries,
+  type LiveConfig,
+  type LiveMarket,
+  type LivePositionView,
+  type PositionSeries
+} from "./liveSeries.js";
+import type { StoredFill } from "./positionQueries.js";
 
 export const DEFAULT_LIVE_MAX_CLIENTS = 10;
 export const DEFAULT_HEARTBEAT_MS = 15_000;
@@ -264,12 +274,16 @@ export class LiveHub {
     return { count: positions.length, valueSol };
   }
 
-  series(positionId: string): PositionSeries | null {
+  hasOpenPosition(positionId: string): boolean {
+    return this.findOpen(positionId) !== null;
+  }
+
+  series(positionId: string, fills: readonly StoredFill[] = []): PositionSeries | null {
     const position = this.findOpen(positionId);
     if (!position) {
       return null;
     }
-    return positionSeries(position, this.market.get(position.mint), this.config, this.clock.nowMs());
+    return positionSeries(position, this.market.get(position.mint), this.config, this.clock.nowMs(), MAX_SERIES_POINTS, fills);
   }
 
   poll(streamId: string | null, afterId: number): LivePoll {

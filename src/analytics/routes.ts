@@ -35,6 +35,7 @@ import { describeCalibration, describeComparison, describeRecorder, describeSumm
 import {
   DEFAULT_RECENT_CLOSED_LIMIT,
   emptyPositionsSnapshot,
+  loadPositionFills,
   loadPositionsSnapshot,
   MAX_RECENT_CLOSED_LIMIT,
   selectPositionsRun,
@@ -105,6 +106,7 @@ export interface WalletSnapshot {
   address: string | null;
   walletLamports: bigint | null;
   equityLamports: bigint | null;
+  dayPnlLamports: bigint | null;
   entriesPaused: boolean;
   killReason: string | null;
   haltedForDay: boolean;
@@ -376,7 +378,7 @@ function liveStatusRoute(ctx: AnalyticsContext): Promise<unknown> {
   return Promise.resolve(ctx.live ? ctx.live.status() : LIVE_DISABLED);
 }
 
-function liveSeriesRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
+async function liveSeriesRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
   const raw = request.segments[0] ?? "";
   let id: string;
   try {
@@ -387,11 +389,16 @@ function liveSeriesRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<un
   if (!POSITION_ID.test(id)) {
     throw new HttpError(400, "invalid_position", "position id is malformed");
   }
-  const series = ctx.live?.series(id) ?? null;
+  const live = ctx.live;
+  if (!live || !live.hasOpenPosition(id)) {
+    throw new HttpError(404, "position_not_open", "no open position with this id in this process");
+  }
+  const fills = await loadPositionFills(ctx.db, id).catch(() => []);
+  const series = live.series(id, fills);
   if (!series) {
     throw new HttpError(404, "position_not_open", "no open position with this id in this process");
   }
-  return Promise.resolve(series);
+  return series;
 }
 
 const STREAM_ID = /^[0-9a-f]{1,64}$/;
@@ -439,6 +446,7 @@ async function walletRoute(ctx: AnalyticsContext): Promise<unknown> {
   const walletSol = snapshot?.walletLamports === null || snapshot?.walletLamports === undefined ? null : lamportsToSol(snapshot.walletLamports);
   const equitySol = snapshot?.equityLamports === null || snapshot?.equityLamports === undefined ? null : lamportsToSol(snapshot.equityLamports);
   const openValueSol = open ? open.valueSol : null;
+  const todayPnlSol = snapshot?.dayPnlLamports === null || snapshot?.dayPnlLamports === undefined ? null : lamportsToSol(snapshot.dayPnlLamports);
   const totalSol = walletSol === null ? equitySol : walletSol + (openValueSol ?? 0);
   const usd = (sol: number | null): number | null => (sol === null || price === null ? null : sol * price.usd);
   return {
@@ -453,6 +461,8 @@ async function walletRoute(ctx: AnalyticsContext): Promise<unknown> {
     totalSol,
     totalUsd: usd(totalSol),
     equitySol,
+    todayPnlSol,
+    todayPnlUsd: usd(todayPnlSol),
     entriesPaused: snapshot?.entriesPaused ?? false,
     killReason: snapshot?.killReason ?? null,
     haltedForDay: snapshot?.haltedForDay ?? false,

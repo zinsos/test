@@ -23,6 +23,7 @@ function snapshot(overrides: Partial<WalletSnapshot> = {}): WalletSnapshot {
     address: ADDRESS,
     walletLamports: 442_448_087n,
     equityLamports: 450_000_000n,
+    dayPnlLamports: -12_500_000n,
     entriesPaused: false,
     killReason: null,
     haltedForDay: false,
@@ -72,6 +73,8 @@ describe("wallet endpoint", () => {
     expect(body).toMatchObject({ enabled: true, mode: "live", address: ADDRESS, walletSol: 0.442448087, totalSol: 0.442448087, solUsd: 100, priceSource: "test", canControl: true, entriesPaused: false });
     expect(body.walletUsd).toBeCloseTo(44.2448087, 6);
     expect(body.equitySol).toBe(0.45);
+    expect(body.todayPnlSol).toBe(-0.0125);
+    expect(body.todayPnlUsd).toBeCloseTo(-1.25, 9);
   });
 });
 

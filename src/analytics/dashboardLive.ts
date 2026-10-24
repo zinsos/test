@@ -11,9 +11,8 @@ export const LIVE_VIEW_SCRIPT = String.raw`
   var LIVE_RETRY_MAX_MS = 60000;
   var LIVE_LOOKBACK_MS = 60000;
   var LIVE_CARD_REDRAW_MS = 5000;
-  var LIVE_LABEL_GAP_PCT = 10;
-  var LIVE_LABEL_MIN_PCT = 5;
-  var LIVE_LABEL_MAX_PCT = 95;
+  var LIVE_LEVEL_REACH = 2.2;
+  var LIVE_MARK_NEAR = 0.025;
   var LIVE_KIND_LABELS = {
     score: "Score", signal: "Signal", rejected: "Rejected", skipped: "Skipped", entering: "Buying",
     opened: "Bought", partial: "Sold", closed: "Closed", risk: "Risk"
@@ -34,7 +33,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
   }
   function liveNowMs() { return Date.now() + live.clockOffsetMs; }
   function liveTime(ms) {
-    return isNum(ms) ? new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : DASH;
+    return isNum(ms) ? new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : DASH;
   }
   function liveCoin(symbol, mint) { return symbol ? "$" + symbol : shortAddr(mint); }
   function liveShows(event) {
@@ -151,71 +150,118 @@ export const LIVE_VIEW_SCRIPT = String.raw`
 
   function liveLevelLines(view) {
     var levels = view.levels || {};
-    var lines = [["lv-entry", view.entryPrice, "entry"], ["lv-stop", levels.stopLossPrice, "stop"]];
+    var lines = [["lv-entry", view.entryPrice, "Entry"], ["lv-stop", levels.stopLossPrice, "Stop"]];
     var trail = isNum(levels.trailingStopPrice) ? levels.trailingStopPrice : levels.moonbagStopPrice;
-    if (isNum(trail)) { lines.push(["lv-trail", trail, isNum(levels.trailingStopPrice) ? "trail" : "moonbag"]); }
+    if (isNum(trail)) { lines.push(["lv-trail", trail, isNum(levels.trailingStopPrice) ? "Trail" : "Bag"]); }
     if (levels.nextTakeProfit && isNum(levels.nextTakeProfit.price)) { lines.push(["lv-tp", levels.nextTakeProfit.price, "TP"]); }
     return lines.filter(function (line) { return isNum(line[1]) && line[1] > 0; });
   }
-  function liveChart(entry) {
-    var view = entry.view;
+  function liveChartModel(view, points, fills, nowMs) {
     var entryPrice = view.entryPrice;
-    var box = el("div", { class: "chart live-chart", role: "img", "aria-label": "Price since 1 minute before entry, now " + fmtMult(view.multiple) + " of entry" });
-    var points = entry.points.filter(function (point) { return isNum(point.price) && point.price > 0 && isNum(point.atMs); });
-    if (!(isNum(entryPrice) && entryPrice > 0) || !points.length) {
-      box.append(el("p", { class: "hint chart-wait", text: "Waiting for trades on this coin…" }));
-      return box;
-    }
-    var lines = liveLevelLines(view);
+    if (!(isNum(entryPrice) && entryPrice > 0)) { return null; }
+    var clean = points.filter(function (point) { return isNum(point.price) && point.price > 0 && isNum(point.atMs); });
+    if (!clean.length) { return null; }
     var startMs = view.openedAtMs - LIVE_LOOKBACK_MS;
-    var endMs = Math.max(liveNowMs(), points[points.length - 1].atMs, view.openedAtMs + 30000);
-    var lo = Infinity;
-    var hi = -Infinity;
-    points.forEach(function (point) { var mult = point.price / entryPrice; lo = Math.min(lo, mult); hi = Math.max(hi, mult); });
-    lines.forEach(function (line) { var mult = line[1] / entryPrice; lo = Math.min(lo, mult); hi = Math.max(hi, mult); });
+    var lastPoint = clean[clean.length - 1];
+    var endMs = Math.max(nowMs, lastPoint.atMs, view.openedAtMs + 30000);
+    var visible = clean.filter(function (point) { return point.atMs >= startMs; });
+    if (!visible.length) { visible = [lastPoint]; }
+    var current = isNum(view.price) && view.price > 0 ? view.price : visible[visible.length - 1].price;
+    var line = visible.concat([{ atMs: endMs, price: current }]);
+    var marks = (fills || []).filter(function (mark) { return mark && isNum(mark.price) && mark.price > 0 && isNum(mark.atMs) && mark.atMs >= startMs && mark.atMs <= endMs; });
+    var lo = 1;
+    var hi = 1;
+    function include(mult) { if (isNum(mult) && mult > 0) { lo = Math.min(lo, mult); hi = Math.max(hi, mult); } }
+    line.forEach(function (point) { include(point.price / entryPrice); });
+    marks.forEach(function (mark) { include(mark.price / entryPrice); });
+    var coreLo = lo;
+    var coreHi = hi;
+    var levels = liveLevelLines(view).map(function (level) {
+      var mult = level[1] / entryPrice;
+      var inside = mult >= coreLo / LIVE_LEVEL_REACH && mult <= coreHi * LIVE_LEVEL_REACH;
+      if (inside) { include(mult); }
+      return { cls: level[0], name: level[2], price: level[1], mult: mult, inside: inside };
+    });
     var logLo = Math.log(lo);
     var logHi = Math.log(hi);
     var pad = Math.max(0.04, (logHi - logLo) * 0.08);
-    logLo -= pad;
-    logHi += pad;
-    function y(price) { return ((logHi - Math.log(price / entryPrice)) / (logHi - logLo)) * 180; }
-    function x(atMs) { return Math.max(0, Math.min(600, ((atMs - startMs) / Math.max(1, endMs - startMs)) * 600)); }
-    var visible = points.filter(function (point) { return point.atMs >= startMs; });
-    if (!visible.length) { visible = [points[points.length - 1]]; }
-    var path = visible.map(function (point, i) { return (i ? "L" : "M") + x(point.atMs).toFixed(1) + " " + y(point.price).toFixed(1); }).join(" ");
-    path += " L" + x(endMs).toFixed(1) + " " + y(visible[visible.length - 1].price).toFixed(1);
-    var markup = "<svg viewBox=\"0 0 600 180\" preserveAspectRatio=\"none\" aria-hidden=\"true\">";
-    lines.forEach(function (line) {
-      var ly = y(line[1]).toFixed(1);
-      markup += "<line class=\"" + line[0] + "\" x1=\"0\" x2=\"600\" y1=\"" + ly + "\" y2=\"" + ly + "\"></line>";
-    });
-    var openX = x(view.openedAtMs).toFixed(1);
-    markup += "<line class=\"lv-open\" x1=\"" + openX + "\" x2=\"" + openX + "\" y1=\"0\" y2=\"180\"></line>";
-    markup += "<path class=\"lv-price\" d=\"" + path + "\"></path></svg>";
-    box.innerHTML = markup;
-    liveLabelSpots(lines.map(function (line) { return { line: line, top: (y(line[1]) / 180) * 100 }; })).forEach(function (spot) {
-      var label = el("span", { class: "lv-label " + spot.line[0], text: spot.line[2] + " " + fmtMult(spot.line[1] / entryPrice) });
-      label.style.top = spot.top.toFixed(1) + "%";
-      box.append(label);
-    });
-    return box;
+    return { entryPrice: entryPrice, openedAtMs: view.openedAtMs, startMs: startMs, endMs: endMs, line: line, current: current, marks: marks, levels: levels, logLo: logLo - pad, logHi: logHi + pad };
   }
-  function liveLabelSpots(spots) {
-    var sorted = spots.slice().sort(function (a, b) { return a.top - b.top; });
-    function spread() {
-      for (var i = 0; i < sorted.length; i += 1) {
-        var floor = i ? sorted[i - 1].top + LIVE_LABEL_GAP_PCT : LIVE_LABEL_MIN_PCT;
-        sorted[i].top = Math.max(sorted[i].top, floor);
+  function liveMarkText(mark, entryPrice) {
+    var at = " at " + fmtMult(mark.price / entryPrice);
+    if (mark.side === "buy") { return "Bought " + fmtSol(mark.sol, false) + " SOL" + at; }
+    var share = isNum(mark.pctOfEntry) ? fmtPlainPct(mark.pctOfEntry) + " " : "";
+    return "Sold " + share + "for " + fmtSol(mark.sol, false) + " SOL" + at + (mark.reason ? DOT + readable(mark.reason) : "");
+  }
+  function liveGridText(mult) { return (mult >= 10 ? mult.toFixed(0) : String(mult)) + "×"; }
+  function renderLiveChart(entry) {
+    var f = entry.chart;
+    var view = entry.view;
+    var model = liveChartModel(view, entry.points, entry.fills, liveNowMs());
+    f.box.setAttribute("aria-label", "Price since 1 minute before entry, now " + fmtMult(view.multiple) + " of entry");
+    if (!model) {
+      svgInto(f.art, "");
+      f.marks.replaceChildren();
+      f.tags.replaceChildren();
+      f.xaxis.replaceChildren();
+      f.api = null;
+      chartHide(f);
+      f.wait.textContent = "Waiting for trades on this coin…";
+      f.wait.hidden = false;
+      return;
+    }
+    f.wait.hidden = true;
+    f.wait.textContent = "";
+    function y(price) { return ((model.logHi - Math.log(price / model.entryPrice)) / (model.logHi - model.logLo)) * CHART_SPAN; }
+    function x(atMs) { return clamp(((atMs - model.startMs) / Math.max(1, model.endMs - model.startMs)) * CHART_SPAN, 0, CHART_SPAN); }
+    var grid = multipleTicks(Math.exp(model.logLo), Math.exp(model.logHi), 5);
+    var times = timeTicks(model.startMs, model.endMs, model.openedAtMs, 5);
+    var xs = model.line.map(function (point) { return x(point.atMs); });
+    var ys = model.line.map(function (point) { return y(point.price); });
+    var currentMult = model.current / model.entryPrice;
+    var tone = currentMult >= 1 ? "pos" : "neg";
+    if (!f.gradientId) { f.gradientId = nextGradientId(); }
+    var id = f.gradientId;
+    var svg = [svgOpen(), gradientDefs(id, "accent", 0.28)];
+    grid.forEach(function (mult) { svg.push(hLine("cg", y(mult * model.entryPrice))); });
+    times.forEach(function (tick) { svg.push(vLine("cg cg-v", x(tick.atMs))); });
+    svg.push(vLine("lv-open", x(model.openedAtMs)));
+    svg.push("<path class=\"lv-area\" fill=\"url(#" + id + ")\" d=\"" + areaD(xs, ys) + "\"></path>");
+    model.levels.forEach(function (level) { if (level.inside) { svg.push(hLine(level.cls, y(level.price))); } });
+    svg.push("<path class=\"lv-price\" d=\"" + pathD(xs, ys) + "\"></path></svg>");
+    svgInto(f.art, svg.join(""));
+    var tags = model.levels.map(function (level) {
+      if (level.inside) { return { top: y(level.price) / 10, cls: "lv-label " + level.cls, text: level.name + " " + fmtMult(level.mult) }; }
+      var above = level.mult > 1;
+      return { top: above ? 0 : 100, cls: "lv-label " + level.cls + " off", text: level.name + " " + fmtMult(level.mult) + (above ? " ↑" : " ↓") };
+    });
+    tags.push({ top: y(model.current) / 10, cls: "lv-now " + tone, text: fmtMult(currentMult) });
+    chartGutter(f, grid.map(function (mult) { return { y: y(mult * model.entryPrice), text: liveGridText(mult) }; }), tags);
+    chartXLabels(f, times.map(function (tick) { return { x: x(tick.atMs), text: fmtClock(tick.sec) }; }));
+    var dots = model.marks.map(function (mark) {
+      return chartMark("fill-mark " + (mark.side === "buy" ? "buy" : "sell"), x(mark.atMs), y(mark.price), mark.side === "buy" ? "B" : "S");
+    });
+    dots.push(chartMark("now-dot " + tone, xs[xs.length - 1], ys[ys.length - 1]));
+    f.marks.replaceChildren();
+    append(f.marks, dots);
+    var span = Math.max(1, model.endMs - model.startMs);
+    chartBind(f, {
+      size: function () { return model.line.length; },
+      x: function (i) { return xs[i]; },
+      show: function (i) {
+        var point = model.line[i];
+        var mult = point.price / model.entryPrice;
+        var since = (point.atMs - model.openedAtMs) / 1000;
+        var near = null;
+        model.marks.forEach(function (mark) { if (Math.abs(mark.atMs - point.atMs) <= span * LIVE_MARK_NEAR && (!near || Math.abs(mark.atMs - point.atMs) < Math.abs(near.atMs - point.atMs))) { near = mark; } });
+        chartShowAt(f, xs[i], ys[i], [
+          el("strong", { class: multipleClass(mult), text: fmtMult(mult) }),
+          el("div", { text: fmtSignedPct((mult - 1) * 100) + " vs entry" }),
+          el("div", { class: "tt-muted", text: liveTime(point.atMs) + DOT + (since >= 0 ? fmtClock(since) + " since entry" : fmtClock(-since) + " before entry") }),
+          near ? el("div", { class: "tt-fill", text: liveMarkText(near, model.entryPrice) }) : null
+        ], fmtMult(mult));
       }
-    }
-    spread();
-    var overflow = sorted.length ? sorted[sorted.length - 1].top - LIVE_LABEL_MAX_PCT : 0;
-    if (overflow > 0) {
-      sorted.forEach(function (spot) { spot.top -= overflow; });
-      sorted[0].top = Math.max(sorted[0].top, LIVE_LABEL_MIN_PCT);
-      spread();
-    }
-    return sorted;
+    });
   }
   function liveLevelsText(view) {
     var levels = view.levels || {};
@@ -228,6 +274,23 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     if (isNum(levels.maxHoldAtMs)) { parts.push("max hold " + (levels.maxHoldAtMs > liveNowMs() ? "in " + fmtDur((levels.maxHoldAtMs - liveNowMs()) / 1000) : "reached")); }
     return parts.length ? "Exits: " + parts.join(DOT) : "";
   }
+  function liveCardParts() {
+    var chart = chartFrame("live-chart", "Price chart", true);
+    chart.wait = el("p", { class: "chart-wait", hidden: true });
+    chart.box.append(chart.wait);
+    return {
+      node: el("section", { class: "card live-pos" }),
+      head: el("div", { class: "live-pos-head" }),
+      stats: el("div", { class: "mini-stats" }),
+      chart: chart,
+      legend: el("div", { class: "legend", "aria-hidden": "true" },
+        el("span", { class: "lg lg-price", text: "price" }), el("span", { class: "lg lg-entry", text: "entry" }),
+        el("span", { class: "lg lg-stop", text: "stop" }), el("span", { class: "lg lg-trail", text: "trailing" }), el("span", { class: "lg lg-tp", text: "take-profit" }),
+        el("span", { class: "lg lg-buy", text: "buy" }), el("span", { class: "lg lg-sell", text: "sell" })),
+      levels: el("p", { class: "live-levels" }),
+      badges: el("div", { class: "badges" })
+    };
+  }
   function liveRenderCard(entry) {
     if (!entry.node) { return; }
     entry.renderedAtMs = Date.now();
@@ -237,18 +300,19 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     if (v.takeProfitLevelsHit > 0) { badges.push(badge(v.takeProfitLevelsHit === 1 ? "1 take-profit hit" : v.takeProfitLevelsHit + " take-profits hit", "good")); }
     if (v.migrated) { badges.push(badge("Migrated", "info")); }
     var held = isNum(v.openedAtMs) ? fmtDur((liveNowMs() - v.openedAtMs) / 1000) : DASH;
-    entry.node.replaceChildren();
-    append(entry.node, [
-      el("div", { class: "row" }, mintButton(v.mint, liveCoin(v.symbol, v.mint)), el("span", { class: "big-num " + multipleClass(v.multiple), text: fmtMult(v.multiple) })),
-      el("div", { class: "row" },
-        el("span", { class: "meta", text: "held " + held + DOT + "cost " + fmtSol(v.costSol, false) + " SOL" + DOT + "sold " + fmtPlainPct(v.soldPct) + DOT + "peak " + fmtMult(v.peakMultiple) }),
-        el("span", { class: "num " + signClass(v.pnlEstimateSol), text: fmtSol(v.pnlEstimateSol) + " SOL" })),
-      liveChart(entry),
-      el("div", { class: "lv-legend", "aria-hidden": "true" },
-        el("span", { class: "lg lg-price", text: "price" }), el("span", { class: "lg lg-entry", text: "entry" }),
-        el("span", { class: "lg lg-stop", text: "stop" }), el("span", { class: "lg lg-trail", text: "trailing" }), el("span", { class: "lg lg-tp", text: "take-profit" })),
-      el("p", { class: "subline", text: liveLevelsText(v) }),
-      badges.length ? el("div", { class: "badges" }, badges) : null]);
+    entry.head.replaceChildren(
+      el("div", { class: "pos-name" }, mintButton(v.mint, liveCoin(v.symbol, v.mint)),
+        el("div", { class: "meta", text: (v.name ? v.name + DOT : "") + shortAddr(v.mint) + DOT + readable(v.signalType) + DOT + "risk " + fmtNum(v.riskScore, 0) })),
+      el("span", { class: "pos-mult " + multipleClass(v.multiple), text: fmtMult(v.multiple) }));
+    entry.stats.replaceChildren(
+      miniStat("PnL est.", fmtSol(v.pnlEstimateSol), " SOL", signClass(v.pnlEstimateSol)),
+      miniStat("Return", fmtSignedPct(v.pnlEstimatePct), "", signClass(v.pnlEstimatePct)),
+      miniStat("Held", held, "", ""),
+      miniStat("Peak", fmtMult(v.peakMultiple), "", ""));
+    renderLiveChart(entry);
+    entry.levels.textContent = liveLevelsText(v) + (liveLevelsText(v) ? DOT : "") + "cost " + fmtSol(v.costSol, false) + " SOL" + DOT + "sold " + fmtPlainPct(v.soldPct);
+    entry.badges.replaceChildren();
+    append(entry.badges, badges);
   }
   function liveRenderCards() {
     if (!live.cards) { return; }
@@ -256,8 +320,8 @@ export const LIVE_VIEW_SCRIPT = String.raw`
       .sort(function (a, b) { return (b.view.openedAtMs || 0) - (a.view.openedAtMs || 0); });
     if (!entries.length) {
       var idle = live.tradingActive ? "No open positions. A new buy shows up here with a live price chart, its stop, trailing stop and next take-profit."
-        : "No trader is running in this service, so there are no positions to chart. Scores and signals still stream below.";
-      live.cards.replaceChildren(el("section", { class: "card empty slim" }, el("span", { text: idle })));
+        : "No trader is running in this service, so there are no positions to chart. Scores and signals still stream alongside.";
+      live.cards.replaceChildren(el("section", { class: "card empty slim" }, icon("live", "empty-icon"), el("span", { text: idle })));
       return;
     }
     live.cards.replaceChildren.apply(live.cards, entries.map(function (entry) { return entry.node; }));
@@ -269,6 +333,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
       if (live.positions[id] !== entry || !series) { return; }
       entry.view = series.position || entry.view;
       entry.points = (series.points || []).slice(-LIVE_POINTS_KEEP);
+      entry.fills = Array.isArray(series.fills) ? series.fills : [];
       liveRenderCard(entry);
     }).catch(function (error) {
       if (error && error.status === 404) { liveRemoveCard(id); }
@@ -279,7 +344,9 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     var entry = live.positions[view.id];
     var created = !entry;
     if (created) {
-      entry = { view: view, points: [], seriesAtMs: 0, renderedAtMs: 0, node: el("section", { class: "card live-pos" }) };
+      var parts = liveCardParts();
+      entry = { view: view, points: [], fills: [], seriesAtMs: 0, renderedAtMs: 0, node: parts.node, head: parts.head, stats: parts.stats, chart: parts.chart, levels: parts.levels, badges: parts.badges };
+      entry.node.append(parts.head, parts.stats, parts.chart.box, parts.legend, parts.levels, parts.badges);
       live.positions[view.id] = entry;
     }
     entry.view = view;
@@ -432,10 +499,11 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     live.note = el("p", { class: "hint" });
     live.gapNote = el("p", { class: "hint" });
     var filter = selectBox(LIVE_FILTERS, state.liveFilter || "all", function (value) { state.liveFilter = value; savePrefs(); liveRenderFeed(); }, "Show");
+    var feedCard = card("What the bot is doing", "Newest first, as it happens. Tap a line for the coin's score.", live.note, live.gapNote, live.list);
+    feedCard.classList.add("feed-card");
     live.root = el("div", { class: "live" },
-      el("div", { class: "live-bar" }, live.chip, field("Show", filter), live.pauseButton),
-      live.cards,
-      card("What the bot is doing", "Newest first, as it happens. Tap a line for the coin's score.", live.note, live.gapNote, live.list));
+      el("div", { class: "live-bar" }, live.chip, filter, live.pauseButton),
+      el("div", { class: "live-layout" }, live.cards, feedCard));
     liveSetStatus(live.status, live.detail);
     liveUpdatePause();
     liveRenderCards();

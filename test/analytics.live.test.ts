@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { thresholdsOf } from "../src/analytics/liveEvents.js";
 import { LiveHub, type LiveHubOptions } from "../src/analytics/liveHub.js";
-import { downsamplePoints, exitLevels, livePositionView } from "../src/analytics/liveSeries.js";
+import { downsamplePoints, exitLevels, fillMarkers, livePositionView, MAX_FILL_MARKERS } from "../src/analytics/liveSeries.js";
 import { estimatedCloseProceeds, sellFeeBpsFor, sellFeeDefaultsOf } from "../src/analytics/positionQueries.js";
 import { lamportsToSol } from "../src/analytics/units.js";
 import { startAnalyticsServer, type AnalyticsServer } from "../src/analytics/server.js";
@@ -19,6 +19,7 @@ import { SignalEngine } from "../src/tracker/signals.js";
 import { mintAt } from "./analytics.db.js";
 import { openStream, parseSse, type SseMessage } from "./analytics.sse.js";
 import { createEvent } from "./exits.fixtures.js";
+import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 
 const TOKEN = "live-stream-test-token-0123456789";
 const T0 = 1_800_000_000_000;
@@ -223,9 +224,9 @@ function setup(options: Partial<LiveHubOptions> = {}): Setup {
 const servers: AnalyticsServer[] = [];
 const hubs: LiveHub[] = [];
 
-async function serve(hub: LiveHub | null, clock: VirtualClock): Promise<number> {
+async function serve(hub: LiveHub | null, clock: VirtualClock, db: Db = {} as unknown as Db): Promise<number> {
   const server = await startAnalyticsServer({
-    db: {} as unknown as Db,
+    db,
     port: 0,
     host: "127.0.0.1",
     token: TOKEN,
@@ -636,8 +637,10 @@ describe("live position series", () => {
       fromMs: number;
       totalTrades: number;
       points: Array<{ atMs: number; price: number }>;
+      fills: Array<Record<string, unknown>>;
       position: { levels: Record<string, unknown>; migrated: boolean; peakMultiple: number; multiple: number };
     };
+    expect(body.fills).toEqual([{ side: "buy", atMs: T0, price: entryPrice, reason: null, pctOfEntry: 100, sol: 0.075, source: "position" }]);
     expect(body.fromMs).toBe(T0 - 60_000);
     expect(body.totalTrades).toBe(850);
     expect(body.points.length).toBeLessThanOrEqual(400);
@@ -687,6 +690,30 @@ describe("live position series", () => {
     expect(migrated.maxHoldAtMs).toBe(T0 + 60_000 + 1_800_000);
   });
 
+  it("turns stored fills into chart markers, deriving missing prices and adding the entry when the buy is not stored yet", () => {
+    const held = position();
+    const sells = fillMarkers(held, [
+      { side: "sell", reason: "take_profit", atMs: T0 + 90_000, price: null, tokenAmount: ENTRY_TOKENS / 2n, userQuote: 80_000_000n },
+      { side: "sell", reason: "trailing_stop", atMs: T0 + 60_000, price: ENTRY_PRICE * 1.5, tokenAmount: ENTRY_TOKENS / 4n, userQuote: 27_000_000n },
+      { side: "transfer", reason: null, atMs: T0 + 1_000, price: ENTRY_PRICE, tokenAmount: 1n, userQuote: 1n },
+      { side: "sell", reason: "stop_loss", atMs: T0 + 2_000, price: null, tokenAmount: 0n, userQuote: 0n }
+    ]);
+    expect(sells.map((marker) => [marker.side, marker.atMs, marker.reason, marker.source])).toEqual([
+      ["buy", T0, null, "position"],
+      ["sell", T0 + 60_000, "trailing_stop", "fill"],
+      ["sell", T0 + 90_000, "take_profit", "fill"]
+    ]);
+    expect(sells[1]?.pctOfEntry).toBeCloseTo(25, 6);
+    expect(sells[2]?.price).toBeCloseTo(80_000_000 / Number(ENTRY_TOKENS / 2n), 15);
+    expect(sells[2]?.sol).toBe(0.08);
+    const bought = fillMarkers(held, [{ side: "buy", reason: "score_momentum", atMs: T0 + 900, price: ENTRY_PRICE, tokenAmount: ENTRY_TOKENS, userQuote: 75_000_000n }]);
+    expect(bought).toEqual([{ side: "buy", atMs: T0 + 900, price: ENTRY_PRICE, reason: "score_momentum", pctOfEntry: 100, sol: 0.075, source: "fill" }]);
+    const many = Array.from({ length: 60 }, (_, index) => ({ side: "sell", reason: "partial", atMs: T0 + index * 1_000, price: ENTRY_PRICE, tokenAmount: 1n, userQuote: 1n }));
+    const capped = fillMarkers(held, many);
+    expect(capped).toHaveLength(MAX_FILL_MARKERS);
+    expect(capped.at(-1)?.atMs).toBe(T0 + 59_000);
+  });
+
   it("downsamples long series keeping extremes and the last point", () => {
     const points = Array.from({ length: 5_000 }, (_, index) => ({ atMs: index, price: index === 1_234 ? 99 : index === 4_321 ? 0.001 : 1 + (index % 7) / 100 }));
     const sampled = downsamplePoints(points, 400);
@@ -696,5 +723,52 @@ describe("live position series", () => {
     expect(sampled.at(-1)).toEqual(points.at(-1));
     expect(sampled.map((point) => point.atMs)).toEqual([...sampled.map((point) => point.atMs)].sort((a, b) => a - b));
     expect(downsamplePoints(points.slice(0, 10), 400)).toHaveLength(10);
+  });
+});
+
+describe.skipIf(!hasTestDatabase)("live position series with stored fills", () => {
+  let database: TestDatabase | null = null;
+
+  afterEach(async () => {
+    await database?.drop();
+    database = null;
+  });
+
+  it("marks the buy and every successful sell from the fills table", async () => {
+    database = await createTestDatabase("live_fills");
+    const db = database.db;
+    const run = await db.query<{ id: bigint }>("INSERT INTO strategy_runs (mode, label, config) VALUES ('paper', NULL, '{}'::jsonb) RETURNING id");
+    const runId = Number(run.rows[0]?.id ?? 0);
+    const held = position({ runId, tokensHeld: ENTRY_TOKENS / 2n, proceeds: 80_000_000n, takeProfitLevelsHit: 1 });
+    await db.query(
+      `INSERT INTO positions (id, run_id, mode, mint, signal_type, opened_at, opened_slot, entry_price, entry_tokens, entry_cost, tokens_held, peak_price, last_price, status)
+       VALUES ($1, $2, 'paper', $3, 'score_momentum', $4, 1, $5, $6, 75000000, $7, $5, $5, 'open')`,
+      [held.id, runId, MINT, new Date(T0), ENTRY_PRICE, ENTRY_TOKENS.toString(), (ENTRY_TOKENS / 2n).toString()]
+    );
+    const fill = (side: string, reason: string, atMs: number, success: boolean, price: number | null, tokens: bigint, quote: bigint) =>
+      db.query(
+        `INSERT INTO fills (position_id, run_id, side, reason, urgency, success, venue, requested_at, requested_slot, filled_at, filled_slot,
+           token_amount, quote_amount, user_quote, protocol_fee, creator_fee, lp_fee, extra_platform_fee, network_fees, tips, rent_paid,
+           rent_refunded, reference_price, fill_price, attempts)
+         VALUES ($1, $2, $3, $4, 'normal', $5, 'curve', $6, 1, $7, 2, $8, $9, $9, 0, 0, 0, 0, 5000, 0, 0, 0, 0, $10, '[]'::jsonb)`,
+        [held.id, runId, side, reason, success, new Date(atMs - 800), success ? new Date(atMs) : null, tokens.toString(), quote.toString(), price]
+      );
+    await fill("buy", "score_momentum", T0 + 900, true, ENTRY_PRICE, ENTRY_TOKENS, 75_000_000n);
+    await fill("sell", "stop_loss", T0 + 30_000, false, null, 0n, 0n);
+    await fill("sell", "take_profit", T0 + 95_000, true, ENTRY_PRICE * 2.02, ENTRY_TOKENS / 2n, 80_000_000n);
+    const { hub, clock, open } = setup();
+    await clock.advanceTo(T0 + 120_000);
+    open.push(held);
+    const port = await serve(hub, clock, db);
+    const response = await fetch(`http://127.0.0.1:${port}/api/live/position/${held.id}/series`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { fills: Array<Record<string, unknown>> };
+    expect(body.fills.map((marker) => [marker.side, marker.atMs, marker.reason, marker.source])).toEqual([
+      ["buy", T0 + 900, "score_momentum", "fill"],
+      ["sell", T0 + 95_000, "take_profit", "fill"]
+    ]);
+    expect(body.fills[1]?.price).toBeCloseTo(ENTRY_PRICE * 2.02, 15);
+    expect(body.fills[1]?.pctOfEntry).toBeCloseTo(50, 6);
+    expect(body.fills[1]?.sol).toBe(0.08);
   });
 });

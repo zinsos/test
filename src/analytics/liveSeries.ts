@@ -4,11 +4,12 @@ import { isUsablePrice, multipleOf } from "../exits/math.js";
 import { isSwitchedToPool, moonbagTokensOf, sortedTakeProfitLevels, trailFractionFor } from "../exits/rules.js";
 import { readExitState } from "../exits/state.js";
 import type { LaunchState, TradeRecord } from "../market/state.js";
-import { estimatedCloseProceeds, sellFeeBpsFor, sellFeeDefaultsOf, type LastTradeFees } from "./positionQueries.js";
+import { estimatedCloseProceeds, sellFeeBpsFor, sellFeeDefaultsOf, type LastTradeFees, type StoredFill } from "./positionQueries.js";
 import { lamportsRatio, lamportsToSol } from "./units.js";
 
 export const SERIES_LOOKBACK_MS = 60_000;
 export const MAX_SERIES_POINTS = 400;
+export const MAX_FILL_MARKERS = 40;
 const SECOND_MS = 1_000;
 const MAX_SYMBOL_LENGTH = 16;
 const PERCENT = 100;
@@ -66,11 +67,24 @@ export interface SeriesPoint {
   price: number;
 }
 
+export type FillSide = "buy" | "sell";
+
+export interface FillMarker {
+  side: FillSide;
+  atMs: number;
+  price: number;
+  reason: string | null;
+  pctOfEntry: number | null;
+  sol: number;
+  source: "fill" | "position";
+}
+
 export interface PositionSeries {
   position: LivePositionView;
   fromMs: number;
   totalTrades: number;
   points: SeriesPoint[];
+  fills: FillMarker[];
   inMemory: boolean;
 }
 
@@ -224,6 +238,55 @@ function firstTradeAtOrAfter(trades: readonly TradeRecord[], atMs: number): numb
   return low;
 }
 
+function storedFillPrice(fill: StoredFill): number | null {
+  if (fill.price !== null && isUsablePrice(fill.price)) {
+    return fill.price;
+  }
+  if (fill.tokenAmount > 0n && fill.userQuote > 0n) {
+    const derived = Number(fill.userQuote) / Number(fill.tokenAmount);
+    return isUsablePrice(derived) ? derived : null;
+  }
+  return null;
+}
+
+function fillSideOf(side: string): FillSide | null {
+  return side === "buy" || side === "sell" ? side : null;
+}
+
+export function fillMarkers(position: Pick<Position, "openedAtMs" | "entryPrice" | "entryTokens" | "entryCost">, fills: readonly StoredFill[]): FillMarker[] {
+  const markers: FillMarker[] = [];
+  for (const fill of fills) {
+    const side = fillSideOf(fill.side);
+    const price = storedFillPrice(fill);
+    if (side === null || price === null || !Number.isFinite(fill.atMs) || fill.atMs <= 0) {
+      continue;
+    }
+    const share = position.entryTokens > 0n ? lamportsRatio(fill.tokenAmount, position.entryTokens) : null;
+    markers.push({
+      side,
+      atMs: fill.atMs,
+      price,
+      reason: fill.reason,
+      pctOfEntry: share === null ? null : Math.max(0, share * PERCENT),
+      sol: lamportsToSol(fill.userQuote),
+      source: "fill"
+    });
+  }
+  if (!markers.some((marker) => marker.side === "buy") && isUsablePrice(position.entryPrice)) {
+    markers.push({
+      side: "buy",
+      atMs: position.openedAtMs,
+      price: position.entryPrice,
+      reason: null,
+      pctOfEntry: PERCENT,
+      sol: lamportsToSol(position.entryCost),
+      source: "position"
+    });
+  }
+  markers.sort((a, b) => a.atMs - b.atMs);
+  return markers.slice(-MAX_FILL_MARKERS);
+}
+
 export function downsamplePoints(points: readonly SeriesPoint[], maxPoints: number = MAX_SERIES_POINTS): SeriesPoint[] {
   if (points.length <= maxPoints) {
     return [...points];
@@ -274,7 +337,8 @@ export function positionSeries(
   launch: LaunchState | undefined,
   config: LiveConfig,
   nowMs: number,
-  maxPoints: number = MAX_SERIES_POINTS
+  maxPoints: number = MAX_SERIES_POINTS,
+  fills: readonly StoredFill[] = []
 ): PositionSeries {
   const fromMs = position.openedAtMs - SERIES_LOOKBACK_MS;
   const trades = launch?.trades ?? [];
@@ -291,6 +355,7 @@ export function positionSeries(
     fromMs,
     totalTrades: points.length,
     points: downsamplePoints(points, maxPoints),
+    fills: fillMarkers(position, fills),
     inMemory: launch !== undefined
   };
 }
