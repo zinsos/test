@@ -1,4 +1,5 @@
-import { runBacktest, type BacktestProgress } from "../backtest/runner.js";
+import { groupCohortLanes, runCohortBacktest, type CohortBacktestResult } from "../backtest/cohort.js";
+import type { BacktestProgress } from "../backtest/summary.js";
 import type { StrategyConfig } from "../config/strategy.js";
 import { SystemClock, type Clock } from "../core/clock.js";
 import { moduleLogger } from "../core/logger.js";
@@ -83,6 +84,16 @@ export interface LabVariantResult {
   events: number | null;
   weightsVersion: string | null;
   fingerprint: string | null;
+  pass: number | null;
+  replayedAlone: string | null;
+}
+
+export interface LabPass {
+  variants: string[];
+  runtimeMs: number;
+  events: number | null;
+  isolated: boolean;
+  replayedAlone: string[];
 }
 
 export interface LabResult {
@@ -94,6 +105,7 @@ export interface LabResult {
   scorer: LabScorerResult[];
   scorerSkipped: LabScorerSkip[];
   variants: LabVariantResult[];
+  passes: LabPass[];
   skippedVariants: string[];
   scorerRuntimeMs: number;
   runtimeMs: number;
@@ -169,7 +181,7 @@ export function planVariants(
   return { planned, skipped: variants.slice(limit).map((variant) => variant.name) };
 }
 
-interface VariantContext {
+interface ReplayContext {
   db: Db;
   labRunId: number;
   dataFromMs: number;
@@ -179,8 +191,16 @@ interface VariantContext {
   onProgress: ((progress: LabProgress) => void) | null;
 }
 
-async function runVariant(ctx: VariantContext, plan: PlannedVariant, variantId: number): Promise<LabVariantResult> {
-  const base: LabVariantResult = {
+interface RunnablePlan {
+  plan: PlannedVariant;
+  index: number;
+  variantId: number;
+  config: StrategyConfig;
+  weightsFile: string | null;
+}
+
+function variantResult(plan: PlannedVariant, variantId: number): LabVariantResult {
+  return {
     variantId,
     name: plan.variant.name,
     description: plan.variant.description,
@@ -192,45 +212,71 @@ async function runVariant(ctx: VariantContext, plan: PlannedVariant, variantId: 
     runtimeMs: null,
     events: null,
     weightsVersion: null,
-    fingerprint: null
+    fingerprint: null,
+    pass: null,
+    replayedAlone: null
   };
-  if (!plan.config) {
-    return base;
-  }
-  const startedAt = ctx.timer();
+}
+
+async function replayTogether(ctx: ReplayContext, group: readonly RunnablePlan[]): Promise<{ cohort: CohortBacktestResult | null; error: string | null }> {
   try {
-    const result = await runBacktest({
+    const cohort = await runCohortBacktest({
       db: ctx.db,
       fromMs: ctx.dataFromMs,
       toMs: ctx.dataToMs,
-      config: plan.config,
-      label: labRunLabel(ctx.labRunId, plan.variant.name),
       includeIncomplete: ctx.includeIncomplete,
-      weightsFile: plan.config.scorer.weightsFile,
       recordRejectedSignals: false,
       progressEveryMs: HOUR_MS,
-      onProgress: ctx.onProgress
-        ? (progress) => ctx.onProgress?.({ phase: "variant-progress", labRunId: ctx.labRunId, name: plan.variant.name, progress })
-        : null
+      lanes: group.map((entry) => ({
+        key: entry.plan.variant.name,
+        config: entry.config,
+        label: labRunLabel(ctx.labRunId, entry.plan.variant.name),
+        weightsFile: entry.weightsFile,
+        onProgress: ctx.onProgress
+          ? (progress: BacktestProgress) =>
+              ctx.onProgress?.({ phase: "variant-progress", labRunId: ctx.labRunId, name: entry.plan.variant.name, progress })
+          : null
+      }))
     });
-    const summary = labSummaryOf(result.closedTrades, result.summary.trades);
-    await updateLabVariant(ctx.db, variantId, { strategyRunId: result.runId, summary, error: null });
-    return {
-      ...base,
-      strategyRunId: result.runId,
-      summary,
-      error: null,
-      runtimeMs: ctx.timer() - startedAt,
-      events: result.summary.counts.events,
-      weightsVersion: result.summary.weightsVersion,
-      fingerprint: result.summary.fingerprint
-    };
+    return { cohort, error: null };
+  } catch (error) {
+    log.error({ err: error, labRunId: ctx.labRunId, variants: group.map((entry) => entry.plan.variant.name) }, "lab replay failed");
+    return { cohort: null, error: messageOf(error) };
+  }
+}
+
+async function laneOutcome(
+  ctx: ReplayContext,
+  entry: RunnablePlan,
+  replay: { cohort: CohortBacktestResult | null; error: string | null },
+  share: { runtimeMs: number; pass: number }
+): Promise<LabVariantResult> {
+  const base = { ...variantResult(entry.plan, entry.variantId), runtimeMs: share.runtimeMs, pass: share.pass };
+  const lane = replay.cohort?.lanes.find((candidate) => candidate.key === entry.plan.variant.name) ?? null;
+  const result = lane?.result ?? null;
+  if (!result) {
+    const message = lane?.error ?? replay.error ?? "the replay produced no result";
+    await updateLabVariant(ctx.db, entry.variantId, { error: message }).catch(() => undefined);
+    return { ...base, error: message, replayedAlone: lane?.fallback ?? null };
+  }
+  const summary = labSummaryOf(result.closedTrades, result.summary.trades);
+  try {
+    await updateLabVariant(ctx.db, entry.variantId, { strategyRunId: result.runId, summary, error: null });
   } catch (error) {
     const message = messageOf(error);
-    log.error({ err: error, labRunId: ctx.labRunId, variant: plan.variant.name }, "lab variant failed");
-    await updateLabVariant(ctx.db, variantId, { error: message }).catch(() => undefined);
-    return { ...base, error: message, runtimeMs: ctx.timer() - startedAt };
+    log.error({ err: error, labRunId: ctx.labRunId, variant: entry.plan.variant.name }, "lab variant could not be saved");
+    return { ...base, error: message, replayedAlone: lane?.fallback ?? null };
   }
+  return {
+    ...base,
+    strategyRunId: result.runId,
+    summary,
+    error: null,
+    events: result.summary.counts.events,
+    weightsVersion: result.summary.weightsVersion,
+    fingerprint: result.summary.fingerprint,
+    replayedAlone: lane?.fallback ?? null
+  };
 }
 
 export function variantNotes(results: readonly LabVariantResult[]): JsonObject {
@@ -242,7 +288,9 @@ export function variantNotes(results: readonly LabVariantResult[]): JsonObject {
       runtimeMs: result.runtimeMs === null ? null : Math.round(result.runtimeMs),
       events: result.events,
       weightsVersion: result.weightsVersion,
-      sameTradesAsBaseline: result.isBaseline || baseline === null || result.fingerprint === null ? null : result.fingerprint === baseline
+      sameTradesAsBaseline: result.isBaseline || baseline === null || result.fingerprint === null ? null : result.fingerprint === baseline,
+      pass: result.pass,
+      replayedAlone: result.replayedAlone
     };
   }
   return notes;
@@ -292,6 +340,7 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
       scorer: [],
       scorerSkipped: [],
       variants: [],
+      passes: [],
       skippedVariants: skipped,
       scorerRuntimeMs: 0,
       runtimeMs: 0,
@@ -340,7 +389,7 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
       notes.scorerWeightsBase = current.model.version;
       notes.scorerRuntimeMs = Math.round(result.scorerRuntimeMs);
       await saveLabNotes(db, labRunId, notes);
-      const context: VariantContext = {
+      const context: ReplayContext = {
         db,
         labRunId,
         dataFromMs,
@@ -349,14 +398,44 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
         timer,
         onProgress: options.onProgress ? emit : null
       };
-      for (const [index, plan] of planned.entries()) {
-        emit({ phase: "variant-start", labRunId, name: plan.variant.name, index, total: planned.length });
-        const outcome = await runVariant(context, plan, variantIds[index] ?? 0);
-        releaseMemory();
-        result.variants.push(outcome);
+      const outcomes: Array<LabVariantResult | null> = planned.map(() => null);
+      const record = async (index: number, outcome: LabVariantResult): Promise<void> => {
+        outcomes[index] = outcome;
+        result.variants = outcomes.filter((entry): entry is LabVariantResult => entry !== null);
         notes.variants = variantNotes(result.variants);
+        notes.passes = result.passes.map((pass) => ({ ...pass, runtimeMs: Math.round(pass.runtimeMs) }));
         await saveLabNotes(db, labRunId, notes);
         emit({ phase: "variant-done", labRunId, result: outcome, index, total: planned.length });
+      };
+      const runnable: RunnablePlan[] = [];
+      for (const [index, plan] of planned.entries()) {
+        const variantId = variantIds[index] ?? 0;
+        if (plan.config) {
+          runnable.push({ plan, index, variantId, config: plan.config, weightsFile: plan.config.scorer.weightsFile });
+          continue;
+        }
+        emit({ phase: "variant-start", labRunId, name: plan.variant.name, index, total: planned.length });
+        await record(index, variantResult(plan, variantId));
+      }
+      for (const group of groupCohortLanes(runnable)) {
+        for (const entry of group) {
+          emit({ phase: "variant-start", labRunId, name: entry.plan.variant.name, index: entry.index, total: planned.length });
+        }
+        const startedAtMs = timer();
+        const replay = await replayTogether(context, group);
+        const runtimeMs = timer() - startedAtMs;
+        const pass: LabPass = {
+          variants: group.map((entry) => entry.plan.variant.name),
+          runtimeMs,
+          events: replay.cohort?.passes[0]?.events ?? null,
+          isolated: replay.cohort?.passes[0]?.isolated ?? false,
+          replayedAlone: (replay.cohort?.lanes ?? []).filter((lane) => lane.fallback !== null).map((lane) => lane.key)
+        };
+        result.passes.push(pass);
+        releaseMemory();
+        for (const entry of group) {
+          await record(entry.index, await laneOutcome(context, entry, replay, { runtimeMs: runtimeMs / group.length, pass: result.passes.length }));
+        }
       }
       const baseline = result.variants.find((variant) => variant.isBaseline);
       if (baseline?.error) {

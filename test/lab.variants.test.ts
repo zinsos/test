@@ -288,7 +288,9 @@ describe("lab summaries and report", () => {
       runtimeMs: 1_500,
       events: 1_000,
       weightsVersion: "hand-v1",
-      fingerprint: expectancySol === null ? null : `fp-${expectancySol}`
+      fingerprint: expectancySol === null ? null : `fp-${expectancySol}`,
+      pass: error ? null : 1,
+      replayedAlone: name === "quiet" ? "dev history changed" : null
     });
     const variants = [variant("baseline", 0.001, true), variant("fast-exits", 0.004), variant("quiet", null), variant("broken", null, false, "boom")];
     expect(rankVariants(variants).map((entry) => entry.name)).toEqual(["fast-exits", "baseline", "quiet"]);
@@ -321,6 +323,10 @@ describe("lab summaries and report", () => {
       ],
       scorerSkipped: [{ label: "migrated", checkpointSec: 30, rows: 3, positives: 0, reason: "only 3 matured rows (need 100)" }],
       variants,
+      passes: [
+        { variants: ["baseline", "fast-exits", "quiet"], runtimeMs: 40_000, events: 1_000, isolated: true, replayedAlone: ["quiet"] },
+        { variants: ["copycat"], runtimeMs: 20_000, events: 1_000, isolated: false, replayedAlone: [] }
+      ],
       skippedVariants: ["extra"],
       scorerRuntimeMs: 2_000,
       runtimeMs: 65_000,
@@ -337,6 +343,8 @@ describe("lab summaries and report", () => {
     expect(text).toMatch(/extra\s+skipped: over --max-variants/);
     expect(text).toContain("weights  backtests scored with hand-v1");
     expect(text).toContain("total 1m05s");
+    expect(text).toContain("pass 1 (3 variants in one replay, 1000 events, quiet replayed alone) 40.0s, pass 2 (copycat, 1000 events) 20.0s");
+    expect(text).toContain("2 replay passes for 4 variants");
     expect(text).toContain("pruned   3 lab strategy runs (9 positions, 20 fills, 4 signals) and 8 inactive lab weights");
     expect(text).not.toContain("same trades as the baseline");
     const withCopy = formatLabReport({ ...result, variants: [...variants, variant("copycat", 0.001)] });

@@ -1,5 +1,5 @@
 import type { LabPruneResult } from "./store.js";
-import type { LabResult, LabVariantResult } from "./runner.js";
+import type { LabPass, LabResult, LabVariantResult } from "./runner.js";
 
 function iso(ms: number): string {
   return new Date(ms).toISOString().replace(":00.000Z", "Z").replace(".000Z", "Z");
@@ -130,14 +130,33 @@ function weightsLines(result: LabResult): string[] {
   return versions.length === 0 ? [] : [`weights  backtests scored with ${versions.join(", ")} (lab weights stay inactive until you activate one)`];
 }
 
+function passText(pass: LabPass, index: number): string {
+  const who = pass.variants.length === 1 ? (pass.variants[0] ?? "") : `${pass.variants.length} variants in one replay`;
+  const events = pass.events === null ? "" : `, ${pass.events} events`;
+  const alone = pass.replayedAlone.length === 0 ? "" : `, ${pass.replayedAlone.join(" ")} replayed alone`;
+  return `pass ${index + 1} (${who}${events}${alone}) ${durationText(pass.runtimeMs)}`;
+}
+
 function runtimeLines(result: LabResult): string[] {
   const parts = [`scorer ${durationText(result.scorerRuntimeMs)}`];
-  for (const variant of result.variants) {
-    if (variant.runtimeMs !== null) {
-      parts.push(`${variant.name} ${durationText(variant.runtimeMs)}${variant.events === null ? "" : ` (${variant.events} events)`}`);
+  if (result.passes.length > 0) {
+    parts.push(...result.passes.map(passText));
+  } else {
+    for (const variant of result.variants) {
+      if (variant.runtimeMs !== null) {
+        parts.push(`${variant.name} ${durationText(variant.runtimeMs)}${variant.events === null ? "" : ` (${variant.events} events)`}`);
+      }
     }
   }
   return [`runtime  ${parts.join(", ")}; total ${durationText(result.runtimeMs)}`];
+}
+
+function replayText(result: LabResult): string {
+  if (result.passes.length === 0) {
+    return "every variant through the backtest runner";
+  }
+  const replayed = result.passes.reduce((sum, pass) => sum + pass.variants.length, 0);
+  return `${result.passes.length} replay ${result.passes.length === 1 ? "pass" : "passes"} for ${replayed} ${replayed === 1 ? "variant" : "variants"} through the backtest runner`;
 }
 
 export function pruneText(pruned: LabPruneResult): string {
@@ -148,7 +167,7 @@ export function formatLabReport(result: LabResult): string {
   const hours = (result.dataToMs - result.dataFromMs) / 3_600_000;
   const lines = [
     `== lab run ${result.labRunId} (${result.status}) ==`,
-    `replay   ${iso(result.dataFromMs)} to ${iso(result.dataToMs)} (${Number(hours.toFixed(2))}h, every variant through the backtest runner)`
+    `replay   ${iso(result.dataFromMs)} to ${iso(result.dataToMs)} (${Number(hours.toFixed(2))}h, ${replayText(result)})`
   ];
   if (result.error) {
     lines.push(`error    ${result.error}`);

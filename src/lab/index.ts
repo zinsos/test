@@ -11,6 +11,7 @@ export {
   planVariants,
   runLab,
   variantNotes,
+  type LabPass,
   type LabProgress,
   type LabResult,
   type LabVariantResult,
