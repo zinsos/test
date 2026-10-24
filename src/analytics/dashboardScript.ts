@@ -835,7 +835,8 @@ export const DASHBOARD_SCRIPT = String.raw`
     var since = isNum(health.lastDataAgoMs) ? "for " + fmtDur(health.lastDataAgoMs / 1000) : "since it started";
     dom.alert.replaceChildren(
       el("strong", { text: "No market data " + since + "." }),
-      el("span", { text: " The bot can't see new coins, trade or sell. If Helius says the key is out of credits, paste a new key in the Settings tab." }));
+      el("span", { text: " The bot can't see new coins, trade or sell. If Helius says the key is out of credits, paste a new key in Settings. " }),
+      el("button", { type: "button", class: "btn alert-btn", text: "Change key", onclick: function () { selectTab("settings"); } }));
   }
   function renderBalance() {
     renderAlert();
@@ -1161,7 +1162,9 @@ ${LAB_VIEW_SCRIPT}
     var header = el("header", { class: "top" },
       el("div", { class: "bar" },
         el("div", { class: "brand" }, dom.dot, el("span", { class: "wordmark", "aria-label": "SNYPRA edge" }, "snypra", el("span", { class: "amber", text: "_" })), el("span", { class: "brand-sub", text: "edge" })),
-        el("div", { class: "brand" }, dom.updated, el("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", text: "↻", onclick: function () { refresh(false); } }))),
+        el("div", { class: "brand" }, dom.updated,
+          el("button", { class: "icon-btn", type: "button", "aria-label": "Settings", title: "Settings", text: "⚙", onclick: function () { selectTab("settings"); } }),
+          el("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", text: "↻", onclick: function () { refresh(false); } }))),
       dom.balance, dom.alert, dom.tabs, dom.filters);
     var footer = el("footer", { class: "footer" }, "Numbers are after fees. Expectancy decides, not win rate.", el("br"),
       el("button", { type: "button", text: "Forget token on this device", onclick: function () { storageSet(TOKEN_KEY, null); refresh(false); } }));
