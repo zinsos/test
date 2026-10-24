@@ -20,6 +20,7 @@ import {
   type TradingControls,
   type WalletSource
 } from "./routes.js";
+import type { RpcKeyControls } from "./rpcKey.js";
 import type { SolPriceLookup } from "./solPrice.js";
 
 const log = moduleLogger("analytics");
@@ -47,6 +48,7 @@ export interface AnalyticsServerOptions {
   wallet?: WalletSource | null;
   price?: SolPriceLookup | null;
   trading?: TradingControls | null;
+  rpcKey?: RpcKeyControls | null;
 }
 
 export interface AnalyticsServer {
@@ -165,14 +167,39 @@ async function handleApi(ctx: AnalyticsContext, access: ApiAccess, url: URL, req
   sendJson(res, 200, await runJsonRoute(ctx, resolved.route, request));
 }
 
+const MAX_ACTION_BODY_BYTES = 2_048;
+
+async function readActionBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    size += buffer.length;
+    if (size > MAX_ACTION_BODY_BYTES) {
+      throw new HttpError(413, "payload_too_large", "request body too large");
+    }
+    chunks.push(buffer);
+  }
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  if (text.length === 0) {
+    return null;
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new HttpError(400, "invalid_json", "request body must be JSON");
+  }
+}
+
 async function handleAction(ctx: AnalyticsContext, access: ApiAccess, url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  req.resume();
   if (access.token === null) {
+    req.resume();
     sendJson(res, 403, { error: "actions_need_token", message: "set DASHBOARD_TOKEN to use dashboard actions" });
     return;
   }
   const provided = bearerToken(req);
   if (provided === null || !tokensMatch(provided, access.token)) {
+    req.resume();
     sendJson(res, 401, { error: "unauthorized", message: "actions need Authorization: Bearer <token>" }, {
       "WWW-Authenticate": 'Bearer realm="snypra-edge"'
     });
@@ -180,13 +207,16 @@ async function handleAction(ctx: AnalyticsContext, access: ApiAccess, url: URL, 
   }
   const resolved = resolveRoute(normalizedPath(url.pathname).slice(API_PREFIX.length));
   if (!resolved) {
+    req.resume();
     throw new HttpError(404, "not_found", "unknown api route");
   }
   if (resolved.route.kind !== "action") {
+    req.resume();
     sendJson(res, 405, { error: "method_not_allowed", message: "only GET is supported" }, { Allow: "GET, HEAD" });
     return;
   }
-  const request: ApiRequest = { url, params: url.searchParams, segments: resolved.segments };
+  const body = await readActionBody(req);
+  const request: ApiRequest = { url, params: url.searchParams, segments: resolved.segments, body };
   sendJson(res, 200, await resolved.route.handle(ctx, request));
 }
 
@@ -214,7 +244,8 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
     live: options.live ?? null,
     wallet: options.wallet ?? null,
     price: options.price ?? null,
-    trading: options.trading ?? null
+    trading: options.trading ?? null,
+    rpcKey: options.rpcKey ?? null
   };
   const access: ApiAccess = {
     token: options.token && options.token.length > 0 ? options.token : null,

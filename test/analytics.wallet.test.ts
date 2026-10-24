@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { startAnalyticsServer, type AnalyticsServer } from "../src/analytics/server.js";
 import type { TradingControls, WalletSnapshot } from "../src/analytics/routes.js";
+import type { RpcKeyControls } from "../src/analytics/rpcKey.js";
 import { SolPriceFeed, type PriceSource } from "../src/analytics/solPrice.js";
 import { VirtualClock } from "../src/core/clock.js";
 import type { Db } from "../src/db/pool.js";
@@ -42,7 +43,7 @@ function recordingControls(calls: string[]): TradingControls {
   };
 }
 
-async function serve(options: { token?: string | null; allowOpen?: boolean; trading?: TradingControls | null }): Promise<string> {
+async function serve(options: { token?: string | null; allowOpen?: boolean; trading?: TradingControls | null; rpcKey?: RpcKeyControls | null }): Promise<string> {
   const server = await startAnalyticsServer({
     db: unusedDb,
     port: 0,
@@ -52,7 +53,8 @@ async function serve(options: { token?: string | null; allowOpen?: boolean; trad
     clock: new VirtualClock(NOW_MS),
     wallet: () => snapshot(),
     price: { current: () => Promise.resolve({ usd: 100, source: "test", atMs: NOW_MS - 5_000 }) },
-    trading: options.trading === undefined ? null : options.trading
+    trading: options.trading === undefined ? null : options.trading,
+    rpcKey: options.rpcKey ?? null
   });
   servers.push(server);
   return `http://127.0.0.1:${server.port}`;
@@ -96,6 +98,40 @@ describe("dashboard trading actions", () => {
     expect(calls).toEqual([]);
     const idle = await serve({ trading: null });
     const response = await fetch(`${idle}/api/actions/close-all`, { method: "POST", headers: bearer });
+    expect(response.status).toBe(409);
+  });
+});
+
+describe("rpc key settings", () => {
+  it("shows the masked key and changes it only by an authorised POST with a valid key", async () => {
+    const changed: string[] = [];
+    const rpcKey: RpcKeyControls = {
+      status: () => ({ provider: "helius", keyHint: "1111…5555", canChange: true }),
+      change: (key) => {
+        changed.push(key);
+        return Promise.resolve({ ok: true, keyHint: "aaaa…eeee", restarting: true });
+      }
+    };
+    const base = await serve({ rpcKey });
+    const status = await fetch(`${base}/api/rpc`, { headers: bearer });
+    expect(await status.json()).toEqual({ provider: "helius", keyHint: "1111…5555", canChange: true });
+    const post = (body: string, headers: Record<string, string> = bearer): Promise<Response> =>
+      fetch(`${base}/api/actions/rpc-key`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body });
+    expect((await post(JSON.stringify({ key: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }), {})).status).toBe(401);
+    expect((await post(JSON.stringify({ key: "not-a-key" }))).status).toBe(400);
+    expect((await post("{not json")).status).toBe(400);
+    expect((await post(JSON.stringify({ key: "a".repeat(4_000) }))).status).toBe(413);
+    expect(changed).toEqual([]);
+    const saved = await post(JSON.stringify({ key: " aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee " }));
+    expect(saved.status).toBe(200);
+    expect(await saved.json()).toEqual({ ok: true, keyHint: "aaaa…eeee", restarting: true });
+    expect(changed).toEqual(["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]);
+  });
+
+  it("reports the key change as off when the server has no controls", async () => {
+    const base = await serve({});
+    expect(await (await fetch(`${base}/api/rpc`, { headers: bearer })).json()).toEqual({ provider: "none", keyHint: null, canChange: false });
+    const response = await fetch(`${base}/api/actions/rpc-key`, { method: "POST", headers: bearer, body: JSON.stringify({ key: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }) });
     expect(response.status).toBe(409);
   });
 });

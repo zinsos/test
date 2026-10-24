@@ -45,6 +45,7 @@ import {
 import { latestScore, recentLaunches, recentSignals, trackedWallets } from "./activityQueries.js";
 import { loadLabOverview } from "./labQueries.js";
 import type { LiveHub, LiveStatus } from "./liveHub.js";
+import { isHeliusKey, type RpcKeyControls, type RpcKeyStatus } from "./rpcKey.js";
 import type { SolPriceLookup } from "./solPrice.js";
 import { lamportsToSol } from "./units.js";
 import { recorderHealth } from "./recorderQueries.js";
@@ -124,12 +125,14 @@ export interface AnalyticsContext {
   wallet: WalletSource | null;
   price: SolPriceLookup | null;
   trading: TradingControls | null;
+  rpcKey: RpcKeyControls | null;
 }
 
 export interface ApiRequest {
   url: URL;
   params: URLSearchParams;
   segments: string[];
+  body?: unknown;
 }
 
 export interface CsvStream {
@@ -463,6 +466,23 @@ function resumeRoute(ctx: AnalyticsContext): Promise<unknown> {
   return Promise.resolve({ ok: true, resumed, entriesPaused: false });
 }
 
+function rpcStatusRoute(ctx: AnalyticsContext): Promise<RpcKeyStatus> {
+  return Promise.resolve(ctx.rpcKey ? ctx.rpcKey.status() : { provider: "none", keyHint: null, canChange: false });
+}
+
+function rpcKeyRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
+  if (!ctx.rpcKey) {
+    throw new HttpError(409, "rpc_key_unavailable", "changing the RPC key is off on this server");
+  }
+  const body = request.body;
+  const key = body !== null && typeof body === "object" ? (body as Record<string, unknown>).key : undefined;
+  const trimmed = typeof key === "string" ? key.trim() : null;
+  if (!isHeliusKey(trimmed)) {
+    throw new HttpError(400, "invalid_key", "send {\"key\": \"<helius api key>\"}");
+  }
+  return ctx.rpcKey.change(trimmed);
+}
+
 function tradesCsvRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStream {
   const filter = tradeFilterFrom(request.params);
   return {
@@ -491,6 +511,8 @@ const ROUTES: ReadonlyMap<string, ApiRoute> = new Map<string, ApiRoute>([
   ["wallet", { kind: "json", cacheable: false, handle: (ctx) => walletRoute(ctx) }],
   ["actions/close-all", { kind: "action", handle: (ctx) => closeAllRoute(ctx) }],
   ["actions/resume", { kind: "action", handle: (ctx) => resumeRoute(ctx) }],
+  ["rpc", { kind: "json", cacheable: false, handle: (ctx) => rpcStatusRoute(ctx) }],
+  ["actions/rpc-key", { kind: "action", handle: rpcKeyRoute }],
   ["export/scorer-dataset.csv", { kind: "csv", handle: scorerDatasetRoute }],
   ["export/trades.csv", { kind: "csv", handle: tradesCsvRoute }]
 ]);

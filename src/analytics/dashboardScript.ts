@@ -21,8 +21,11 @@ export const DASHBOARD_SCRIPT = String.raw`
   var DOT = " · ";
   var TABS = [
     ["trades", "Trades"], ["live", "Live"], ["edge", "Edge"], ["lab", "Lab"], ["breakdowns", "Breakdowns"], ["compare", "Paper vs Live"],
-    ["scorer", "Scorer"], ["recorder", "Recorder"], ["signals", "Signals"], ["launches", "Launches"], ["wallets", "Wallets"]
+    ["scorer", "Scorer"], ["recorder", "Recorder"], ["signals", "Signals"], ["launches", "Launches"], ["wallets", "Wallets"], ["settings", "Settings"]
   ];
+  var STATIC_TABS = { settings: true };
+  var HELIUS_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  var RELOAD_AFTER_KEY_MS = 15000;
   var FILTER_TABS = { edge: true, breakdowns: true, compare: true };
   var LIVE_TABS = { trades: true };
   var STREAM_TABS = { live: true };
@@ -180,10 +183,10 @@ export const DASHBOARD_SCRIPT = String.raw`
   function api(path, params) {
     return fetch(path + queryString(params), { headers: authHeaders(), cache: "no-store", credentials: "same-origin" }).then(readJson);
   }
-  function apiPost(path) {
+  function apiPost(path, body) {
     var headers = authHeaders();
     headers["Content-Type"] = "application/json";
-    return fetch(path, { method: "POST", headers: headers, body: "{}", cache: "no-store", credentials: "same-origin" }).then(readJson);
+    return fetch(path, { method: "POST", headers: headers, body: JSON.stringify(body || {}), cache: "no-store", credentials: "same-origin" }).then(readJson);
   }
 
   function card(title, hint) {
@@ -1007,9 +1010,42 @@ export const DASHBOARD_SCRIPT = String.raw`
 
 ${LIVE_VIEW_SCRIPT}
 ${LAB_VIEW_SCRIPT}
+  function providerText(rpc) {
+    if (rpc.provider === "helius") { return "Helius"; }
+    return rpc.provider === "custom" ? "another provider" : "not set";
+  }
+  function saveRpcKey(input, note, button) {
+    var key = String(input.value || "").trim();
+    if (!HELIUS_KEY.test(key)) { note.textContent = "That does not look like a Helius API key. It has 5 groups of letters and numbers: 8-4-4-4-12."; return; }
+    button.disabled = true;
+    note.textContent = "Checking the key with Helius…";
+    apiPost("/api/actions/rpc-key", { key: key }).then(function (result) {
+      input.value = "";
+      note.textContent = "Saved key " + result.keyHint + ". The bot is restarting with it; this page reloads in " + RELOAD_AFTER_KEY_MS / 1000 + " seconds.";
+      window.setTimeout(function () { window.location.reload(); }, RELOAD_AFTER_KEY_MS);
+    }).catch(function (error) {
+      button.disabled = false;
+      note.textContent = "Not saved: " + (error && error.message ? error.message : "request failed") + ".";
+    });
+  }
+  function settingsView() {
+    return api("/api/rpc").then(function (rpc) {
+      var input = el("input", { type: "text", name: "helius-key", autocomplete: "off", autocapitalize: "off", spellcheck: "false", inputmode: "text", placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" });
+      var note = el("p", { class: "subline", role: "status" });
+      var button = el("button", { type: "button", class: "btn primary", text: "Check and save" });
+      button.addEventListener("click", function () { saveRpcKey(input, note, button); });
+      var current = el("dl", { class: "kv" },
+        el("dt", { text: "Provider" }), el("dd", { text: providerText(rpc) }),
+        el("dt", { text: "Current key" }), el("dd", { class: "mono", text: rpc.keyHint || DASH }));
+      var body = rpc.canChange
+        ? [field("New Helius API key", input), actions([button]), note]
+        : el("p", { class: "detail", text: "Changing the key from here is off on this server. Set ENV_FILE to the path of the service env file to turn it on." });
+      return [card("Helius RPC key", "The bot reads the chain and sends trades through Helius. Copy a new API key from dashboard.helius.dev and paste it here. It is checked with Helius first, then saved, and the bot restarts in a few seconds. Open trades are picked up again after the restart.", current, body)];
+    });
+  }
   var VIEWS = {
     trades: tradesView, live: liveView, edge: edgeView, lab: labView, breakdowns: breakdownsView, compare: compareView, scorer: scorerView,
-    recorder: recorderView, signals: signalsView, launches: launchesView, wallets: walletsView
+    recorder: recorderView, signals: signalsView, launches: launchesView, wallets: walletsView, settings: settingsView
   };
 
   function setActiveTab() {
@@ -1095,7 +1131,7 @@ ${LAB_VIEW_SCRIPT}
   }
   function periodicRefresh() {
     if (!autoRefreshAllowed()) { return; }
-    if (LIVE_TABS[state.tab] === true || STREAM_TABS[state.tab] === true) { checkHealth(); loadMeta(); return; }
+    if (LIVE_TABS[state.tab] === true || STREAM_TABS[state.tab] === true || STATIC_TABS[state.tab] === true) { checkHealth(); loadMeta(); return; }
     refresh(true);
   }
   function selectTab(id) {

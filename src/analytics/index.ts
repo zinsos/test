@@ -94,6 +94,7 @@ export {
   type WalletSnapshot,
   type WalletSource
 } from "./routes.js";
+export { HELIUS_KEY_PATTERN, isHeliusKey, keyHint, type RpcKeyChange, type RpcKeyControls, type RpcKeyStatus, type RpcProvider } from "./rpcKey.js";
 export { DEFAULT_PRICE_SOURCES, positivePrice, SolPriceFeed, type PriceSource, type SolPrice, type SolPriceLookup } from "./solPrice.js";
 export {
   createAnalyticsHandler,

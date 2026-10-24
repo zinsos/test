@@ -9,6 +9,7 @@ import {
   type TradingControls,
   type WalletSnapshot
 } from "../analytics/index.js";
+import { createRpcKeyControls } from "./rpcKey.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
 import type { StrategyConfig } from "../config/strategy.js";
@@ -47,6 +48,8 @@ const MIN_DASHBOARD_TOKEN_LENGTH = 24;
 const SKIP_REASON_LOOKBACK_MS = 1_000;
 const PLACEHOLDER_DASHBOARD_TOKEN = "change-me-to-a-long-random-string";
 
+
+const RPC_KEY_RESTART_DELAY_MS = 1_000;
 
 function walletSnapshotOf(parts: TradingParts): WalletSnapshot {
   const status = parts.risk.status();
@@ -353,7 +356,16 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           live: liveHub,
           price: new SolPriceFeed({ clock }),
           wallet: () => (tradingParts ? walletSnapshotOf(tradingParts) : null),
-          trading: tradingControlsOf(() => tradingParts)
+          trading: tradingControlsOf(() => tradingParts),
+          rpcKey: createRpcKeyControls({
+            envFile: env.ENV_FILE ?? null,
+            currentHttpUrl: env.RPC_HTTP_URL,
+            restart: () => {
+              clock.schedule(clock.nowMs() + RPC_KEY_RESTART_DELAY_MS, () => {
+                process.kill(process.pid, "SIGTERM");
+              });
+            }
+          })
         })
       : await startHealthServer({
           db,
