@@ -331,7 +331,7 @@ export class LaneScoring implements ScoreProvider {
   private readonly launches: LaneLaunches;
   private readonly service: ScorerService;
   private readonly devCache = new DevCacheEmulator();
-  private readonly latestScores = new LruCache<Pubkey, LaunchScore>(LATEST_SCORE_ENTRIES);
+  private readonly latestScores = new LruCache<Pubkey, LaunchScore | null>(LATEST_SCORE_ENTRIES);
   private readonly checks: Array<Promise<string | null>> = [];
   private trending: TrendingIdentity | null = null;
   private divergence: string | null = null;
@@ -384,6 +384,8 @@ export class LaneScoring implements ScoreProvider {
 
   forget(mint: Pubkey): void {
     this.launches.forget(mint);
+    this.latestScores.replace(mint, null);
+    this.service.forget(mint);
   }
 
   sees(mint: Pubkey): boolean {

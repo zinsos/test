@@ -331,6 +331,7 @@ export class PaperLanes {
       return;
     }
     const resumedRunIds = new Set<number>();
+    const untouchedLabels = new Set<string>();
     for (const spec of this.options.specs) {
       const lane = await this.openActive(spec, runs).catch((error: unknown) => {
         log.error({ err: error, lane: spec.name }, "paper lane failed to start; the main trader and other lanes continue");
@@ -338,11 +339,13 @@ export class PaperLanes {
       });
       if (lane) {
         resumedRunIds.add(lane.runId);
+      } else {
+        untouchedLabels.add(spec.label);
       }
     }
     const activeLabels = new Set(this.options.specs.map((spec) => spec.label));
     for (const run of runs) {
-      if (resumedRunIds.has(run.runId)) {
+      if (resumedRunIds.has(run.runId) || untouchedLabels.has(run.label)) {
         continue;
       }
       const reason: PaperLaneEndReason = activeLabels.has(run.label) ? "config_changed" : "lane_removed";

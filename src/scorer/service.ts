@@ -99,7 +99,7 @@ export class ScorerService implements ScoreProvider {
   private readonly storedFeatures: StoredFeaturesLookup | null;
   private readonly devHistoryTimeoutMs: number;
   private readonly maxCheckpointLagMs: number;
-  private readonly latestScores: LruCache<Pubkey, LaunchScore>;
+  private readonly latestScores: LruCache<Pubkey, LaunchScore | null>;
   private readonly timers = new Map<Pubkey, Set<TimerHandle>>();
   private readonly scheduledMints = new LruCache<Pubkey, true>(100_000);
   private readonly running = new Set<Promise<unknown>>();
@@ -121,7 +121,7 @@ export class ScorerService implements ScoreProvider {
     this.storedFeatures = options.storedFeatures ?? null;
     this.devHistoryTimeoutMs = options.devHistoryTimeoutMs ?? 2_000;
     this.maxCheckpointLagMs = options.maxCheckpointLagMs ?? 60_000;
-    this.latestScores = new LruCache<Pubkey, LaunchScore>(options.maxLatest ?? 50_000);
+    this.latestScores = new LruCache<Pubkey, LaunchScore | null>(options.maxLatest ?? 50_000);
   }
 
   start(): void {
@@ -162,6 +162,10 @@ export class ScorerService implements ScoreProvider {
 
   latest(mint: Pubkey): LaunchScore | null {
     return this.latestScores.get(mint) ?? null;
+  }
+
+  forget(mint: Pubkey): void {
+    this.latestScores.replace(mint, null);
   }
 
   scheduleLaunch(mint: Pubkey, createdAtMs: number): void {

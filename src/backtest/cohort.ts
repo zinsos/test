@@ -451,7 +451,7 @@ async function runPass(options: CohortBacktestOptions, specs: readonly CohortLan
         }
         const nowMs = base.nowMs();
         if (nowMs - lastEvictMs >= evictEveryMs) {
-          pass.hiddenWhileHeld += evictLaunches(market, lanes, nowMs, evictionWindow);
+          pass.hiddenWhileHeld += evictLaunches(market, lanes, sharedScorer, nowMs, evictionWindow);
           await stopDivergedLanes(lanes);
           lastEvictMs = nowMs;
         }
@@ -657,7 +657,13 @@ async function settleLanes(lanes: readonly Lane[], base: VirtualClock, shared: S
   }
 }
 
-function evictLaunches(market: MarketState, lanes: readonly Lane[], nowMs: number, window: ReturnType<typeof evictionWindowOf>): number {
+function evictLaunches(
+  market: MarketState,
+  lanes: readonly Lane[],
+  scorer: ScorerModule,
+  nowMs: number,
+  window: ReturnType<typeof evictionWindowOf>
+): number {
   let hiddenWhileHeld = 0;
   const evicted = market.evict(nowMs, (launch) => {
     if (!evictableAt(launch, nowMs, window)) {
@@ -682,6 +688,7 @@ function evictLaunches(market: MarketState, lanes: readonly Lane[], nowMs: numbe
     return held;
   });
   for (const launch of evicted) {
+    scorer.service.forget(launch.mint);
     for (const lane of lanes) {
       lane.market.forget(launch.mint);
       lane.scoring?.forget(launch.mint);

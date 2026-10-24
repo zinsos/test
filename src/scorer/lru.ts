@@ -51,6 +51,14 @@ export class LruCache<K, V> {
     }
   }
 
+  replace(key: K, value: V): boolean {
+    if (!this.map.has(key)) {
+      return false;
+    }
+    this.map.set(key, value);
+    return true;
+  }
+
   delete(key: K): boolean {
     const value = this.map.get(key);
     if (value === undefined) {

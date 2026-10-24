@@ -142,7 +142,7 @@ export const LAB_VIEW_SCRIPT = String.raw`
   }
   function livePaperChanges(row) {
     if (row.isMain) { return "The strategy in the service's strategy config."; }
-    var compared = isNum(row.mainSameWindowTrades) ? " vs main over its " + fmtInt(row.mainSameWindowTrades) + " trades in the same period." : "";
+    var compared = isNum(row.mainSameWindowTrades) ? " vs main uses the main strategy's " + fmtInt(row.mainSameWindowTrades) + " trades from the same period." : "";
     if (!row.changes || !row.changes.length) { return "Same settings as the main strategy." + compared; }
     var shown = row.changes.slice(0, LIVE_PAPER_CHANGES_SHOWN).map(livePaperChange);
     var more = row.changes.length - shown.length + (row.moreChanges || 0);

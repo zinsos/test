@@ -284,7 +284,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     meta.runs.forEach(function (run) {
       if (String(run.id) === state.runId) { listed = true; }
       if (mode && run.mode !== mode) { return; }
-      options.push([String(run.id), "#" + run.id + " " + run.mode + (run.label ? " " + run.label : "") + " (" + fmtInt(run.closedTrades) + ")"]);
+      options.push([String(run.id), runTitle(run) + " (" + fmtInt(run.closedTrades) + ")"]);
     });
     if (state.runId && !listed) { options.push([state.runId, "#" + state.runId + " (opened from Lab)"]); }
     return options;

@@ -293,6 +293,45 @@ describe.skipIf(!hasTestDatabase)("live paper strategy lanes", () => {
     expect(reasons).toEqual(["halted_daily_loss"]);
   });
 
+  it("keeps the main trader and the other lanes running when a lane fails to start", async () => {
+    await stop();
+    const failing = new Proxy(database.db, {
+      get(target, property, receiver) {
+        if (property === "query") {
+          return (text: unknown, params?: unknown[]) => {
+            if (typeof text === "string" && text.includes("FROM risk_state") && params?.[0] === firstRuns["fast-exits"]) {
+              return Promise.reject(new Error("risk state unreadable"));
+            }
+            return target.query(text as string, params);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      }
+    });
+    app = await startLiveApp({
+      env: paperEnv(database.url, LANES),
+      config: baseConfig(),
+      clock,
+      db: failing,
+      rpc: null,
+      source: new ReplayLogSource({ clock, transactions: [] }),
+      port: 0
+    });
+    const running = app;
+    expect(running.paperLanes?.lanes().map((lane) => lane.strategy)).toEqual(["momentum-loose"]);
+    expect(running.trader?.isRunning()).toBe(true);
+    const mint = await launchAt(running, clock);
+    running.bus.emit("score", momentumScore(mint, clock.nowMs(), 20));
+    await settle(clock);
+    expect(running.trader?.openPositions().map((position) => position.mint)).toContain(mint);
+    const lanes = running.paperLanes?.lanes() ?? [];
+    await stop();
+    expect(lanes.every((lane) => !lane.trader.isRunning() && lane.state === "halted")).toBe(true);
+    const fastRun = (await runs(database)).find((run) => Number(run.id) === firstRuns["fast-exits"]);
+    expect(fastRun?.ended_at).toBeNull();
+  });
+
   it("does not start a lane whose lock another process holds and runs the others", async () => {
     await stop();
     const holder = new pg.Client({ connectionString: database.url });

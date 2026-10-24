@@ -366,7 +366,7 @@ describe("dashboard with live paper strategies", () => {
       );
     const dashboard = await startDashboard({}, { hash: "#lab", responder });
     const text = dashboard.view().text;
-    for (const expected of ["Live paper strategies", "Main strategy", "momentum-loose", "maxRiskScore 35 → 50", "+0.011", "-0.003 to +0.025", "+0.010", "vs main over its 3 trades in the same period.", "56%", "No lab run yet"]) {
+    for (const expected of ["Live paper strategies", "Main strategy", "momentum-loose", "maxRiskScore 35 → 50", "+0.011", "-0.003 to +0.025", "+0.010", "vs main uses the main strategy's 3 trades from the same period.", "56%", "No lab run yet"]) {
       expect(text).toContain(expected);
     }
     expect(dashboard.find("main-row").map((row) => row.className)).toEqual(["lane-row main-row", "lane-detail main-row"]);
