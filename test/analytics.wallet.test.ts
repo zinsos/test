@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { startAnalyticsServer, type AnalyticsServer } from "../src/analytics/server.js";
-import type { TradingControls, WalletSnapshot } from "../src/analytics/routes.js";
+import type { MarketDataSource, TradingControls, WalletSnapshot } from "../src/analytics/routes.js";
 import type { RpcKeyControls } from "../src/analytics/rpcKey.js";
 import { SolPriceFeed, type PriceSource } from "../src/analytics/solPrice.js";
 import { VirtualClock } from "../src/core/clock.js";
@@ -43,7 +43,7 @@ function recordingControls(calls: string[]): TradingControls {
   };
 }
 
-async function serve(options: { token?: string | null; allowOpen?: boolean; trading?: TradingControls | null; rpcKey?: RpcKeyControls | null }): Promise<string> {
+async function serve(options: { token?: string | null; allowOpen?: boolean; trading?: TradingControls | null; rpcKey?: RpcKeyControls | null; marketData?: MarketDataSource | null }): Promise<string> {
   const server = await startAnalyticsServer({
     db: unusedDb,
     port: 0,
@@ -54,7 +54,8 @@ async function serve(options: { token?: string | null; allowOpen?: boolean; trad
     wallet: () => snapshot(),
     price: { current: () => Promise.resolve({ usd: 100, source: "test", atMs: NOW_MS - 5_000 }) },
     trading: options.trading === undefined ? null : options.trading,
-    rpcKey: options.rpcKey ?? null
+    rpcKey: options.rpcKey ?? null,
+    marketData: options.marketData ?? null
   });
   servers.push(server);
   return `http://127.0.0.1:${server.port}`;
@@ -71,6 +72,20 @@ describe("wallet endpoint", () => {
     expect(body).toMatchObject({ enabled: true, mode: "live", address: ADDRESS, walletSol: 0.442448087, totalSol: 0.442448087, solUsd: 100, priceSource: "test", canControl: true, entriesPaused: false });
     expect(body.walletUsd).toBeCloseTo(44.2448087, 6);
     expect(body.equitySol).toBe(0.45);
+  });
+});
+
+describe("market data health", () => {
+  it("flags the stream as stale after two minutes without data or when it never connected", async () => {
+    const read = async (health: ReturnType<MarketDataSource>): Promise<unknown> => {
+      const base = await serve({ marketData: () => health });
+      return ((await (await fetch(`${base}/api/wallet`, { headers: bearer })).json()) as Record<string, unknown>).marketData;
+    };
+    expect(await read({ connected: true, lastDataAgoMs: 900 })).toEqual({ connected: true, lastDataAgoMs: 900, stale: false });
+    expect(await read({ connected: false, lastDataAgoMs: 2_220_000 })).toEqual({ connected: false, lastDataAgoMs: 2_220_000, stale: true });
+    expect(await read({ connected: true, lastDataAgoMs: 120_001 })).toMatchObject({ stale: true });
+    expect(await read({ connected: false, lastDataAgoMs: null })).toMatchObject({ stale: true });
+    expect(await read(null)).toBeNull();
   });
 });
 

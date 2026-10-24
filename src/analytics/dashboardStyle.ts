@@ -56,6 +56,10 @@ a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible
 .bal-sol { font-size: 15px; color: var(--ink); }
 .bal-usd { font-size: 15px; font-weight: 500; color: var(--ink-2); }
 .bal-flag { font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--bad-ink); }
+.alert { max-width: 928px; margin: 0 auto 8px; padding: 10px 12px; border: 1px solid var(--bad); border-radius: 6px; background: var(--bad-wash); color: var(--ink); font-size: 14px; }
+.alert:empty { display: none; }
+.alert strong { color: var(--bad-ink); font-weight: 600; }
+@media (max-width: 960px) { .alert { margin: 0 16px 8px; } }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--neutral); flex: 0 0 auto; }
 .dot.good { background: var(--good); }
 .dot.bad { background: var(--bad); }

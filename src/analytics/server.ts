@@ -17,6 +17,7 @@ import {
   type CsvRoute,
   type ExtraHealth,
   type ScoreLookup,
+  type MarketDataSource,
   type TradingControls,
   type WalletSource
 } from "./routes.js";
@@ -49,6 +50,7 @@ export interface AnalyticsServerOptions {
   price?: SolPriceLookup | null;
   trading?: TradingControls | null;
   rpcKey?: RpcKeyControls | null;
+  marketData?: MarketDataSource | null;
 }
 
 export interface AnalyticsServer {
@@ -245,7 +247,8 @@ export function createAnalyticsHandler(options: Omit<AnalyticsServerOptions, "po
     wallet: options.wallet ?? null,
     price: options.price ?? null,
     trading: options.trading ?? null,
-    rpcKey: options.rpcKey ?? null
+    rpcKey: options.rpcKey ?? null,
+    marketData: options.marketData ?? null
   };
   const access: ApiAccess = {
     token: options.token && options.token.length > 0 ? options.token : null,

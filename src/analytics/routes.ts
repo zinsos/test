@@ -109,6 +109,23 @@ export interface WalletSnapshot {
 
 export type WalletSource = () => WalletSnapshot | null;
 
+export interface MarketDataHealth {
+  connected: boolean;
+  lastDataAgoMs: number | null;
+}
+
+export type MarketDataSource = () => MarketDataHealth | null;
+
+export const MARKET_DATA_STALE_MS = 120_000;
+
+export function marketDataView(health: MarketDataHealth | null): { connected: boolean; lastDataAgoMs: number | null; stale: boolean } | null {
+  if (!health) {
+    return null;
+  }
+  const stale = health.lastDataAgoMs === null ? !health.connected : health.lastDataAgoMs > MARKET_DATA_STALE_MS;
+  return { connected: health.connected, lastDataAgoMs: health.lastDataAgoMs, stale };
+}
+
 export interface TradingControls {
   closeAll(reason: string): number | null;
   resume(reason: string): boolean | null;
@@ -126,6 +143,7 @@ export interface AnalyticsContext {
   price: SolPriceLookup | null;
   trading: TradingControls | null;
   rpcKey: RpcKeyControls | null;
+  marketData: MarketDataSource | null;
 }
 
 export interface ApiRequest {
@@ -436,6 +454,7 @@ async function walletRoute(ctx: AnalyticsContext): Promise<unknown> {
     killReason: snapshot?.killReason ?? null,
     haltedForDay: snapshot?.haltedForDay ?? false,
     canControl: snapshot !== null && ctx.trading !== null,
+    marketData: marketDataView(ctx.marketData ? ctx.marketData() : null),
     solUsd: price?.usd ?? null,
     priceSource: price?.source ?? null,
     priceAtMs: price?.atMs ?? null,

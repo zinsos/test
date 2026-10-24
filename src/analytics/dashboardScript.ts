@@ -828,7 +828,17 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   var wallet = { data: null, lastMs: 0, loading: false, busy: false, armed: null, armedUntil: 0, note: "", card: null };
   function walletLive() { return !!(wallet.data && wallet.data.mode === "live"); }
+  function renderAlert() {
+    if (!dom.alert) { return; }
+    var health = wallet.data && wallet.data.marketData;
+    if (!health || !health.stale) { dom.alert.replaceChildren(); return; }
+    var since = isNum(health.lastDataAgoMs) ? "for " + fmtDur(health.lastDataAgoMs / 1000) : "since it started";
+    dom.alert.replaceChildren(
+      el("strong", { text: "No market data " + since + "." }),
+      el("span", { text: " The bot can't see new coins, trade or sell. If Helius says the key is out of credits, paste a new key in the Settings tab." }));
+  }
   function renderBalance() {
+    renderAlert();
     if (!dom.balance) { return; }
     var w = wallet.data;
     if (!w || !w.enabled) { dom.balance.replaceChildren(); return; }
@@ -1147,11 +1157,12 @@ ${LAB_VIEW_SCRIPT}
     dom.filters = el("div", { class: "filters" });
     dom.main = el("main", { id: "main" });
     dom.balance = el("div", { class: "balance", role: "status", "aria-live": "polite" });
+    dom.alert = el("div", { class: "alert", role: "alert" });
     var header = el("header", { class: "top" },
       el("div", { class: "bar" },
         el("div", { class: "brand" }, dom.dot, el("span", { class: "wordmark", "aria-label": "SNYPRA edge" }, "snypra", el("span", { class: "amber", text: "_" })), el("span", { class: "brand-sub", text: "edge" })),
         el("div", { class: "brand" }, dom.updated, el("button", { class: "icon-btn", type: "button", "aria-label": "Refresh", text: "↻", onclick: function () { refresh(false); } }))),
-      dom.balance, dom.tabs, dom.filters);
+      dom.balance, dom.alert, dom.tabs, dom.filters);
     var footer = el("footer", { class: "footer" }, "Numbers are after fees. Expectancy decides, not win rate.", el("br"),
       el("button", { type: "button", text: "Forget token on this device", onclick: function () { storageSet(TOKEN_KEY, null); refresh(false); } }));
     document.body.replaceChildren(header, dom.main, footer);

@@ -357,6 +357,18 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           price: new SolPriceFeed({ clock }),
           wallet: () => (tradingParts ? walletSnapshotOf(tradingParts) : null),
           trading: tradingControlsOf(() => tradingParts),
+          marketData: ingest
+            ? () => {
+                const source = ingest.stats().source;
+                if (!source) {
+                  return null;
+                }
+                return {
+                  connected: Number(source.connected) === 1,
+                  lastDataAgoMs: typeof source.msSinceLastNotification === "number" && source.msSinceLastNotification >= 0 ? source.msSinceLastNotification : null
+                };
+              }
+            : null,
           rpcKey: createRpcKeyControls({
             envFile: env.ENV_FILE ?? null,
             currentHttpUrl: env.RPC_HTTP_URL,

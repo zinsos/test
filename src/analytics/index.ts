@@ -90,6 +90,9 @@ export {
   type AnalyticsSettings,
   type ExtraHealth,
   type ScoreLookup,
+  MARKET_DATA_STALE_MS,
+  type MarketDataHealth,
+  type MarketDataSource,
   type TradingControls,
   type WalletSnapshot,
   type WalletSource
