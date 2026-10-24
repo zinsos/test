@@ -107,6 +107,9 @@ export function configChanges(main: unknown, lane: unknown, prefix = ""): Config
     const keys = [...new Set([...Object.keys(main), ...Object.keys(lane)])].filter((key) => prefix !== "" || !IGNORED_CONFIG_KEYS.has(key)).sort();
     return keys.flatMap((key) => configChanges(main[key], lane[key], prefix ? `${prefix}.${key}` : key));
   }
+  if (Array.isArray(main) && Array.isArray(lane) && main.length === lane.length && main.some((item) => isRecord(item))) {
+    return main.flatMap((item, index) => configChanges(item, lane[index], `${prefix}.${index}`));
+  }
   if (JSON.stringify(main) === JSON.stringify(lane)) {
     return [];
   }

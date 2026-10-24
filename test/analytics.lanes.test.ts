@@ -255,8 +255,15 @@ describe("live paper strategy rows", () => {
     const lane = structuredClone(main);
     lane.signals.scoreMomentum.maxRiskScore = 50;
     lane.exits.timeStop.afterSec = 120;
+    const firstTakeProfit = lane.exits.takeProfit[0];
+    if (firstTakeProfit) {
+      firstTakeProfit.atMultiple = 1.5;
+    }
+    lane.signals.enabled = ["score_momentum"];
     expect(configChanges(main, lane)).toEqual([
+      { setting: "exits.takeProfit.0.atMultiple", main: "2", lane: "1.5" },
       { setting: "exits.timeStop.afterSec", main: "300", lane: "120" },
+      { setting: "signals.enabled", main: '["smart_convergence"]', lane: '["score_momentum"]' },
       { setting: "signals.scoreMomentum.maxRiskScore", main: "35", lane: "50" }
     ]);
     expect(configChanges({ ...main, lab: { livePaperVariants: ["a"] } }, main)).toEqual([]);
@@ -359,10 +366,15 @@ describe("dashboard with live paper strategies", () => {
       );
     const dashboard = await startDashboard({}, { hash: "#lab", responder });
     const text = dashboard.view().text;
-    for (const expected of ["Live paper strategies", "Main strategy", "momentum-loose", "maxRiskScore 35 → 50", "+0.011", "-0.003 to +0.025", "+0.010 (3 main)", "56%", "No lab run yet"]) {
+    for (const expected of ["Live paper strategies", "Main strategy", "momentum-loose", "maxRiskScore 35 → 50", "+0.011", "-0.003 to +0.025", "+0.010", "vs main over its 3 trades in the same period.", "56%", "No lab run yet"]) {
       expect(text).toContain(expected);
     }
-    expect(dashboard.find("main-row")).toHaveLength(1);
+    expect(dashboard.find("main-row").map((row) => row.className)).toEqual(["lane-row main-row", "lane-detail main-row"]);
+    expect(dashboard.find("lane-detail").map((row) => row.textContent)).toEqual([
+      expect.stringContaining("The strategy in the service's strategy config."),
+      expect.stringContaining("Changes scoreMomentum.maxRiskScore 35 → 50")
+    ]);
+    expect(dashboard.find("show-narrow")[1]?.textContent).toContain("win 56% · total +0.099 SOL · 1 open · 95% range -0.003 to +0.025 · since");
     await dashboard.click("momentum-loose");
     expect(JSON.parse(dashboard.storage.get("snypra-edge-prefs") ?? "{}")).toMatchObject({ tradesRun: "2" });
     expect(dashboard.location.hash).toBe("trades");

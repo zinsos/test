@@ -274,9 +274,15 @@ const LIVE_RULES = `
 .big-num .unit { font-size: 12px; font-weight: 500; color: var(--ink-2); }
 .lab-variant.baseline { background: var(--accent-wash); margin: 0 -16px; padding: 12px 16px; }
 tr.main-row td { background: var(--accent-wash); }
-.strategy-cell { min-width: 140px; }
+tr.lane-row td { border-bottom: none; padding-bottom: 2px; }
+tr.lane-detail td { text-align: left; white-space: normal; overflow-wrap: anywhere; padding-top: 0; }
+.strategy-cell { min-width: 96px; }
 .strategy-cell .link-btn { min-height: 32px; white-space: normal; text-align: left; }
-.strategy-cell .meta { margin: 2px 0 6px; }
+.strategy-cell .badges { align-items: center; }
+.show-narrow { display: none; }
+@media (max-width: 420px) {
+  .show-narrow { display: block; }
+}
 .link-btn {
   border: none; background: none; padding: 0; min-height: 44px; color: var(--accent-ink); font-weight: 600; font-size: 14px;
   cursor: pointer; flex: 0 0 auto; white-space: nowrap;

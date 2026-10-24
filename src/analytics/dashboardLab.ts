@@ -136,46 +136,59 @@ export const LAB_VIEW_SCRIPT = String.raw`
     savePrefs();
     selectTab("trades");
   }
+  function livePaperChange(change) {
+    var parts = change.setting.split(".");
+    return (parts.length > 1 ? parts.slice(1).join(".") : change.setting) + " " + change.main + " → " + change.lane;
+  }
   function livePaperChanges(row) {
-    if (row.isMain) { return "the strategy in the service's strategy config"; }
-    if (!row.changes || !row.changes.length) { return "same settings as the main strategy"; }
-    var shown = row.changes.slice(0, LIVE_PAPER_CHANGES_SHOWN).map(function (change) {
-      var parts = change.setting.split(".");
-      return parts[parts.length - 1] + " " + change.main + " → " + change.lane;
-    });
+    if (row.isMain) { return "The strategy in the service's strategy config."; }
+    var compared = isNum(row.mainSameWindowTrades) ? " vs main over its " + fmtInt(row.mainSameWindowTrades) + " trades in the same period." : "";
+    if (!row.changes || !row.changes.length) { return "Same settings as the main strategy." + compared; }
+    var shown = row.changes.slice(0, LIVE_PAPER_CHANGES_SHOWN).map(livePaperChange);
     var more = row.changes.length - shown.length + (row.moreChanges || 0);
-    return shown.join(DOT) + (more > 0 ? DOT + "+" + more + " more" : "");
+    return "Changes " + shown.join(DOT) + (more > 0 ? DOT + "+" + more + " more" : "") + "." + compared;
+  }
+  function livePaperSince(row) {
+    return row.endedAtMs ? "ended " + fmtTime(row.endedAtMs) : fmtTime(row.startedAtMs) + " (" + fmtAgo(row.startedAtMs) + ")";
+  }
+  function livePaperNarrow(row) {
+    return "win " + fmtPct(row.winRate, 0) + DOT + "total " + fmtSol(row.totalPnlSol) + " SOL" + DOT + fmtInt(row.openPositions) + " open" + DOT +
+      "95% range " + livePaperRange(row) + DOT + "since " + livePaperSince(row);
   }
   function livePaperRange(row) {
     return isNum(row.ciLowSol) && isNum(row.ciHighSol) ? fmtSol(row.ciLowSol) + " to " + fmtSol(row.ciHighSol) : DASH;
   }
   function livePaperVsMain(row) {
-    if (row.isMain) { return DASH; }
-    if (!isNum(row.vsMainSol)) { return DASH; }
-    return fmtSol(row.vsMainSol) + " (" + fmtInt(row.mainSameWindowTrades) + " main)";
+    return !row.isMain && isNum(row.vsMainSol) ? fmtSol(row.vsMainSol) : DASH;
   }
-  function livePaperRow(row) {
+  function livePaperRows(row) {
     var status = LIVE_PAPER_STATUS[row.status] || [readable(row.status), ""];
-    var since = row.endedAtMs ? "ended " + fmtTime(row.endedAtMs) : fmtTime(row.startedAtMs) + " (" + fmtAgo(row.startedAtMs) + ")";
+    var tone = row.isMain ? "main-row" : "";
     var name = el("div", { class: "strategy-cell" },
       el("button", { class: "link-btn", type: "button", text: row.isMain ? "Main strategy" : readable(row.strategy), onclick: function () { openTradesRun(row.runId); } }),
-      el("div", { class: "meta", text: "run #" + row.runId + DOT + livePaperChanges(row) }),
-      el("div", { class: "badges" }, badge(status[0], status[1])));
-    return el("tr", { class: row.isMain ? "main-row" : null }, el("td", null, name),
+      el("div", { class: "badges" }, badge(status[0], status[1]), el("span", { class: "meta", text: "run #" + row.runId })));
+    var summary = el("tr", { class: ("lane-row " + tone).trim() }, el("td", null, name),
       cell(fmtInt(row.trades)), cell(fmtPct(row.winRate, 0), "hide-narrow"),
       cell(row.trades > 0 ? fmtSol(row.expectancySol) : DASH, signClass(row.expectancySol)),
       cell(livePaperRange(row), "hide-narrow"),
       cell(livePaperVsMain(row), signClass(row.vsMainSol)),
-      cell(fmtSol(row.totalPnlSol), signClass(row.totalPnlSol)),
-      cell(fmtInt(row.openPositions)),
-      cell(since, "hide-narrow"));
+      cell(fmtSol(row.totalPnlSol), "hide-narrow " + signClass(row.totalPnlSol)),
+      cell(fmtInt(row.openPositions), "hide-narrow"),
+      cell(livePaperSince(row), "hide-narrow"));
+    var detail = el("tr", { class: ("lane-detail " + tone).trim() },
+      el("td", { colspan: "9" },
+        el("div", { class: "meta show-narrow", text: livePaperNarrow(row) }),
+        el("div", { class: "meta", text: livePaperChanges(row) })));
+    return [summary, detail];
   }
   function livePaperCard(result) {
     var rows = result && Array.isArray(result.rows) ? result.rows : [];
     if (!rows.length) { return null; }
+    var body = [];
+    rows.forEach(function (row) { body.push.apply(body, livePaperRows(row)); });
     return card("Live paper strategies",
       "Every strategy trades the same live feed at the same time, each with its own bankroll, risk limits and positions, so their numbers are directly comparable. Expectancy is SOL per trade after fees with its 95% range. vs main compares a strategy's expectancy with the main strategy's trades opened since that strategy started. Tap a name to open its trades.",
-      table(["Strategy", "Trades", "Win rate", "Exp/trade", "95% range", "vs main", "Total PnL", "Open", "Running since"], rows.map(livePaperRow), { 2: true, 4: true, 8: true }));
+      table(["Strategy", "Trades", "Win rate", "Exp/trade", "95% range", "vs main", "Total PnL", "Open", "Running since"], body, { 2: true, 4: true, 6: true, 7: true, 8: true }));
   }
   function labView() {
     var livePaper = api("/api/lab/live").catch(function (error) {

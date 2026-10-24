@@ -256,6 +256,9 @@ export class PaperLanes {
       return;
     }
     this.started = true;
+    if (this.all.length === 0) {
+      return;
+    }
     const bus = this.options.bus;
     this.detachShared = [
       bus.on("chain", (event) => this.forward("chain", event)),
@@ -272,15 +275,13 @@ export class PaperLanes {
       log.info({ lane: lane.strategy, runId: lane.runId, kind: lane.kind, resumed: lane.resumed, open: lane.trader.openPositions().length }, "paper lane trading");
     }
     this.refreshRunning();
-    if (this.all.length > 0) {
-      this.repeater = new Repeater({
-        clock: this.options.clock,
-        name: "paper-lane-kill-reset",
-        intervalMs: this.options.killResetPollMs ?? 30_000,
-        run: () => this.pollKillResets()
-      });
-      this.repeater.start();
-    }
+    this.repeater = new Repeater({
+      clock: this.options.clock,
+      name: "paper-lane-kill-reset",
+      intervalMs: this.options.killResetPollMs ?? 30_000,
+      run: () => this.pollKillResets()
+    });
+    this.repeater.start();
     for (const lane of this.all) {
       this.maybeFinish(lane);
     }
