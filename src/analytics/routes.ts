@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { defaultStrategyConfig } from "../config/strategy.js";
 import type { Clock } from "../core/clock.js";
+import { moduleLogger } from "../core/logger.js";
 import type { LaunchScore, Pubkey, TradingMode } from "../core/types.js";
 import type { Db } from "../db/pool.js";
 import { DEFAULT_LABEL_HORIZON_HOURS } from "../scorer/dataset.js";
@@ -45,7 +46,8 @@ import {
 } from "./positionQueries.js";
 import { latestScore, recentLaunches, recentSignals, trackedWallets } from "./activityQueries.js";
 import { loadLabOverview } from "./labQueries.js";
-import type { LiveHub, LiveStatus } from "./liveHub.js";
+import type { LiveHub, LiveStatus, OpenValue } from "./liveHub.js";
+import type { SeriesPoint } from "./liveSeries.js";
 import { isHeliusKey, type RpcKeyControls, type RpcKeyStatus } from "./rpcKey.js";
 import type { SolPriceLookup } from "./solPrice.js";
 import { buildTips, tipSettingsOf, type TipSettings } from "./tips.js";
@@ -98,6 +100,8 @@ export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
   tips: tipSettingsOf(defaultStrategyConfig())
 };
 
+const log = moduleLogger("analytics");
+
 export type ScoreLookup = (mint: Pubkey) => LaunchScore | null;
 export type ExtraHealth = () => Record<string, unknown>;
 
@@ -106,6 +110,7 @@ export interface WalletSnapshot {
   address: string | null;
   walletLamports: bigint | null;
   equityLamports: bigint | null;
+  unrealizedLamports: bigint | null;
   dayPnlLamports: bigint | null;
   entriesPaused: boolean;
   killReason: string | null;
@@ -353,7 +358,9 @@ async function positionsRoute(ctx: AnalyticsContext, request: ApiRequest): Promi
   const snapshot = run
     ? await loadPositionsSnapshot(ctx.db, run, { closedLimit, nowMs, fees: ctx.settings.sellFees, dayResetUtcHour })
     : emptyPositionsSnapshot(nowMs, dayResetUtcHour);
-  return { filter: { runId, mode }, ...snapshot, entryRules: ctx.settings.entryRules };
+  const sparks = ctx.live ? ctx.live.sparklines(snapshot.open.map((position) => position.id)) : new Map<string, SeriesPoint[]>();
+  const open = snapshot.open.map((position) => ({ ...position, spark: sparks.get(position.id) ?? null }));
+  return { filter: { runId, mode }, ...snapshot, open, entryRules: ctx.settings.entryRules };
 }
 
 async function walletsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
@@ -390,10 +397,13 @@ async function liveSeriesRoute(ctx: AnalyticsContext, request: ApiRequest): Prom
     throw new HttpError(400, "invalid_position", "position id is malformed");
   }
   const live = ctx.live;
-  if (!live || !live.hasOpenPosition(id)) {
+  if (!live || !live.hasOpenPositionId(id)) {
     throw new HttpError(404, "position_not_open", "no open position with this id in this process");
   }
-  const fills = await loadPositionFills(ctx.db, id).catch(() => []);
+  const fills = await loadPositionFills(ctx.db, id).catch((error: unknown) => {
+    log.warn({ err: error, positionId: id }, "position fills lookup failed, charting without fill markers");
+    return [];
+  });
   const series = live.series(id, fills);
   if (!series) {
     throw new HttpError(404, "position_not_open", "no open position with this id in this process");
@@ -439,14 +449,25 @@ function scorerDatasetRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStre
   };
 }
 
+function solOrNull(lamports: bigint | null | undefined): number | null {
+  return lamports === null || lamports === undefined ? null : lamportsToSol(lamports);
+}
+
+function openMarkAdjustment(open: OpenValue | null, unrealizedSol: number | null): number {
+  return open && unrealizedSol !== null ? open.pnlSol - unrealizedSol : 0;
+}
+
 async function walletRoute(ctx: AnalyticsContext): Promise<unknown> {
   const snapshot = ctx.wallet ? ctx.wallet() : null;
   const price = ctx.price ? await ctx.price.current().catch(() => null) : null;
   const open = snapshot && ctx.live ? ctx.live.openValue() : null;
-  const walletSol = snapshot?.walletLamports === null || snapshot?.walletLamports === undefined ? null : lamportsToSol(snapshot.walletLamports);
-  const equitySol = snapshot?.equityLamports === null || snapshot?.equityLamports === undefined ? null : lamportsToSol(snapshot.equityLamports);
+  const walletSol = solOrNull(snapshot?.walletLamports);
+  const markAdjustSol = openMarkAdjustment(open, solOrNull(snapshot?.unrealizedLamports));
+  const ledgerSol = solOrNull(snapshot?.equityLamports);
+  const equitySol = ledgerSol === null ? null : ledgerSol + markAdjustSol;
   const openValueSol = open ? open.valueSol : null;
-  const todayPnlSol = snapshot?.dayPnlLamports === null || snapshot?.dayPnlLamports === undefined ? null : lamportsToSol(snapshot.dayPnlLamports);
+  const dayPnlSol = solOrNull(snapshot?.dayPnlLamports);
+  const todayPnlSol = dayPnlSol === null ? null : dayPnlSol + markAdjustSol;
   const totalSol = walletSol === null ? equitySol : walletSol + (openValueSol ?? 0);
   const usd = (sol: number | null): number | null => (sol === null || price === null ? null : sol * price.usd);
   return {

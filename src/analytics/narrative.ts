@@ -193,7 +193,7 @@ function gapSentence(input: RecorderNarrativeInput): string {
   if (input.gapCount24h === 0) {
     return "No ingest gaps in the last 24h.";
   }
-  return `${input.gapCount24h} ingest gap(s) in the last 24h totalling ${formatDuration(input.gapSeconds24h)}.`;
+  return `${input.gapCount24h} ${input.gapCount24h === 1 ? "ingest gap" : "ingest gaps"} in the last 24h totalling ${formatDuration(input.gapSeconds24h)}.`;
 }
 
 export function describeRecorder(input: RecorderNarrativeInput): Narrative {

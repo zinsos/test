@@ -7,3 +7,6 @@ coverage
 *.log
 keys
 *.keypair.json
+/desktop/node_modules/
+/desktop/out/
+/desktop/dist/

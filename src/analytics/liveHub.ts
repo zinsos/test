@@ -29,12 +29,20 @@ import {
   livePositionView,
   MAX_SERIES_POINTS,
   positionSeries,
+  sparklinePoints,
   type LiveConfig,
   type LiveMarket,
   type LivePositionView,
-  type PositionSeries
+  type PositionSeries,
+  type SeriesPoint
 } from "./liveSeries.js";
 import type { StoredFill } from "./positionQueries.js";
+
+export interface OpenValue {
+  count: number;
+  valueSol: number;
+  pnlSol: number;
+}
 
 export const DEFAULT_LIVE_MAX_CLIENTS = 10;
 export const DEFAULT_HEARTBEAT_MS = 15_000;
@@ -262,20 +270,33 @@ export class LiveHub {
     };
   }
 
-  openValue(): { count: number; valueSol: number } {
+  openValue(): OpenValue {
     const nowMs = this.clock.nowMs();
     const positions = this.positions ? this.openPrimaryPositions() : [];
     let valueSol = 0;
+    let pnlSol = 0;
     for (const position of positions) {
       const view = this.viewOf(position, nowMs);
       const booked = view.costSol - view.proceedsSol;
       valueSol += view.pnlEstimateSol === null ? Math.max(0, booked) : view.pnlEstimateSol + booked;
+      pnlSol += view.pnlEstimateSol ?? 0;
     }
-    return { count: positions.length, valueSol };
+    return { count: positions.length, valueSol, pnlSol };
   }
 
-  hasOpenPosition(positionId: string): boolean {
+  hasOpenPositionId(positionId: string): boolean {
     return this.findOpen(positionId) !== null;
+  }
+
+  sparklines(positionIds: readonly string[]): Map<string, SeriesPoint[]> {
+    const result = new Map<string, SeriesPoint[]>();
+    for (const id of positionIds) {
+      const position = this.findOpen(id);
+      if (position) {
+        result.set(id, sparklinePoints(position, this.market.get(position.mint)));
+      }
+    }
+    return result;
   }
 
   series(positionId: string, fills: readonly StoredFill[] = []): PositionSeries | null {

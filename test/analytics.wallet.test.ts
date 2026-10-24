@@ -23,6 +23,7 @@ function snapshot(overrides: Partial<WalletSnapshot> = {}): WalletSnapshot {
     address: ADDRESS,
     walletLamports: 442_448_087n,
     equityLamports: 450_000_000n,
+    unrealizedLamports: 4_000_000n,
     dayPnlLamports: -12_500_000n,
     entriesPaused: false,
     killReason: null,

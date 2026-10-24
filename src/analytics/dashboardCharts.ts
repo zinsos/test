@@ -1,9 +1,11 @@
 export const CHART_SCRIPT = String.raw`
   var CHART_SPAN = 1000;
   var CHART_TAG_GAP_PCT = 10;
+  var CHART_TAG_PX = 19;
   var CHART_TAG_MIN_PCT = 5;
   var CHART_TAG_MAX_PCT = 95;
   var CHART_GRID_CLEAR_PCT = 6;
+  var CHART_LEAD_MIN_PCT = 1.5;
   var CHART_EDGE_PCT = 7;
   var CHART_TONES = { accent: "#f3c24b", good: "#34d17f", bad: "#f25c5c" };
   var chartSeq = 0;
@@ -48,7 +50,7 @@ export const CHART_SCRIPT = String.raw`
   function fmtTick(value, step, signed) {
     if (Math.abs(value) < step * 1e-6) { return "0"; }
     var text = Math.abs(value).toFixed(stepDecimals(step));
-    if (value < 0) { return "-" + text; }
+    if (value < 0) { return MINUS + text; }
     return signed ? "+" + text : text;
   }
   function multipleTicks(lo, hi, maxTicks) {
@@ -77,17 +79,19 @@ export const CHART_SCRIPT = String.raw`
   function fmtClock(sec) {
     if (!isNum(sec)) { return DASH; }
     var safe = Math.abs(Math.round(sec));
-    var sign = sec < -0.5 ? "−" : "";
+    var sign = sec < -0.5 ? MINUS : "";
     if (safe >= 3600) { var h = Math.floor(safe / 3600); var m = Math.floor((safe % 3600) / 60); return sign + h + "h" + (m < 10 ? "0" : "") + m; }
     var mm = Math.floor(safe / 60);
     var ss = safe % 60;
     return sign + mm + ":" + (ss < 10 ? "0" : "") + ss;
   }
-  function spreadTags(spots) {
-    var sorted = spots.slice().sort(function (a, b) { return a.top - b.top; });
+  function spreadTags(spots, gapPct) {
+    var gap = gapPct || CHART_TAG_GAP_PCT;
+    var sorted = spots.slice().sort(function (a, b) { return a.top - b.top || (b.priority || 0) - (a.priority || 0); });
+    sorted.forEach(function (spot) { if (!isNum(spot.orig)) { spot.orig = spot.top; } });
     function spread() {
       for (var i = 0; i < sorted.length; i += 1) {
-        var floor = i ? sorted[i - 1].top + CHART_TAG_GAP_PCT : CHART_TAG_MIN_PCT;
+        var floor = i ? sorted[i - 1].top + gap : CHART_TAG_MIN_PCT;
         sorted[i].top = Math.max(sorted[i].top, floor);
       }
     }
@@ -101,9 +105,11 @@ export const CHART_SCRIPT = String.raw`
     return sorted;
   }
 
-  function chartFrame(kind, ariaLabel, gutter) {
+  function chartFrame(kind, ariaLabel) {
     var f = {
-      box: el("div", { class: "chart " + kind + (gutter === false ? " no-gutter" : ""), role: "img", tabindex: "0", "aria-label": ariaLabel }),
+      root: el("div", { class: "chart-block" }),
+      readout: el("div", { class: "chart-readout" }),
+      box: el("div", { class: "chart " + kind, role: "img", tabindex: "0", "aria-label": ariaLabel }),
       plot: el("div", { class: "chart-plot" }),
       art: el("div", { class: "chart-art" }),
       marks: el("div", { class: "chart-marks" }),
@@ -112,14 +118,13 @@ export const CHART_SCRIPT = String.raw`
       dot: el("div", { class: "chart-dot" }),
       gutter: el("div", { class: "chart-gutter" }),
       tags: el("div", { class: "chart-tags" }),
-      ytag: el("span", { class: "chart-ytag" }),
       xaxis: el("div", { class: "chart-x" }),
-      tip: el("div", { class: "tooltip" }),
       api: null, hover: null, current: -1
     };
     f.plot.append(f.art, f.marks, f.hline, f.vline, f.dot);
-    f.gutter.append(f.tags, f.ytag);
-    f.box.append(f.plot, f.gutter, f.xaxis, f.tip);
+    f.gutter.append(f.tags);
+    f.box.append(f.plot, f.gutter, f.xaxis);
+    f.root.append(f.readout, f.box);
     return f;
   }
   function chartXLabels(f, items) {
@@ -131,19 +136,38 @@ export const CHART_SCRIPT = String.raw`
       f.xaxis.append(node);
     });
   }
-  function chartGutter(f, grid, tags) {
-    var placed = spreadTags(tags);
+  function tagGapPct(f) {
+    var height = f.plot.clientHeight || 0;
+    return height > 0 ? Math.max(6, (CHART_TAG_PX / height) * 100) : CHART_TAG_GAP_PCT;
+  }
+  function chartGutter(f, gridItems, tags) {
+    var placed = spreadTags(tags, tagGapPct(f));
     var nodes = [];
-    grid.forEach(function (item) {
+    function near(top) {
+      for (var i = 0; i < placed.length; i += 1) {
+        if (Math.abs(placed[i].top - top) < CHART_GRID_CLEAR_PCT || Math.abs(placed[i].orig - top) < CHART_GRID_CLEAR_PCT) { return true; }
+      }
+      return false;
+    }
+    gridItems.forEach(function (item) {
       var top = clamp(item.y, 0, CHART_SPAN) / 10;
-      if (top < 3 || top > 97) { return; }
-      for (var i = 0; i < placed.length; i += 1) { if (Math.abs(placed[i].top - top) < CHART_GRID_CLEAR_PCT) { return; } }
+      if (top < 3 || top > 97 || near(top)) { return; }
       var node = el("span", { class: "chart-ylab", text: item.text });
       node.style.top = top.toFixed(2) + "%";
       nodes.push(node);
     });
     placed.forEach(function (spot) {
-      var node = el("span", { class: spot.cls, text: spot.text });
+      var shift = spot.top - spot.orig;
+      if (!spot.pinned && Math.abs(shift) > CHART_LEAD_MIN_PCT) {
+        var tone = spot.lead || "";
+        var lead = el("span", { class: "tag-lead " + tone });
+        lead.style.top = Math.min(spot.top, spot.orig).toFixed(2) + "%";
+        lead.style.height = Math.abs(shift).toFixed(2) + "%";
+        var tickMark = el("span", { class: "tag-tick " + tone });
+        tickMark.style.top = clamp(spot.orig, 0, 100).toFixed(2) + "%";
+        nodes.push(lead, tickMark);
+      }
+      var node = el("span", { class: spot.cls + (Math.abs(shift) > CHART_LEAD_MIN_PCT && !spot.pinned ? " moved" : ""), text: spot.text });
       node.style.top = spot.top.toFixed(2) + "%";
       nodes.push(node);
     });
@@ -157,18 +181,18 @@ export const CHART_SCRIPT = String.raw`
     node.style.top = pctOf(yValue);
     return node;
   }
-  function placeTip(f, fraction) {
-    var width = f.box.clientWidth || 0;
-    var plotWidth = f.plot.clientWidth || width;
-    var tipWidth = f.tip.offsetWidth || 0;
-    var x = fraction * plotWidth;
-    var left = x + 14 + tipWidth <= plotWidth ? x + 14 : x - 14 - tipWidth;
-    f.tip.style.left = Math.max(0, Math.min(Math.max(0, width - tipWidth), left)) + "px";
+  function chartReadout(f, content, hovering) {
+    var data = content || { main: [], sub: "" };
+    fill(f.readout, el("div", { class: "ro-main" }, data.main), el("div", { class: "ro-sub" + (data.subTone ? " " + data.subTone : ""), text: data.sub || "" }));
+    f.readout.className = "chart-readout" + (hovering ? " hovering" : "");
   }
-  function chartHide(f) {
-    [f.vline, f.hline, f.dot, f.ytag, f.tip].forEach(function (node) { node.style.display = "none"; });
+  function roItem(text, cls) { return el("span", { class: "ro-item" + (cls ? " " + cls : ""), text: text }); }
+  function roKey(label, value, cls) { return el("span", { class: "ro-item" }, el("span", { class: "ro-key", text: label }), el("span", { class: cls || null, text: value })); }
+  function chartIdle(f) {
+    [f.vline, f.hline, f.dot].forEach(function (node) { node.style.display = "none"; });
+    chartReadout(f, f.api && f.api.idle ? f.api.idle() : null, false);
   }
-  function chartShowAt(f, xValue, yValue, rows, tagText) {
+  function chartShowAt(f, xValue, yValue, content) {
     f.vline.style.display = "block";
     f.vline.style.left = pctOf(xValue);
     f.hline.style.display = "block";
@@ -176,17 +200,7 @@ export const CHART_SCRIPT = String.raw`
     f.dot.style.display = "block";
     f.dot.style.left = pctOf(xValue);
     f.dot.style.top = pctOf(yValue);
-    if (tagText) {
-      f.ytag.style.display = "block";
-      f.ytag.style.top = pctOf(yValue);
-      f.ytag.textContent = tagText;
-    } else {
-      f.ytag.style.display = "none";
-    }
-    f.tip.replaceChildren();
-    append(f.tip, rows);
-    f.tip.style.display = "block";
-    placeTip(f, clamp(xValue, 0, CHART_SPAN) / CHART_SPAN);
+    chartReadout(f, content, true);
   }
   function chartNearest(f, fraction) {
     var size = f.api ? f.api.size() : 0;
@@ -204,10 +218,12 @@ export const CHART_SCRIPT = String.raw`
     f.api.show(index);
   }
   function chartRefresh(f) {
-    if (!f.api || !f.api.size()) { chartHide(f); return; }
+    if (!f.api || !f.api.size()) { chartIdle(f); return; }
     if (f.hover !== null) { chartPick(f, chartNearest(f, f.hover)); return; }
-    if (f.current >= 0 && document.activeElement === f.box) { chartPick(f, Math.min(f.current, f.api.size() - 1)); }
+    if (f.current >= 0 && document.activeElement === f.box) { chartPick(f, Math.min(f.current, f.api.size() - 1)); return; }
+    chartIdle(f);
   }
+  function chartReset(f) { f.hover = null; f.current = -1; chartIdle(f); }
   function chartBind(f, api) {
     f.api = api;
     if (f.bound) { chartRefresh(f); return; }
@@ -219,11 +235,12 @@ export const CHART_SCRIPT = String.raw`
     function onPointer(event) { f.hover = fromEvent(event); chartPick(f, chartNearest(f, f.hover)); }
     f.plot.addEventListener("pointermove", onPointer);
     f.plot.addEventListener("pointerdown", onPointer);
-    f.plot.addEventListener("pointerleave", function (event) { if (event.pointerType === "mouse") { f.hover = null; f.current = -1; chartHide(f); } });
+    f.plot.addEventListener("pointerleave", function () { chartReset(f); });
+    f.plot.addEventListener("pointercancel", function () { chartReset(f); });
     f.box.addEventListener("focus", function () { if (f.hover === null && f.api) { chartPick(f, f.api.size() - 1); } });
-    f.box.addEventListener("blur", function () { f.hover = null; f.current = -1; chartHide(f); });
+    f.box.addEventListener("blur", function () { chartReset(f); });
     f.box.addEventListener("keydown", function (event) {
-      if (event.key === "Escape") { f.hover = null; chartHide(f); return; }
+      if (event.key === "Escape") { chartReset(f); return; }
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") { return; }
       event.preventDefault();
       var size = f.api ? f.api.size() : 0;
@@ -231,6 +248,7 @@ export const CHART_SCRIPT = String.raw`
       f.hover = null;
       chartPick(f, clamp(f.current < 0 ? size - 1 : f.current + (event.key === "ArrowRight" ? 1 : -1), 0, size - 1));
     });
+    chartIdle(f);
   }
 
   function equityChart(points) {
@@ -238,6 +256,7 @@ export const CHART_SCRIPT = String.raw`
     var lastIndex = last.index || 1;
     var lo = 0;
     var hi = 0;
+    var peak = 0;
     points.forEach(function (point) { lo = Math.min(lo, point.equitySol); hi = Math.max(hi, point.equitySol); });
     if (hi - lo < 1e-9) { hi += 0.001; lo -= 0.001; }
     var pad = (hi - lo) * 0.08;
@@ -245,10 +264,10 @@ export const CHART_SCRIPT = String.raw`
     lo -= pad;
     var ticks = niceTicks(lo, hi, 4);
     function y(value) { return ((hi - value) / (hi - lo)) * CHART_SPAN; }
-    var xs = points.map(function (point) { return (point.index / lastIndex) * CHART_SPAN; });
+    var xs = points.map(function (point) { return (point.index / lastIndex) * CHART_SPAN * 0.985; });
     var ys = points.map(function (point) { return y(point.equitySol); });
     var tone = last.equitySol < 0 ? "bad" : "accent";
-    var f = chartFrame("equity-chart", "Equity curve over " + lastIndex + " trades, ending at " + fmtSol(last.equitySol) + " SOL", true);
+    var f = chartFrame("equity-chart", "Equity curve over " + lastIndex + " trades, ending at " + fmtSol(last.equitySol) + " SOL");
     var id = nextGradientId();
     var svg = [svgOpen(), gradientDefs(id, tone, 0.3)];
     ticks.ticks.forEach(function (tick) { svg.push(hLine("cg", y(tick))); });
@@ -257,42 +276,49 @@ export const CHART_SCRIPT = String.raw`
     svg.push("<path class=\"eq-line" + (tone === "bad" ? " neg-line" : "") + "\" d=\"" + pathD(xs, ys) + "\"></path></svg>");
     svgInto(f.art, svg.join(""));
     chartGutter(f, ticks.ticks.map(function (tick) { return { y: y(tick), text: fmtTick(tick, ticks.step, true) }; }),
-      [{ top: ys[ys.length - 1] / 10, cls: "eq-now", text: fmtSol(last.equitySol) }]);
+      [{ top: ys[ys.length - 1] / 10, cls: "eq-now" + (tone === "bad" ? " neg" : ""), text: fmtSol(last.equitySol) }]);
     var xt = niceTicks(0, lastIndex, 5);
     chartXLabels(f, xt.ticks.filter(function (tick) { return tick >= 1 && Math.round(tick) === tick; }).map(function (tick) {
-      return { x: (tick / lastIndex) * CHART_SPAN, text: "#" + fmtInt(tick) };
+      return { x: (tick / lastIndex) * CHART_SPAN * 0.985, text: "#" + fmtInt(tick) };
     }));
-    f.marks.replaceChildren(chartMark("now-dot" + (tone === "bad" ? " neg" : ""), xs[xs.length - 1], ys[ys.length - 1]));
+    f.marks.replaceChildren(chartMark("now-dot still" + (tone === "bad" ? " neg" : ""), xs[xs.length - 1], ys[ys.length - 1]));
+    points.forEach(function (point) { peak = Math.max(peak, point.equitySol); });
     chartBind(f, {
       size: function () { return points.length; },
       x: function (i) { return xs[i]; },
+      idle: function () {
+        return { main: [roItem(fmtSol(last.equitySol) + " SOL", "strong " + signClass(last.equitySol)), roKey("Peak", fmtSol(peak)), roKey("From peak", fmtSol(last.equitySol - peak), signClass(last.equitySol - peak))],
+          sub: "After " + tradesWord(lastIndex) + DOT + "drag across the chart to inspect" };
+      },
       show: function (i) {
         var point = points[i];
-        chartShowAt(f, xs[i], ys[i], [
-          el("strong", { class: signClass(point.equitySol), text: fmtSol(point.equitySol) + " SOL" }),
-          el("div", { text: point.index ? "Trade #" + point.index + DOT + fmtTime(point.atMs) : "Start" }),
-          point.index ? el("div", { class: "tt-muted", text: "This trade " + fmtSol(point.pnlSol) + DOT + "drawdown " + fmtSol(point.drawdownSol, false) }) : null
-        ], fmtSol(point.equitySol));
+        return chartShowAt(f, xs[i], ys[i], {
+          main: [roItem(fmtSol(point.equitySol) + " SOL", "strong " + signClass(point.equitySol)), point.index ? roKey("Trade", fmtSol(point.pnlSol), signClass(point.pnlSol)) : null, point.index ? roKey("Drawdown", fmtSol(point.drawdownSol, false)) : null],
+          sub: point.index ? "Trade #" + point.index + DOT + fmtTime(point.atMs) : "Start"
+        });
       }
     });
-    return f.box;
+    return f.root;
   }
 
   function barChart(items, valueOf, labelOf, unit, tickOf) {
     var max = 0;
-    items.forEach(function (item) { max = Math.max(max, valueOf(item)); });
-    var f = chartFrame("bar-chart short", "Bar chart, peak " + fmtInt(max) + " " + unit, true);
-    var ticks = niceTicks(0, max > 0 ? max : 1, 3);
+    var total = 0;
+    items.forEach(function (item) { max = Math.max(max, valueOf(item)); total += valueOf(item); });
+    var f = chartFrame("bar-chart short", "Bar chart, peak " + fmtInt(max) + " " + unit);
+    var ticks = max > 0 ? niceTicks(0, max, 3) : { step: 1, ticks: [] };
     var top = Math.max(ticks.ticks[ticks.ticks.length - 1] || 1, max > 0 ? max : 1);
     var slot = CHART_SPAN / Math.max(1, items.length);
-    var gap = Math.min(slot * 0.18, 6);
+    var gap = Math.min(slot * 0.22, 8);
     function y(value) { return CHART_SPAN - (value / top) * (CHART_SPAN - 20); }
     var svg = [svgOpen()];
     ticks.ticks.forEach(function (tick) { if (tick > 0) { svg.push(hLine("cg", y(tick))); } });
+    svg.push(hLine("base", CHART_SPAN - 0.5));
     items.forEach(function (item, i) {
       var value = valueOf(item);
-      var height = value > 0 ? Math.max(4, CHART_SPAN - y(value)) : 4;
-      svg.push("<rect class=\"bar-rect" + (value > 0 ? "" : " dim") + "\" x=\"" + coord(i * slot + gap / 2) + "\" y=\"" + coord(CHART_SPAN - height) +
+      if (!(value > 0)) { return; }
+      var height = Math.max(6, CHART_SPAN - y(value));
+      svg.push("<rect class=\"bar-rect" + (i === items.length - 1 ? " last" : "") + "\" x=\"" + coord(i * slot + gap / 2) + "\" y=\"" + coord(CHART_SPAN - height) +
         "\" width=\"" + coord(Math.max(1, slot - gap)) + "\" height=\"" + coord(height) + "\"></rect>");
     });
     svg.push("</svg>");
@@ -302,16 +328,20 @@ export const CHART_SCRIPT = String.raw`
       var picks = items.length > 2 ? [0, Math.floor((items.length - 1) / 2), items.length - 1] : items.map(function (_, i) { return i; });
       chartXLabels(f, picks.map(function (i) { return { x: (i + 0.5) * slot, text: tickOf ? tickOf(items[i]) : labelOf(items[i]) }; }));
     }
-    if (max === 0) { return [f.box, el("p", { class: "hint", text: "Nothing recorded in this window. If this lasts, check the websocket." })]; }
+    var latest = items.length ? items[items.length - 1] : null;
     chartBind(f, {
-      size: function () { return items.length; },
+      size: function () { return max > 0 ? items.length : 0; },
       x: function (i) { return (i + 0.5) * slot; },
+      idle: function () {
+        if (max === 0) { return { main: [roItem("Nothing recorded", "strong")], sub: "If this lasts, check the websocket and the Recorder view." }; }
+        return { main: [roItem(fmtInt(latest ? valueOf(latest) : 0) + " " + unit, "strong"), roKey("Peak", fmtInt(max)), roKey("Total", fmtInt(total))], sub: "Latest" + (latest ? DOT + labelOf(latest) : "") };
+      },
       show: function (i) {
         var item = items[i];
-        chartShowAt(f, (i + 0.5) * slot, y(valueOf(item)), [el("strong", { text: fmtInt(valueOf(item)) + " " + unit }), el("div", { class: "tt-muted", text: labelOf(item) })], fmtInt(valueOf(item)));
+        chartShowAt(f, (i + 0.5) * slot, y(valueOf(item)), { main: [roItem(fmtInt(valueOf(item)) + " " + unit, "strong")], sub: labelOf(item) });
       }
     });
-    return f.box;
+    return f.root;
   }
 
   function labHistoryChart(history) {
@@ -332,7 +362,7 @@ export const CHART_SCRIPT = String.raw`
     var xs = points.map(function (_, i) { return inset + (i / (points.length - 1)) * (CHART_SPAN - 2 * inset); });
     var ys = points.map(function (point) { return y(point.expectancySol); });
     var banded = points.every(function (point) { return isNum(point.ciLowSol) && isNum(point.ciHighSol); });
-    var f = chartFrame("lab-chart", "Baseline expectancy over " + points.length + " lab runs", true);
+    var f = chartFrame("lab-chart", "Baseline expectancy over " + points.length + " lab runs");
     var svg = [svgOpen()];
     ticks.ticks.forEach(function (tick) { svg.push(hLine("cg", y(tick))); });
     svg.push(hLine("zero", y(0)));
@@ -349,19 +379,43 @@ export const CHART_SCRIPT = String.raw`
       return { x: xs[item.i], text: "#" + item.point.labRunId };
     }));
     f.marks.replaceChildren();
-    append(f.marks, points.map(function (_, i) { return chartMark("pt-mark", xs[i], ys[i]); }));
+    append(f.marks, points.map(function (point, i) { return chartMark("pt-mark " + signClass(point.expectancySol), xs[i], ys[i]); }));
+    function content(point) {
+      return {
+        main: [roItem(fmtSol(point.expectancySol) + " SOL/trade", "strong " + signClass(point.expectancySol)),
+          isNum(point.ciLowSol) && isNum(point.ciHighSol) ? roKey("95%", fmtSol(point.ciLowSol) + " to " + fmtSol(point.ciHighSol)) : null, roKey("Trades", fmtInt(point.trades))],
+        sub: "Lab run #" + point.labRunId + DOT + fmtDay(point.startedAtMs)
+      };
+    }
     chartBind(f, {
       size: function () { return points.length; },
       x: function (i) { return xs[i]; },
-      show: function (i) {
-        var point = points[i];
-        chartShowAt(f, xs[i], ys[i], [
-          el("strong", { class: signClass(point.expectancySol), text: fmtSol(point.expectancySol) + " SOL/trade" }),
-          el("div", { text: "Lab run #" + point.labRunId + DOT + fmtDay(point.startedAtMs) }),
-          el("div", { class: "tt-muted", text: (isNum(point.ciLowSol) && isNum(point.ciHighSol) ? "95% " + fmtSol(point.ciLowSol) + " to " + fmtSol(point.ciHighSol) + DOT : "") + fmtInt(point.trades) + " trades" })
-        ], fmtSol(point.expectancySol));
-      }
+      idle: function () { return content(points[points.length - 1]); },
+      show: function (i) { chartShowAt(f, xs[i], ys[i], content(points[i])); }
     });
-    return f.box;
+    return f.root;
+  }
+
+  function sparkline(points, entryPrice) {
+    var clean = (points || []).filter(function (point) { return point && isNum(point.price) && point.price > 0 && isNum(point.atMs); });
+    if (clean.length < 2 || !(isNum(entryPrice) && entryPrice > 0)) { return null; }
+    var lo = 0;
+    var hi = 0;
+    clean.forEach(function (point) { var v = Math.log(point.price / entryPrice); lo = Math.min(lo, v); hi = Math.max(hi, v); });
+    var pad = Math.max(0.03, (hi - lo) * 0.12);
+    lo -= pad;
+    hi += pad;
+    var startMs = clean[0].atMs;
+    var span = Math.max(1, clean[clean.length - 1].atMs - startMs);
+    function y(price) { return ((hi - Math.log(price / entryPrice)) / (hi - lo)) * CHART_SPAN; }
+    var xs = clean.map(function (point) { return ((point.atMs - startMs) / span) * CHART_SPAN; });
+    var ys = clean.map(function (point) { return y(point.price); });
+    var tone = clean[clean.length - 1].price >= entryPrice ? "good" : "bad";
+    var id = nextGradientId();
+    var box = el("div", { class: "spark " + tone, role: "img", "aria-label": "Price since entry, now " + fmtMult(clean[clean.length - 1].price / entryPrice) + " of entry" });
+    svgInto(box, svgOpen() + gradientDefs(id, tone, 0.22) + hLine("spark-entry", y(entryPrice)) +
+      "<path class=\"spark-area\" fill=\"url(#" + id + ")\" d=\"" + areaD(xs, ys) + "\"></path>" +
+      "<path class=\"spark-line\" d=\"" + pathD(xs, ys) + "\"></path></svg>");
+    return box;
   }
 `;

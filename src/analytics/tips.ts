@@ -204,8 +204,8 @@ function sizingTip(summary: TradeSummary, rows: readonly SizingRow[], settings: 
     return {
       id: "sizing",
       tone: "good",
-      title: `Bigger bets would have made more: ${sol(double.pnlSol)} at 2x instead of ${sol(current.pnlSol)}`,
-      detail: `The edge is positive even at the low end, so size can go up step by step. At 1.5x the result would be ${sol(rows.find((row) => row.multiplier === 1.5)?.pnlSol ?? 0)} with a worst dip of ${plainSol(rows.find((row) => row.multiplier === 1.5)?.worstDipSol ?? 0)}. Raising the bet fraction from ${pct(settings.fractionPerTrade)} to ${pct(nextFraction)} of the bankroll is that step; the worst dip grows by the same factor.`,
+      title: `Bigger bets would have made more: ${sol(double.pnlSol)} at 2× instead of ${sol(current.pnlSol)}`,
+      detail: `The edge is positive even at the low end, so size can go up step by step. At 1.5× the result would be ${sol(rows.find((row) => row.multiplier === 1.5)?.pnlSol ?? 0)} with a worst dip of ${plainSol(rows.find((row) => row.multiplier === 1.5)?.worstDipSol ?? 0)}. Raising the bet fraction from ${pct(settings.fractionPerTrade)} to ${pct(nextFraction)} of the bankroll is that step; the worst dip grows by the same factor.`,
       confidence: confidenceFor(summary.n, interval),
       basedOn: summary.n
     };
@@ -214,7 +214,7 @@ function sizingTip(summary: TradeSummary, rows: readonly SizingRow[], settings: 
     return {
       id: "sizing",
       tone: "bad",
-      title: `Bigger bets would have lost more: ${sol(double.pnlSol)} at 2x`,
+      title: `Bigger bets would have lost more: ${sol(double.pnlSol)} at 2×`,
       detail: `With the current results, doubling the bet doubles the loss and the worst dip (${plainSol(double.worstDipSol)}). Half-size bets would be at ${sol(half.pnlSol)}. Keep the size until the per-trade result turns positive.`,
       confidence: confidenceFor(summary.n, interval),
       basedOn: summary.n
@@ -223,7 +223,7 @@ function sizingTip(summary: TradeSummary, rows: readonly SizingRow[], settings: 
   return {
     id: "sizing",
     tone: "warn",
-    title: `2x bets would show ${sol(double.pnlSol)} instead of ${sol(current.pnlSol)}, but it is not proven`,
+    title: `2× bets would show ${sol(double.pnlSol)} instead of ${sol(current.pnlSol)}, but it is not proven`,
     detail: `Bigger bets multiply wins and losses alike: the worst dip would go from ${plainSol(current.worstDipSol)} to ${plainSol(double.worstDipSol)}. Since the edge could still be luck, raising the bet now mostly raises the risk. Wait until the edge tip turns green.`,
     confidence: confidenceFor(summary.n, interval),
     basedOn: summary.n
@@ -380,8 +380,8 @@ function payoffTip(summary: TradeSummary): Tip | null {
   return {
     id: "payoff",
     tone: healthy ? "good" : "warn",
-    title: `Wins ${pct(summary.winRate)} of trades; an average win is ${ratio.toFixed(1)}x an average loss`,
-    detail: `With wins ${ratio.toFixed(1)}x the size of losses, the bot only needs to win ${pct(breakEven)} of trades to break even, and it ${healthy ? "is above that" : "is below that"}. Judge it by this balance, not by the win rate alone.`,
+    title: `Wins ${pct(summary.winRate)} of trades; an average win is ${ratio.toFixed(1)}× an average loss`,
+    detail: `With wins ${ratio.toFixed(1)}× the size of losses, the bot only needs to win ${pct(breakEven)} of trades to break even, and it ${healthy ? "is above that" : "is below that"}. Judge it by this balance, not by the win rate alone.`,
     confidence: confidenceFor(summary.n),
     basedOn: summary.n
   };

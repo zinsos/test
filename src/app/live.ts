@@ -59,6 +59,7 @@ function walletSnapshotOf(parts: TradingParts): WalletSnapshot {
     address: parts.live?.wallet ?? null,
     walletLamports: parts.live ? parts.risk.availableBalanceLamports() : null,
     equityLamports: status.equityLamports,
+    unrealizedLamports: status.unrealizedPnlLamports,
     dayPnlLamports: status.dayPnlLamports,
     entriesPaused: status.killed,
     killReason: status.killReason,

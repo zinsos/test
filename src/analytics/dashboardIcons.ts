@@ -20,7 +20,10 @@ export const ICON_SCRIPT = String.raw`
     lock: "<rect x=\"5\" y=\"10.5\" width=\"14\" height=\"10\" rx=\"2\"></rect><path d=\"M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3\"></path>",
     inbox: "<path d=\"M3.5 13.5l2.8-8h11.4l2.8 8\"></path><path d=\"M3.5 13.5V19h17v-5.5\"></path><path d=\"M3.5 13.5h5l1.5 2.5h4l1.5-2.5h5\"></path>",
     key: "<circle cx=\"8\" cy=\"15\" r=\"4.5\"></circle><path d=\"M11.3 11.7L20 3\"></path><path d=\"M16.5 6.5l2.5 2.5\"></path><path d=\"M14.5 8.5l2 2\"></path>",
-    download: "<path d=\"M12 4v11\"></path><path d=\"M7.5 10.5L12 15l4.5-4.5\"></path><path d=\"M4.5 19.5h15\"></path>"
+    download: "<path d=\"M12 4v11\"></path><path d=\"M7.5 10.5L12 15l4.5-4.5\"></path><path d=\"M4.5 19.5h15\"></path>",
+    info: "<circle cx=\"12\" cy=\"12\" r=\"8.5\"></circle><path d=\"M12 11v5.5\"></path><circle class=\"f\" cx=\"12\" cy=\"7.8\" r=\"1.1\"></circle>",
+    copy: "<rect x=\"8.5\" y=\"8.5\" width=\"11\" height=\"11\" rx=\"1.8\"></rect><path d=\"M15.5 8.5V6.3a1.8 1.8 0 0 0-1.8-1.8H6.3a1.8 1.8 0 0 0-1.8 1.8v7.4a1.8 1.8 0 0 0 1.8 1.8h2.2\"></path>",
+    check: "<path d=\"M5 12.5l4.5 4.5L19 7.5\"></path>"
   };
 
   function icon(key, cls) {

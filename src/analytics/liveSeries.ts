@@ -4,14 +4,17 @@ import { isUsablePrice, multipleOf } from "../exits/math.js";
 import { isSwitchedToPool, moonbagTokensOf, sortedTakeProfitLevels, trailFractionFor } from "../exits/rules.js";
 import { readExitState } from "../exits/state.js";
 import type { LaunchState, TradeRecord } from "../market/state.js";
+import { effectiveFillPrice } from "../trader/accounting.js";
 import { estimatedCloseProceeds, sellFeeBpsFor, sellFeeDefaultsOf, type LastTradeFees, type StoredFill } from "./positionQueries.js";
 import { lamportsRatio, lamportsToSol } from "./units.js";
 
 export const SERIES_LOOKBACK_MS = 60_000;
 export const MAX_SERIES_POINTS = 400;
 export const MAX_FILL_MARKERS = 40;
+export const SPARKLINE_POINTS = 48;
 const SECOND_MS = 1_000;
 const MAX_SYMBOL_LENGTH = 16;
+const LAMPORTS_PER_SOL_NUMBER = 1_000_000_000;
 const PERCENT = 100;
 
 export interface LiveMarket {
@@ -59,6 +62,7 @@ export interface LivePositionView {
   migrated: boolean;
   exiting: string | null;
   lastTradeAtMs: number | null;
+  marketCapSol: number | null;
   levels: ExitLevels;
 }
 
@@ -189,6 +193,13 @@ export function estimatedOpenPnl(position: Position, launch: LaunchState | undef
   return position.proceeds + estimatedCloseProceeds(position.tokensHeld, price, fee, defaults) - position.entryCost;
 }
 
+export function marketCapSolAt(launch: LaunchState | undefined, price: number | null): number | null {
+  if (!launch || price === null || !launch.isSolQuoted || launch.info.tokenTotalSupply <= 0n) {
+    return null;
+  }
+  return finiteOrNull((price * Number(launch.info.tokenTotalSupply)) / LAMPORTS_PER_SOL_NUMBER);
+}
+
 export function livePositionView(position: Position, launch: LaunchState | undefined, config: LiveConfig, nowMs: number): LivePositionView {
   const spot = launch ? launch.price() : 0;
   const price = isUsablePrice(spot) ? spot : isUsablePrice(position.lastPrice) ? position.lastPrice : null;
@@ -219,6 +230,7 @@ export function livePositionView(position: Position, launch: LaunchState | undef
     migrated: position.migratedSeen || (launch?.migrated ?? false),
     exiting: readExitState(position).liquidating?.reason ?? null,
     lastTradeAtMs: launch?.lastTradeAtMs ?? null,
+    marketCapSol: marketCapSolAt(launch, price),
     levels: exitLevels({ ...position, peakPrice: peakPrice > 0 ? peakPrice : position.peakPrice }, config.exits)
   };
 }
@@ -239,14 +251,8 @@ function firstTradeAtOrAfter(trades: readonly TradeRecord[], atMs: number): numb
 }
 
 function storedFillPrice(fill: StoredFill): number | null {
-  if (fill.price !== null && isUsablePrice(fill.price)) {
-    return fill.price;
-  }
-  if (fill.tokenAmount > 0n && fill.userQuote > 0n) {
-    const derived = Number(fill.userQuote) / Number(fill.tokenAmount);
-    return isUsablePrice(derived) ? derived : null;
-  }
-  return null;
+  const price = effectiveFillPrice({ fillPrice: fill.price, userQuote: fill.userQuote, tokenAmount: fill.tokenAmount });
+  return isUsablePrice(price) ? price : null;
 }
 
 function fillSideOf(side: string): FillSide | null {
@@ -332,6 +338,22 @@ export function downsamplePoints(points: readonly SeriesPoint[], maxPoints: numb
   return result;
 }
 
+function pricePointsSince(launch: LaunchState | undefined, fromMs: number): SeriesPoint[] {
+  const trades = launch?.trades ?? [];
+  const points: SeriesPoint[] = [];
+  for (let index = firstTradeAtOrAfter(trades, fromMs); index < trades.length; index += 1) {
+    const trade = trades[index];
+    if (trade && isUsablePrice(trade.price)) {
+      points.push({ atMs: trade.atMs, price: trade.price });
+    }
+  }
+  return points;
+}
+
+export function sparklinePoints(position: Pick<Position, "openedAtMs">, launch: LaunchState | undefined, maxPoints: number = SPARKLINE_POINTS): SeriesPoint[] {
+  return downsamplePoints(pricePointsSince(launch, position.openedAtMs), maxPoints);
+}
+
 export function positionSeries(
   position: Position,
   launch: LaunchState | undefined,
@@ -341,15 +363,7 @@ export function positionSeries(
   fills: readonly StoredFill[] = []
 ): PositionSeries {
   const fromMs = position.openedAtMs - SERIES_LOOKBACK_MS;
-  const trades = launch?.trades ?? [];
-  const startIndex = firstTradeAtOrAfter(trades, fromMs);
-  const points: SeriesPoint[] = [];
-  for (let index = startIndex; index < trades.length; index += 1) {
-    const trade = trades[index];
-    if (trade && isUsablePrice(trade.price)) {
-      points.push({ atMs: trade.atMs, price: trade.price });
-    }
-  }
+  const points = pricePointsSince(launch, fromMs);
   return {
     position: livePositionView(position, launch, config, nowMs),
     fromMs,
