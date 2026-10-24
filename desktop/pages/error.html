@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="color-scheme" content="dark">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snypra-edge: dashboard unavailable</title>
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="error.css">
+<script src="error.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <section class="card" aria-labelledby="title">
+    <div class="badge" aria-hidden="true">
+      <span class="icon"><svg viewBox="0 0 24 24"><path d="M3 9.5a13 13 0 0 1 18 0"></path><path d="M6.5 13a8 8 0 0 1 11 0"></path><path d="M10 16.5a3 3 0 0 1 4 0"></path><path d="M4 4l16 16"></path></svg></span>
+    </div>
+    <p class="eyebrow bad-eyebrow">Dashboard unavailable</p>
+    <h1 class="title" id="title">Dashboard unavailable</h1>
+    <p class="lede" id="message">The dashboard did not load.</p>
+    <dl class="facts">
+      <dt class="label">Address</dt><dd class="mono" id="host">not set</dd>
+    </dl>
+    <div class="banner info tip" id="tip">
+      <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 11v5"></path><path d="M12 7.8v.1"></path></svg></span>
+      <span>If the server uses a Cloudflare quick tunnel, its address changes every time the tunnel restarts. Use Change URL to paste the new one.</span>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="retry" type="button">Try again</button>
+      <button class="btn" id="change" type="button">Change URL</button>
+    </div>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="color-scheme" content="dark">
+<title>snypra-edge</title>
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="toolbar.css">
+<script src="toolbar.js" defer></script>
+</head>
+<body>
+<header class="bar" aria-label="snypra-edge desktop">
+  <div class="brand" aria-label="snypra edge"><span class="wordmark">snypra<span class="amber">_</span></span><span class="brand-sub">edge</span></div>
+  <div class="status" id="status" role="status" aria-live="polite">
+    <span class="dot" id="dot" aria-hidden="true"></span>
+    <span class="status-label" id="status-label">Starting</span>
+    <span class="host" id="host" hidden></span>
+  </div>
+  <nav class="tools" aria-label="Window actions">
+    <button class="tool accent" id="open-web" type="button" aria-label="Open web version" disabled>
+      <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"></path></svg></span>
+      <span class="tool-label">Open web version</span>
+    </button>
+    <button class="tool" id="reload" type="button" aria-label="Reload" title="Reload (F5)" disabled>
+      <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 11.5A8 8 0 1 0 17.7 17"></path><path d="M20.5 4.5V11h-6.5"></path></svg></span>
+      <span class="tool-label">Reload</span>
+    </button>
+    <button class="tool" id="settings" type="button" aria-label="Settings" title="Settings (Ctrl+,)" aria-pressed="false">
+      <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6.5h9"></path><path d="M19 6.5h1"></path><circle cx="16" cy="6.5" r="2.3"></circle><path d="M4 12h2"></path><path d="M12 12h8"></path><circle cx="9" cy="12" r="2.3"></circle><path d="M4 17.5h10"></path><circle cx="17" cy="17.5" r="2.3"></circle></svg></span>
+      <span class="tool-label">Settings</span>
+    </button>
+  </nav>
+</header>
+</body>
+</html>

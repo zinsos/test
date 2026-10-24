@@ -1,0 +1,11 @@
+.page { padding-top: 64px; }
+.badge {
+  display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; margin-bottom: 16px; border-radius: 50%;
+  background: var(--bad-wash); color: var(--bad-ink); border: 1px solid rgba(242, 92, 92, 0.35);
+}
+.badge .icon { width: 20px; height: 20px; }
+.bad-eyebrow { color: var(--bad-ink); }
+.facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; align-items: baseline; margin: 18px 0 0; padding: 12px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.facts dd { margin: 0; font-size: 12.5px; color: var(--ink); overflow-wrap: anywhere; }
+.tip { margin-top: 16px; }
+@media (max-width: 480px) { .page { padding-top: 24px; } .card { padding: 18px 16px; } .actions .btn { flex: 1 1 auto; } }
