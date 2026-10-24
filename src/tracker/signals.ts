@@ -197,6 +197,10 @@ export class SignalEngine {
     return until !== undefined && nowMs < until;
   }
 
+  hasPending(): boolean {
+    return this.pending.size > 0;
+  }
+
   async idle(): Promise<void> {
     while (this.pending.size > 0) {
       await Promise.allSettled([...this.pending]);

@@ -32,3 +32,13 @@ export {
   type BacktestSummary,
   type ManagedTradingStore
 } from "./runner.js";
+export {
+  cohortGroupKey,
+  groupCohortLanes,
+  runCohortBacktest,
+  type CohortBacktestOptions,
+  type CohortBacktestResult,
+  type CohortLane,
+  type CohortLaneResult,
+  type CohortPass
+} from "./cohort.js";
