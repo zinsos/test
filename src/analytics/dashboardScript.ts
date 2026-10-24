@@ -11,6 +11,8 @@ export const DASHBOARD_SCRIPT = String.raw`
   var STALL_MS = 30000;
   var TICK_MS = 1000;
   var WALLET_MS = 15000;
+  var TIPS_MS = 60000;
+  var TIP_TONES = { good: ["Working", "good"], warn: ["Watch", "warn"], bad: ["Problem", "bad"], info: ["Info", "info"] };
   var ARM_MS = 6000;
   var SOLSCAN_ACCOUNT_URL = "https://solscan.io/account/";
   var PREFS_VERSION = "2";
@@ -929,7 +931,65 @@ export const DASHBOARD_SCRIPT = String.raw`
       if (state.tab === "trades") { render(true); }
     });
   }
+  var tips = { data: null, lastMs: 0, loading: false, card: null, runKey: "" };
+  function tipsStageText(d) {
+    if (d.stage === "waiting") { return d.trades === 0 ? "Waiting for the first closed trade" : "Too early to tell"; }
+    if (d.stage === "early") { return "Early hints, not results yet"; }
+    if (d.stage === "building") { return "Patterns are forming"; }
+    return "Enough trades to act on";
+  }
+  function tipItem(t) {
+    var tone = TIP_TONES[t.tone] || TIP_TONES.info;
+    return el("li", { class: "item tip tone-" + t.tone },
+      el("div", { class: "row" }, el("strong", { class: "tip-title", text: t.title }), badge(tone[0], tone[1])),
+      el("p", { class: "tip-detail", text: t.detail }),
+      el("p", { class: "tip-meta", text: "Based on " + fmtInt(t.basedOn) + (t.basedOn === 1 ? " trade" : " trades") + DOT + t.confidence + " confidence" }));
+  }
+  function sizingTableNode(d) {
+    return el("div", { class: "table-wrap" }, el("table", null,
+      el("thead", null, el("tr", null, el("th", { text: "Bet size" }), el("th", { text: "Per trade" }), el("th", { text: "Result" }), el("th", { text: "Worst dip" }))),
+      el("tbody", null, d.sizing.map(function (row) {
+        return el("tr", { class: row.multiplier === 1 ? "current-size" : "" },
+          el("td", { text: row.multiplier + "x" + (row.multiplier === 1 ? " (now)" : "") + (row.allowed ? "" : " *") }),
+          el("td", { text: fmtSolAmount(row.betSol) }),
+          el("td", { class: signClass(row.pnlSol), text: fmtSol(row.pnlSol) }),
+          el("td", { text: fmtSolAmount(row.worstDipSol) }));
+      }))));
+  }
+  function renderTipsCard() {
+    var node = tips.card;
+    if (!node) { return; }
+    var d = tips.data;
+    if (!d || !d.run) { node.hidden = true; node.replaceChildren(); return; }
+    node.hidden = false;
+    node.replaceChildren(
+      el("p", { class: "eyebrow", text: "Tips from your stats" }),
+      el("h2", { text: tipsStageText(d) }),
+      el("ul", { class: "list tips" }, (d.tips || []).map(tipItem)),
+      d.sizing && d.sizing.length ? [el("h3", { text: "What other bet sizes would have done" }), sizingTableNode(d),
+        el("p", { class: "subline", text: "Same trades replayed at each size: results and dips scale together; fixed network fees do not." + (d.sizing.some(function (row) { return !row.allowed; }) ? " * outside the allowed bet range." : "") })] : null);
+  }
+  function tipsCardNode() {
+    var runKey = String(tradesRunParam() || "");
+    if (runKey !== tips.runKey) { tips.data = null; }
+    if (!tips.card) { tips.card = el("section", { class: "card tips-card", hidden: true }); }
+    renderTipsCard();
+    return tips.card;
+  }
+  function loadTips() {
+    if (tips.loading || state.tab !== "trades") { return; }
+    var runKey = String(tradesRunParam() || "");
+    var fresh = runKey === tips.runKey && tips.data !== null && Date.now() - tips.lastMs < TIPS_MS;
+    if (fresh || !autoRefreshAllowed()) { return; }
+    tips.loading = true;
+    tips.lastMs = Date.now();
+    tips.runKey = runKey;
+    api("/api/tips", { runId: tradesRunParam() }).then(function (d) {
+      if (String(tradesRunParam() || "") === runKey && d && Array.isArray(d.tips) && typeof d.stage === "string") { tips.data = d; renderTipsCard(); }
+    }).catch(function () { return null; }).then(function () { tips.loading = false; });
+  }
   function walletTick() {
+    loadTips();
     if (wallet.armed && Date.now() >= wallet.armedUntil) {
       wallet.armed = null;
       wallet.note = "";
@@ -939,7 +999,7 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   function tradesView() {
     return api("/api/positions", { runId: tradesRunParam() }).then(function (data) {
-      var out = [walletCardNode()];
+      var out = [walletCardNode(), tipsCardNode()];
       var runOptions = tradesRunOptions();
       if (runOptions) {
         out.push(el("div", { class: "controls" }, field("Run", selectBox(runOptions, state.tradesRun, function (value) { state.tradesRun = value; savePrefs(); render(); }, "Run"))));

@@ -6,6 +6,7 @@ import {
   SolPriceFeed,
   startAnalyticsServer,
   thresholdsOf,
+  tipSettingsOf,
   type TradingControls,
   type WalletSnapshot
 } from "../analytics/index.js";
@@ -351,7 +352,8 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
             labelHorizonHours: config.recorder.outcome.finalizeAfterHours,
             sellFees: sellFeeDefaultsOf(config.execution),
             entryRules: entryRulesOf(config),
-            dayResetUtcHour: config.risk.dayResetUtcHour
+            dayResetUtcHour: config.risk.dayResetUtcHour,
+            tips: tipSettingsOf(config)
           },
           live: liveHub,
           price: new SolPriceFeed({ clock }),

@@ -47,6 +47,7 @@ import { loadLabOverview } from "./labQueries.js";
 import type { LiveHub, LiveStatus } from "./liveHub.js";
 import { isHeliusKey, type RpcKeyControls, type RpcKeyStatus } from "./rpcKey.js";
 import type { SolPriceLookup } from "./solPrice.js";
+import { buildTips, tipSettingsOf, type TipSettings } from "./tips.js";
 import { lamportsToSol } from "./units.js";
 import { recorderHealth } from "./recorderQueries.js";
 import { scoreCheckpoints, scorerCalibration } from "./scorerQueries.js";
@@ -75,6 +76,7 @@ export interface AnalyticsSettings {
   sellFees: SellFeeDefaults;
   entryRules: EntryRules | null;
   dayResetUtcHour: number;
+  tips: TipSettings;
 }
 
 export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
@@ -91,7 +93,8 @@ export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
   labelHorizonHours: DEFAULT_LABEL_HORIZON_HOURS,
   sellFees: sellFeeDefaultsOf(defaultStrategyConfig().execution),
   entryRules: null,
-  dayResetUtcHour: defaultStrategyConfig().risk.dayResetUtcHour
+  dayResetUtcHour: defaultStrategyConfig().risk.dayResetUtcHour,
+  tips: tipSettingsOf(defaultStrategyConfig())
 };
 
 export type ScoreLookup = (mint: Pubkey) => LaunchScore | null;
@@ -485,6 +488,19 @@ function resumeRoute(ctx: AnalyticsContext): Promise<unknown> {
   return Promise.resolve({ ok: true, resumed, entriesPaused: false });
 }
 
+async function tipsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
+  const runId = parseInteger(request.params, "runId", { min: 1 });
+  const run = await selectPositionsRun(ctx.db, { runId, mode: null });
+  if (!run) {
+    if (runId !== null) {
+      throw new HttpError(404, "run_not_found", "no strategy run with this id");
+    }
+    return { run: null, ...buildTips([], ctx.settings.tips) };
+  }
+  const trades = await loadClosedTrades(ctx.db, { runId: run.id, includeShadows: false, limit: ctx.settings.tradeLimit });
+  return { run: { id: run.id, mode: run.mode, label: run.label }, ...buildTips(trades, ctx.settings.tips) };
+}
+
 function rpcStatusRoute(ctx: AnalyticsContext): Promise<RpcKeyStatus> {
   return Promise.resolve(ctx.rpcKey ? ctx.rpcKey.status() : { provider: "none", keyHint: null, canChange: false });
 }
@@ -531,6 +547,7 @@ const ROUTES: ReadonlyMap<string, ApiRoute> = new Map<string, ApiRoute>([
   ["actions/close-all", { kind: "action", handle: (ctx) => closeAllRoute(ctx) }],
   ["actions/resume", { kind: "action", handle: (ctx) => resumeRoute(ctx) }],
   ["rpc", { kind: "json", cacheable: false, handle: (ctx) => rpcStatusRoute(ctx) }],
+  ["tips", { kind: "json", cacheable: true, handle: tipsRoute }],
   ["actions/rpc-key", { kind: "action", handle: rpcKeyRoute }],
   ["export/scorer-dataset.csv", { kind: "csv", handle: scorerDatasetRoute }],
   ["export/trades.csv", { kind: "csv", handle: tradesCsvRoute }]
