@@ -9,6 +9,7 @@ import {
   sellFeeBpsFor,
   sellFeeDefaultsOf
 } from "../src/analytics/positionQueries.js";
+import type { LiveHub } from "../src/analytics/liveHub.js";
 import { startAnalyticsServer, type AnalyticsServer } from "../src/analytics/server.js";
 import { defaultStrategyConfig } from "../src/config/strategy.js";
 import { VirtualClock } from "../src/core/clock.js";
@@ -479,6 +480,20 @@ describe.skipIf(!hasTestDatabase)("positions api", () => {
     expect((await call("/api/positions", null)).status).toBe(401);
     expect((await call("/api/positions", "wrong")).status).toBe(401);
     expect((await call(`/api/positions?token=${TOKEN}`, null)).status).toBe(200);
+  });
+
+  it("adds each open position's price line since entry when this process runs the live hub", async () => {
+    expect(list((await call("/api/positions")).body, "open").map((item) => item.spark)).toEqual([null, null, null, null]);
+    const points = [{ atMs: NOW_MS - 60_000, price: 1e-7 }, { atMs: NOW_MS, price: 2e-7 }];
+    const live = { sparklines: (wanted: readonly string[]) => new Map(wanted.filter((id) => id === "pos-a").map((id) => [id, points])), disconnectAll: () => undefined } as unknown as LiveHub;
+    const withHub = await startAnalyticsServer({ db: database.db, port: 0, host: "127.0.0.1", token: TOKEN, clock: new VirtualClock(NOW_MS), settings: { sellFees: SELL_FEES }, live });
+    try {
+      const response = await fetch(`http://127.0.0.1:${withHub.port}/api/positions`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+      const body = (await response.json()) as Json;
+      expect(list(body, "open").map((item) => [item.id, item.spark])).toEqual([["pos-d", null], ["pos-b", null], ["pos-a", points], ["pos-c", null]]);
+    } finally {
+      await withHub.close();
+    }
   });
 
   it("picks the latest paper or live run that has positions, ahead of newer backtests and empty runs", async () => {

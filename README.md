@@ -202,16 +202,16 @@ Many launches are now quoted in the PUMP coin (`pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz
 
 ## Dashboard
 
-Open the service A domain with `?token=<DASHBOARD_TOKEN>` once. The page stores the token and removes it from the URL. It is built for phones and has these tabs:
+Open the service A domain with `?token=<DASHBOARD_TOKEN>` once. The page stores the token and removes it from the URL. It is built for phones first (bottom bar with More) and shows a sidebar on desktop. Every view keeps its `#hash` address:
 
-- **Edge:** expectancy and verdict
-- **Breakdowns**
-- **Paper vs Live**
-- **Scorer:** calibration
-- **Recorder:** health and gaps
-- **Signals**
-- **Launches:** tap a mint for its score sheet
-- **Wallets**
+- **Overview** (`#trades`): run status, equity, today, open positions with a price line since entry, closed trades, the wallet card with two-tap Close all and Resume buying, and tips from the run's stats.
+- **Live** (`#live`): each open position on a live price chart with entry, stop, trailing stop and take-profit levels, buy and sell markers, market cap and a readout row, next to the activity feed.
+- **Performance** (`#edge`): expectancy, verdict, statistics and the equity curve.
+- **Lab** (`#lab`): strategy variants replayed over recorded launches, scorer retraining and the baseline over time.
+- **Breakdowns**, **Paper vs Live**, **Scorer** (calibration), **Recorder** (health and gaps), **Signals**, **Launches** and **Wallets**: tap a coin for its score sheet.
+- **Settings** (`#settings`): swap the Helius API key and forget the token on this device.
+
+The top bar shows the mode (Live or Paper), one status that names the worst current condition (server unreachable, no market data, buys paused, halted for the day, or trading), the wallet (live) or equity (paper) in SOL and USD, and today's PnL. The equity and today figures come from the trader's risk ledger with open positions valued by the same fee-netted estimate as the Overview.
 
 `/healthz` needs no token, and on a service that also records it answers 503 until the stream has delivered data. Every other route needs `DASHBOARD_TOKEN`, and the service will not start the dashboard without a token of at least 24 characters. `DASHBOARD_ALLOW_OPEN=true` serves the API without a token, for a private network only. A token that is set is always required.
 

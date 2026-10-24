@@ -85,7 +85,7 @@ describe("dashboard html", () => {
     expect(DASHBOARD_SCRIPT).toContain('api("/api/positions"');
     expect(DASHBOARD_SCRIPT).toContain('"Updated " + fmtDur(');
     expect(DASHBOARD_SCRIPT).toContain("No open positions right now");
-    expect(DASHBOARD_SCRIPT).toContain("Recent closed trades");
+    expect(DASHBOARD_SCRIPT).toContain("Closed trades");
     expect(DASHBOARD_SCRIPT).not.toContain("Signals need a tracked-wallet ranking");
     expect(DASHBOARD_SCRIPT).toContain("Score momentum fires on a low-risk launch");
   });
@@ -98,10 +98,12 @@ describe("dashboard html", () => {
     expect(rendered.text).toContain("4.00×");
     expect(rendered.text).toContain("+0.1473 SOL");
     expect(rendered.text).toContain("Awaiting fill");
-    expect(rendered.text).toContain("Recent closed trades");
-    expect(rendered.links).toEqual([`${PUMP_COIN_URL}${MINT}`, `${PUMP_COIN_URL}${PENDING_MINT}`, `${PUMP_COIN_URL}${MINT}`]);
-    expect(rendered.authHeaders).toEqual(["Bearer dom-token", "Bearer dom-token"]);
-    for (const expected of ["Equity5.397SOL+7.9% vs start", "Today+0.2973SOLday 2026-10-23", "Open11 awaiting fill · est. +0.1473 SOL", "Win rate100%1 of 1 won", "Expectancy+0.060SOL+60.0% per trade", "Trades11 closed in 24h"]) {
+    expect(rendered.text).toContain("Closed trades");
+    expect(rendered.text).toContain("TimeCoinExitHoldPnL SOL%");
+    expect(rendered.text).toContain("ALPHATrail30m+0.0600+60.0%");
+    expect(rendered.links).toEqual([`${PUMP_COIN_URL}${MINT}`, `${PUMP_COIN_URL}${PENDING_MINT}`]);
+    expect(rendered.authHeaders).toEqual(["Bearer dom-token", "Bearer dom-token", "Bearer dom-token"]);
+    for (const expected of ["Equity SOL5.3973+7.9% vs start", "Today SOL+0.2973Oct 23 · UTC day", "Open11 pending · est. +0.1473", "Win rate100%1 of 1 won", "Expectancy SOL+0.0600+60.0% on cost", "Trades11 in 24h"]) {
       expect(rendered.text).toContain(expected);
     }
     expect(rendered.text).not.toMatch(/null|undefined|NaN/);
@@ -110,18 +112,18 @@ describe("dashboard html", () => {
     const empty = await renderTradesView({ ...fixture, open: [], counts });
     expect(empty.text).toContain("No open positions right now");
     expect(empty.text).toContain("score momentum (risk 35 or lower at the 60s checkpoint");
-    expect(empty.text).toContain("4 signals in the last 2h, 2 traded; most were skipped for max open positions");
-    expect(empty.paths).toEqual(["/api/runs?limit=200", "/api/positions"]);
+    expect(empty.text).toContain("4 signals in the last 2h, 2 traded; most skips: too many open positions");
+    expect(empty.paths).toEqual(["/api/runs?limit=200", "/api/wallet", "/api/positions"]);
   });
 
   it("moves saved preferences from before the Trades tab onto it once, then keeps the chosen tab", async () => {
     const before = JSON.stringify({ tab: "edge", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "" });
     const migrated = await renderTradesView(tradesFixture(), { storage: { "snypra-edge-prefs": before } });
-    expect(migrated.paths).toEqual(["/api/runs?limit=200", "/api/positions"]);
+    expect(migrated.paths).toEqual(["/api/runs?limit=200", "/api/wallet", "/api/positions"]);
     expect(migrated.text).toContain("Paper run #1");
     const chosen = JSON.stringify({ v: "2", tab: "signals", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "" });
     const kept = await renderTradesView({ signals: [] }, { storage: { "snypra-edge-prefs": chosen } });
-    expect(kept.paths).toEqual(["/api/runs?limit=200", "/api/signals/recent?limit=50"]);
+    expect(kept.paths).toEqual(["/api/runs?limit=200", "/api/wallet", "/api/signals/recent?limit=50"]);
   });
 
   it("links only base58 mints to pump.fun", async () => {
@@ -130,7 +132,7 @@ describe("dashboard html", () => {
     const rendered = await renderTradesView({ ...fixture, open, recentClosed: [] });
     expect(rendered.links).toEqual([`${PUMP_COIN_URL}${PENDING_MINT}`]);
     expect(rendered.text).toContain("+0.2973");
-    expect(rendered.text).toContain("held 10m");
+    expect(rendered.text).toContain("Held10msince");
   });
 
   it("refreshes the Trades tab every 10 seconds in place, only while visible and not while a control is in use", async () => {
@@ -422,16 +424,15 @@ describe("live tab", () => {
     stream.send("message", { ...liveEvent(3, "position", "trade", "$GEN 2.5x"), data: liveView({ multiple: 2.5, price: 0.000125 }) }, "s1:3");
     stream.send("message", liveEvent(2, "opened", "trade", "duplicate replayed event"), "s1:2");
     await dashboard.flush();
-    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Live");
+    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Streaming");
     expect(dashboard.paths).toContain(`/api/live/position/${POSITION}/series`);
     const text = (): string => dashboard.view().text;
     expect(text()).toContain("$GEN");
     expect(text()).toContain("2.00×");
-    expect(text()).toContain("Exits: stop 0.65× · trailing stop 1.72× · next take-profit 3.00× sells 15%");
-    expect(text()).toContain("take-profit");
+    expect(dashboard.find("exit-chip").map((node) => node.textContent)).toEqual(["Stop0.65× −35%", "Trail1.72×", "TP3.00× · 15%", "Max hold58m"]);
     expect(text()).not.toContain("duplicate replayed event");
     const feed = (): string[] => dashboard.find("feed-text").map((node) => node.textContent);
-    expect(feed()).toEqual(["Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL", "Scored $GEN 60s: 18 (clean)"]);
+    expect(feed()).toEqual(["Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL"]);
     const chart = dashboard.find("live-chart")[0];
     const art = chart?.descendants().find((node) => node.className === "chart-art");
     for (const line of ["lv-price", "lv-entry", "lv-stop", "lv-trail", "lv-tp", "lv-open", "lv-area"]) {
@@ -465,17 +466,25 @@ describe("live tab", () => {
       expect(mark.style.top).toMatch(/^\d+(\.\d+)?%$/);
     }
     expect(dashboard.find("now-dot")).toHaveLength(1);
+    const readout = () => dashboard.find("chart-readout")[0];
+    expect(readout()?.textContent).toContain("2.00×+100.0%Now · last trade");
     await dashboard.pointer("chart-plot", "pointermove", PLOT_WIDTH * (80 / 180));
-    const tip = dashboard.find("tooltip")[0];
-    expect(tip?.style.display).toBe("block");
-    expect(tip?.textContent).toContain("1.00×0.0% vs entry");
-    expect(tip?.textContent).toContain("0:20 since entry");
-    expect(tip?.textContent).toContain("Bought 0.075 SOL at 1.00×");
-    expect(dashboard.find("chart-ytag")[0]?.textContent).toBe("1.00×");
+    expect(readout()?.className).toBe("chart-readout hovering");
+    expect(readout()?.textContent).toContain("1.00×0.0%");
+    expect(readout()?.textContent).toContain("Bought 0.0750 SOL at 1.00×");
+    expect(dashboard.find("chart-vline")[0]?.style.display).toBe("block");
+    expect(dashboard.find("chart-ytag")).toHaveLength(0);
+    expect(dashboard.find("tooltip")).toHaveLength(0);
     await dashboard.pointer("chart-plot", "pointermove", PLOT_WIDTH * 0.99);
-    expect(dashboard.find("tooltip")[0]?.textContent).toContain("Sold 50% for 0.070 SOL at 2.00× · take profit");
-    await dashboard.pointer("chart-plot", "pointerleave", 0);
-    expect(dashboard.find("tooltip")[0]?.style.display).toBe("none");
+    expect(readout()?.textContent).toContain("Sold 50% for 0.0700 SOL at 2.00× · Take-profit");
+    await dashboard.pointer("chart-plot", "pointerleave", 0, "touch");
+    expect(readout()?.className).toBe("chart-readout");
+    expect(readout()?.textContent).toContain("Now · last trade");
+    expect(dashboard.find("chart-vline")[0]?.style.display).toBe("none");
+    await dashboard.pointer("chart-plot", "pointerdown", PLOT_WIDTH * 0.5, "touch");
+    expect(readout()?.className).toBe("chart-readout hovering");
+    await dashboard.pointer("chart-plot", "pointercancel", 0, "touch");
+    expect(readout()?.className).toBe("chart-readout");
 
     await dashboard.change("Show", "scores");
     expect(feed()).toEqual(["Scored $GEN 60s: 18 (clean)"]);
@@ -483,6 +492,7 @@ describe("live tab", () => {
     expect(feed()).toEqual(["Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL"]);
     expect(JSON.parse(dashboard.storage.get("snypra-edge-prefs") ?? "{}")).toMatchObject({ liveFilter: "trades" });
     await dashboard.change("Show", "all");
+    expect(feed()).toEqual(["Bought $GEN 0.075 SOL at 2.1x latency 1.1s slippage +1.8% fees 0.0013 SOL", "Scored $GEN 60s: 18 (clean)"]);
 
     await dashboard.click("Pause");
     stream.send("message", { ...liveEvent(4, "rejected", "signal", "Rejected $XYZ: risk 82 above 35"), tone: "neutral" }, "s1:4");
@@ -495,8 +505,9 @@ describe("live tab", () => {
     stream.send("message", liveEvent(5, "closed", "trade", "Closed $GEN: +0.025 SOL (+33.3%), trailing stop after 5m", { positionId: POSITION }), "s1:5");
     await dashboard.flush();
     expect(feed()[0]).toBe("Closed $GEN: +0.025 SOL (+33.3%), trailing stop after 5m");
-    expect(text()).not.toContain("Exits:");
-    expect(text()).toContain("No open positions.");
+    expect(dashboard.find("exit-chip")).toHaveLength(0);
+    expect(text()).toContain("No open positions");
+    expect(text()).toContain("A new buy shows up here with a live price chart");
   });
 
   it("pins exit levels far outside the price range to the chart edge instead of squashing the chart", async () => {
@@ -541,7 +552,7 @@ describe("live tab", () => {
     first?.fail(true);
     await dashboard.flush();
     expect(dashboard.find("live-chip")[0]?.textContent).toBe("Offline, retrying in 3s");
-    expect(dashboard.updated()).toBe("Offline, retrying in 3s");
+    expect(dashboard.updated()).toBe("");
     await dashboard.advance(3_000);
     expect(dashboard.streams).toHaveLength(2);
     const second = dashboard.streams[1];
@@ -567,11 +578,11 @@ describe("live tab", () => {
     await dashboard.advance(2_000);
     expect(stream?.closed).toBe(true);
     expect(dashboard.paths).toContain("/api/live/events?after=0");
-    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Live · updates every 2s");
-    expect(dashboard.find("feed-text").map((node) => node.textContent)).toEqual(["Bought $GEN 0.075 SOL", "Scored $GEN 60s: 18 (clean)"]);
+    expect(dashboard.find("live-chip")[0]?.textContent).toBe("Streaming · updates every 2s");
+    expect(dashboard.find("feed-text").map((node) => node.textContent)).toEqual(["Bought $GEN 0.075 SOL"]);
     await dashboard.advance(2_000);
     expect(dashboard.paths).toContain("/api/live/events?stream=p1&after=2");
-    expect(dashboard.find("feed-text")).toHaveLength(2);
+    expect(dashboard.find("feed-text")).toHaveLength(1);
     await dashboard.advance(60_000);
     expect(dashboard.streams).toHaveLength(1);
   });
@@ -649,17 +660,17 @@ describe("lab tab", () => {
       "Run #3 is running now",
       "Faster exits beat the baseline by +0.004 SOL per trade over 118 trades, not yet significant",
       "Strategy leaderboard",
-      "faster exits",
+      "Faster exits",
       "Tighter trailing stops and an earlier first take-profit.",
-      "+0.006",
-      "118 trades · win 40% · total +0.708 SOL · max drawdown -0.300",
-      "95% range -0.001 to +0.013 · vs baseline +0.004 per trade",
+      "+0.0060",
+      "118 trades · win 40% · total +0.7080 SOL · max drawdown −0.3000",
+      "95% range −0.0010 to +0.0130 · vs baseline +0.0040 per trade",
       "No edge yet",
       "replay failed",
       "Scorer: rugged at 60s",
       "Retrained AUC0.740",
-      "dev share",
-      "riskier when higher",
+      "Dev share",
+      "Riskier when higher",
       "90-100",
       "Skipped: too few positives",
       "Baseline over time"
@@ -668,7 +679,8 @@ describe("lab tab", () => {
     }
     expect(dashboard.find("baseline")).toHaveLength(1);
     expect(dashboard.find("baseline")[0]?.textContent).toContain("Baseline");
-    await dashboard.click("Open in Performance");
+    expect(dashboard.find("lab-open").map((node) => node.getAttribute("aria-label"))).toEqual(["Faster exits, open in Performance", "Baseline, open in Performance"]);
+    await dashboard.click("Faster exits");
     expect(JSON.parse(dashboard.storage.get("snypra-edge-prefs") ?? "{}")).toMatchObject({ runId: "41", mode: "backtest" });
     expect(dashboard.location.hash).toBe("edge");
   });
@@ -695,7 +707,7 @@ describe("lab tab", () => {
     const dashboard = await startDashboard({}, { storage: { "snypra-edge-prefs": prefs }, responder });
     expect(dashboard.paths).toContain("/api/summary?runId=41");
     expect(dashboard.bodyText()).toContain("#41 (opened from Lab)");
-    expect(dashboard.bodyText()).toContain("#9 backtest bt (3)");
+    expect(dashboard.bodyText()).toContain("#9 Backtest · bt · 3 trades");
   });
 });
 
@@ -791,9 +803,10 @@ describe("top bar and wallet", () => {
     expect(dashboard.find("mode-badge")[0]?.textContent).toBe("Live");
     expect(dashboard.find("mode-badge")[0]?.className).toBe("mode-badge live");
     const ticker = (): string => dashboard.find("ticker")[0]?.textContent ?? "";
-    expect(ticker()).toBe("Balance0.4831 SOL$88.11Today+0.2973 SOL");
+    expect(ticker()).toBe("Wallet0.4831SOL$88.11Today−0.0125SOL");
     expect(dashboard.find("dot")[0]?.className).toBe("dot bad");
-    expect(dashboard.find("health-text")[0]?.textContent).toBe("No market data");
+    expect(dashboard.find("status-text")[0]?.textContent).toBe("No market data");
+    expect(dashboard.find("status-short")[0]?.textContent).toBe("No data");
     expect(dashboard.find("alert")[0]?.textContent).toContain("No market data for 23m.");
     expect(dashboard.find("alert")[0]?.textContent).toContain("Change key");
     const wallet = dashboard.find("wallet-card")[0];
@@ -806,7 +819,7 @@ describe("top bar and wallet", () => {
 
     await dashboard.navigate("#lab");
     await dashboard.advance(31_000);
-    expect(ticker()).toBe("Balance0.4831 SOL$88.11Today-0.0125 SOL");
+    expect(ticker()).toBe("Wallet0.4831SOL$88.11Today−0.0125SOL");
     await dashboard.click("Change key");
     expect(dashboard.location.hash).toBe("settings");
   });
@@ -843,8 +856,9 @@ describe("performance and lab charts", () => {
     expect(dashboard.find("chart-xlab").map((node) => node.textContent)).toEqual(["#10", "#20", "#30", "#40"]);
     expect(dashboard.find("eq-now")[0]?.textContent).toMatch(/^\+0\.\d+$/);
     expect(dashboard.find("chart-ylab").length).toBeGreaterThan(1);
+    expect(dashboard.find("chart-readout")[0]?.textContent).toMatch(/^\+0\.\d{4} SOLPeak/);
     await dashboard.pointer("chart-plot", "pointermove", PLOT_WIDTH / 2);
-    expect(dashboard.find("tooltip")[0]?.textContent).toContain("Trade #20");
+    expect(dashboard.find("chart-readout")[0]?.textContent).toContain("Trade #20");
   });
 
   it("charts the lab baseline over time with its 95% band and shows each variant's range against zero", async () => {
@@ -856,6 +870,270 @@ describe("performance and lab charts", () => {
     expect(dashboard.find("lab-chart")[0]?.descendants().filter((node) => node.className.startsWith("chart-xlab")).map((node) => node.textContent)).toEqual(["#1", "#2"]);
     const ranges = dashboard.find("lb-range");
     expect(ranges).toHaveLength(2);
-    expect(ranges[0]?.getAttribute("aria-label")).toBe("Expectancy +0.006 SOL per trade, 95% range -0.001 to +0.013");
+    expect(ranges[0]?.getAttribute("aria-label")).toBe("Expectancy +0.0060 SOL per trade, 95% range −0.0010 to +0.0130");
+  });
+});
+
+function walletFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    enabled: true,
+    mode: "paper",
+    address: null,
+    walletSol: null,
+    walletUsd: null,
+    openPositions: 1,
+    openValueSol: 0.2,
+    openValueUsd: 36,
+    totalSol: 5.4012,
+    totalUsd: 985.1,
+    equitySol: 5.4012,
+    todayPnlSol: 0.3012,
+    todayPnlUsd: 54.9,
+    entriesPaused: false,
+    killReason: null,
+    haltedForDay: false,
+    canControl: true,
+    marketData: { connected: true, lastDataAgoMs: 500, stale: false },
+    solUsd: 182.37,
+    priceSource: "coinbase",
+    priceAtMs: READ_AT_MS - 22_000,
+    readAtMs: READ_AT_MS,
+    ...overrides
+  };
+}
+
+interface ControlServer {
+  responder: Responder;
+  posts: string[];
+  setWallet(overrides: Record<string, unknown>): void;
+}
+
+function controlServer(positions: Record<string, unknown>): ControlServer {
+  const posts: string[] = [];
+  let walletOverrides: Record<string, unknown> = {};
+  const tips = {
+    run: { id: 1 },
+    stage: "building",
+    trades: 40,
+    tips: Array.from({ length: 6 }, (_, i) => ({ title: `Tip ${i}`, detail: `Detail ${i}`, tone: i % 2 ? "warn" : "good", basedOn: 10 + i, confidence: "low" })),
+    sizing: [
+      { multiplier: 0.5, betSol: 0.02, pnlSol: 0.01, worstDipSol: 0.01, allowed: true },
+      { multiplier: 1, betSol: 0.04, pnlSol: 0.02, worstDipSol: 0.02, allowed: true }
+    ]
+  };
+  const responder: Responder = (path) => {
+    if (path.startsWith("/api/runs")) {
+      return Promise.resolve(jsonResponse({ runs: [{ id: 1, mode: "paper", label: null, endedAtMs: null, closedTrades: 1 }], modes: [] }));
+    }
+    if (path === "/api/wallet") {
+      return Promise.resolve(jsonResponse(walletFixture(walletOverrides)));
+    }
+    if (path.startsWith("/api/tips")) {
+      return Promise.resolve(jsonResponse(tips));
+    }
+    if (path === "/api/actions/close-all") {
+      posts.push(path);
+      walletOverrides = { ...walletOverrides, entriesPaused: true, killReason: "dashboard: close all" };
+      return Promise.resolve(jsonResponse({ ok: true, closing: 1, entriesPaused: true }));
+    }
+    if (path === "/api/actions/resume") {
+      posts.push(path);
+      walletOverrides = { ...walletOverrides, entriesPaused: false, killReason: null };
+      return Promise.resolve(jsonResponse({ ok: true, resumed: true, entriesPaused: false }));
+    }
+    if (path === "/api/actions/rpc-key") {
+      posts.push(path);
+      return Promise.resolve(jsonResponse({ ok: true, keyHint: "aaaa…eeee", restarting: true }));
+    }
+    if (path === "/api/rpc") {
+      return Promise.resolve(jsonResponse({ provider: "helius", keyHint: "1234…abcd", canChange: true }));
+    }
+    return Promise.resolve(jsonResponse(positions));
+  };
+  return {
+    responder,
+    posts,
+    setWallet(overrides) {
+      walletOverrides = { ...walletOverrides, ...overrides };
+    }
+  };
+}
+
+describe("overview controls", () => {
+  it("arms close all on the first tap with a countdown, disarms after 6 seconds, and posts with the bearer token on the second tap", async () => {
+    const fixture = tradesFixture();
+    const server = controlServer(fixture);
+    const dashboard = await startDashboard(fixture, { responder: server.responder });
+    await dashboard.advance(1_000);
+    const walletText = (): string => dashboard.find("wallet-card")[0]?.textContent ?? "";
+    expect(walletText()).toContain("Paper bankroll");
+    expect(walletText()).toContain("5.4012SOL$985.10");
+    expect(walletText()).toContain("Close all & pause buying");
+    await dashboard.click("Close all & pause buying");
+    expect(walletText()).toContain("Tap again: sell everything now");
+    expect(walletText()).toContain("This sells every open position at market");
+    expect(server.posts).toEqual([]);
+    const bar = (): string => dashboard.find("arm-bar")[0]?.style.width ?? "";
+    expect(bar()).toBe("100.0%");
+    await dashboard.advance(3_000);
+    expect(Number.parseFloat(bar())).toBeLessThan(60);
+    await dashboard.advance(4_000);
+    expect(walletText()).toContain("Close all & pause buying");
+    expect(dashboard.find("arm-bar")).toHaveLength(0);
+    expect(server.posts).toEqual([]);
+
+    await dashboard.click("Close all & pause buying");
+    await dashboard.click("Tap again: sell everything now");
+    expect(server.posts).toEqual(["/api/actions/close-all"]);
+    expect(dashboard.authHeaders[dashboard.paths.indexOf("/api/actions/close-all")]).toBe("Bearer dom-token");
+    expect(walletText()).toContain("Paused from the dashboard (Close all).");
+    expect(walletText()).toContain("Resume buying");
+    expect(dashboard.find("status-text")[0]?.textContent).toBe("Buys paused");
+    expect(dashboard.view().text).toContain("Paper run #1Buys paused");
+
+    await dashboard.click("Resume buying");
+    await dashboard.click("Tap again to resume buying");
+    expect(server.posts).toEqual(["/api/actions/close-all", "/api/actions/resume"]);
+    expect(walletText()).toContain("Buying resumed.");
+
+    server.setWallet({ openPositions: 0, openValueSol: 0 });
+    await dashboard.advance(15_000);
+    expect(walletText()).toContain("Pause buying");
+    expect(walletText()).not.toContain("Close all");
+    expect(dashboard.find("wallet-card")[0]?.descendants().find((node) => node.tagName === "button")?.className).toBe("btn block ");
+    expect(dashboard.bodyText()).not.toMatch(/null|undefined|NaN/);
+  });
+
+  it("shows three tips and twelve closed trades first and expands both on request", async () => {
+    const fixture = tradesFixture();
+    const closed = (fixture.recentClosed as Array<Record<string, unknown>>)[0] ?? {};
+    const many = { ...fixture, recentClosed: Array.from({ length: 20 }, (_, index) => ({ ...closed, id: `c-${index}` })) };
+    const server = controlServer(many);
+    const dashboard = await startDashboard(many, { responder: server.responder });
+    await dashboard.advance(1_000);
+    expect(dashboard.find("tip")).toHaveLength(3);
+    expect(dashboard.find("tips-card")[0]?.textContent).toContain("What other bet sizes would have done");
+    expect(dashboard.find("current-size")[0]?.textContent).toContain("1× (now)");
+    await dashboard.click("Show all 6 tips");
+    expect(dashboard.find("tip")).toHaveLength(6);
+    const rows = (): number => (dashboard.find("blotter")[0]?.descendants().filter((node) => node.tagName === "tr").length ?? 0) - 1;
+    expect(rows()).toBe(12);
+    await dashboard.click("Show all 20");
+    expect(rows()).toBe(20);
+    await dashboard.click("Show fewer");
+    expect(rows()).toBe(12);
+  });
+
+  it("uses the trader's own equity and today figures on the overview so the header and the tiles agree", async () => {
+    const fixture = tradesFixture();
+    const server = controlServer(fixture);
+    const dashboard = await startDashboard(fixture, { responder: server.responder });
+    await dashboard.advance(1_000);
+    expect(dashboard.find("ticker")[0]?.textContent).toBe("Equity5.4012SOL$985.10Today+0.3012SOL");
+    const tiles = dashboard.find("kpi").map((node) => node.textContent);
+    expect(tiles[0]).toBe("Equity SOL5.4012+8.0% vs start");
+    expect(tiles[1]).toBe("Today SOL+0.3012Oct 23 · UTC day");
+    const other = { ...fixture, run: { ...(fixture.run as Record<string, unknown>), active: false, endedAtMs: READ_AT_MS - 60_000 } };
+    const ended = await startDashboard(other, { responder: controlServer(other).responder });
+    await ended.advance(1_000);
+    expect(ended.find("kpi")[0]?.textContent).toBe("Equity SOL5.3973+7.9% vs start");
+    expect(ended.view().text).toContain("Run ended");
+  });
+
+  it("checks a new Helius key before posting it and posts it with the bearer token", async () => {
+    const server = controlServer(tradesFixture());
+    const dashboard = await startDashboard({}, { hash: "#settings", responder: server.responder });
+    expect(dashboard.view().text).toContain("Current key1234…abcd");
+    expect(dashboard.updated()).toBe("");
+    const input = dashboard.find("mono-input")[0];
+    if (!input) {
+      throw new Error("no key input");
+    }
+    input.value = "not-a-key";
+    await dashboard.click("Check and save");
+    expect(dashboard.view().text).toContain("That does not look like a Helius API key.");
+    expect(server.posts).toEqual([]);
+    input.value = " aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee ";
+    await dashboard.click("Check and save");
+    expect(server.posts).toEqual(["/api/actions/rpc-key"]);
+    expect(dashboard.authHeaders[dashboard.paths.indexOf("/api/actions/rpc-key")]).toBe("Bearer dom-token");
+    expect(dashboard.view().text).toContain("Saved key aaaa…eeee.");
+  });
+});
+
+describe("connection and status", () => {
+  it("says the server is unhealthy, not unreachable, when the health check answers with an error", async () => {
+    const unhealthy = await startDashboard(tradesFixture(), { health: () => Promise.resolve(jsonResponse({ ok: false }, 503)) });
+    expect(unhealthy.find("status-text")[0]?.textContent).toBe("Server unhealthy (database or stream)");
+    const down = await startDashboard(tradesFixture(), { health: () => Promise.reject(new TypeError("Failed to fetch")) });
+    expect(down.find("status-text")[0]?.textContent).toBe("Server unreachable");
+  });
+
+  it("keeps the last data on screen with a disconnected bar when the bot stops answering", async () => {
+    const fixture = tradesFixture();
+    const dashboard = await startDashboard(fixture);
+    expect(dashboard.view().text).toContain("Paper run #1");
+    dashboard.setResponder(() => Promise.reject(new TypeError("Failed to fetch")));
+    await dashboard.advance(10_000);
+    expect(dashboard.view().text).toContain("Paper run #1");
+    expect(dashboard.view().text).not.toContain("Could not load this view");
+    expect(dashboard.find("offline-bar")[0]?.textContent).toContain("Disconnected · showing data from");
+    expect(dashboard.find("status-text")[0]?.textContent).toBe("Server unreachable");
+    expect(dashboard.updated()).toContain("offline");
+    dashboard.setResponder((path) => Promise.resolve(jsonResponse(path.startsWith("/api/runs") ? { runs: [], modes: [] } : fixture)));
+    await dashboard.advance(10_000);
+    expect(dashboard.find("offline-bar")[0]?.textContent).toBe("");
+    expect(dashboard.updated()).toBe("Updated 0s ago");
+  });
+
+  it("explains a view that fails on first load in plain words", async () => {
+    const dashboard = await startDashboard({}, { hash: "#signals", responder: (path) => (path.startsWith("/api/signals") ? Promise.reject(new TypeError("Failed to fetch")) : Promise.resolve(jsonResponse({ runs: [], modes: [] }))) });
+    expect(dashboard.view().text).toContain("Could not load this view");
+    expect(dashboard.view().text).toContain("Can't reach the bot.");
+    expect(dashboard.view().text).not.toContain("Failed to fetch");
+  });
+
+  it("shows the worst current condition on the run badge: no market data before paused", async () => {
+    const fixture = tradesFixture();
+    const server = controlServer(fixture);
+    server.setWallet({ entriesPaused: true, killReason: "dashboard: close all", marketData: { connected: false, lastDataAgoMs: 900_000, stale: true } });
+    const dashboard = await startDashboard(fixture, { responder: server.responder });
+    await dashboard.advance(1_000);
+    expect(dashboard.view().text).toContain("Paper run #1No market data");
+    expect(dashboard.find("status-text")[0]?.textContent).toBe("No market data");
+    server.setWallet({ marketData: { connected: true, lastDataAgoMs: 500, stale: false } });
+    await dashboard.advance(15_000);
+    expect(dashboard.view().text).toContain("Paper run #1Buys paused");
+  });
+
+  it("shows only a sign-in card while locked", async () => {
+    const dashboard = await startDashboard(tradesFixture(), { search: "", responder: () => Promise.resolve(jsonResponse({ error: "unauthorized" }, 401)) });
+    expect(dashboard.bodyClass()).toBe("locked");
+    expect(dashboard.view().text).toContain("This dashboard is locked");
+    expect(dashboard.updated()).toBe("");
+  });
+});
+
+describe("live chart details", () => {
+  it("draws the time after the last trade as a dashed tail and says how old the last trade is", async () => {
+    const quiet = liveView({ lastTradeAtMs: READ_AT_MS - 180_000 });
+    const responder: Responder = (path) => {
+      if (path.startsWith("/api/live/position/")) {
+        return Promise.resolve(
+          jsonResponse({ position: quiet, fromMs: READ_AT_MS - 180_000, totalTrades: 2, points: [{ atMs: READ_AT_MS - 200_000, price: 0.00004 }, { atMs: READ_AT_MS - 180_000, price: 0.0001 }], fills: [], inMemory: true })
+        );
+      }
+      return liveResponder(LIVE_STATUS, quiet)(path);
+    };
+    const dashboard = await startDashboard({}, { hash: "#live", eventSource: true, responder });
+    const stream = dashboard.streams[0];
+    stream?.open();
+    stream?.send("hello", { streamId: "s7", serverTimeMs: READ_AT_MS, tradingActive: true, maxClients: 10, clients: 1, heartbeatMs: 15_000, positions: [quiet] });
+    await dashboard.flush();
+    const art = dashboard.find("chart-art")[0]?.innerHTML ?? "";
+    expect(art).toContain('class="lv-tail"');
+    expect(dashboard.find("now-dot")[0]?.className).toBe("now-dot pos stale");
+    expect(dashboard.find("chart-readout")[0]?.textContent).toContain("No trades for 3m");
+    expect(dashboard.find("chart-readout")[0]?.className).toBe("chart-readout");
   });
 });

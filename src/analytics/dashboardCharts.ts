@@ -305,9 +305,10 @@ export const CHART_SCRIPT = String.raw`
     var max = 0;
     var total = 0;
     items.forEach(function (item) { max = Math.max(max, valueOf(item)); total += valueOf(item); });
+    if (!(max > 0)) { return el("p", { class: "chart-empty", text: "Nothing recorded in this window. If this lasts, check the websocket." }); }
     var f = chartFrame("bar-chart short", "Bar chart, peak " + fmtInt(max) + " " + unit);
-    var ticks = max > 0 ? niceTicks(0, max, 3) : { step: 1, ticks: [] };
-    var top = Math.max(ticks.ticks[ticks.ticks.length - 1] || 1, max > 0 ? max : 1);
+    var ticks = niceTicks(0, max, 3);
+    var top = Math.max(ticks.ticks[ticks.ticks.length - 1] || 1, max);
     var slot = CHART_SPAN / Math.max(1, items.length);
     var gap = Math.min(slot * 0.22, 8);
     function y(value) { return CHART_SPAN - (value / top) * (CHART_SPAN - 20); }
@@ -330,10 +331,9 @@ export const CHART_SCRIPT = String.raw`
     }
     var latest = items.length ? items[items.length - 1] : null;
     chartBind(f, {
-      size: function () { return max > 0 ? items.length : 0; },
+      size: function () { return items.length; },
       x: function (i) { return (i + 0.5) * slot; },
       idle: function () {
-        if (max === 0) { return { main: [roItem("Nothing recorded", "strong")], sub: "If this lasts, check the websocket and the Recorder view." }; }
         return { main: [roItem(fmtInt(latest ? valueOf(latest) : 0) + " " + unit, "strong"), roKey("Peak", fmtInt(max)), roKey("Total", fmtInt(total))], sub: "Latest" + (latest ? DOT + labelOf(latest) : "") };
       },
       show: function (i) {

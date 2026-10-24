@@ -224,7 +224,9 @@ function setup(options: Partial<LiveHubOptions> = {}): Setup {
 const servers: AnalyticsServer[] = [];
 const hubs: LiveHub[] = [];
 
-async function serve(hub: LiveHub | null, clock: VirtualClock, db: Db = {} as unknown as Db): Promise<number> {
+const emptyDb = { query: () => Promise.resolve({ rows: [] }) } as unknown as Db;
+
+async function serve(hub: LiveHub | null, clock: VirtualClock, db: Db = emptyDb): Promise<number> {
   const server = await startAnalyticsServer({
     db,
     port: 0,
@@ -641,6 +643,7 @@ describe("live position series", () => {
       position: { levels: Record<string, unknown>; migrated: boolean; peakMultiple: number; multiple: number };
     };
     expect(body.fills).toEqual([{ side: "buy", atMs: T0, price: entryPrice, reason: null, pctOfEntry: 100, sol: 0.075, source: "position" }]);
+    expect((body.position as unknown as { marketCapSol: number }).marketCapSol).toBeCloseTo(body.position.multiple * entryPrice * 1_000_000, 6);
     expect(body.fromMs).toBe(T0 - 60_000);
     expect(body.totalTrades).toBe(850);
     expect(body.points.length).toBeLessThanOrEqual(400);
@@ -662,6 +665,60 @@ describe("live position series", () => {
     const malformed = await fetch(`http://127.0.0.1:${port}/api/live/position/bad%20id!/series`, { headers: { Authorization: `Bearer ${TOKEN}` } });
     expect(malformed.status).toBe(400);
     expect((await fetch(`http://127.0.0.1:${port}/api/live/position/${POSITION_ID}/series`)).status).toBe(401);
+  });
+
+  it("still charts a position with the entry marker when the fills lookup fails", async () => {
+    const { hub, clock, open, apply } = setup();
+    apply(tradeAt(MINT, 2, T0 - 5_000, 990));
+    await clock.advanceTo(T0 + 10_000);
+    open.push(position());
+    const failing = { query: () => Promise.reject(new Error("database is down")) } as unknown as Db;
+    const port = await serve(hub, clock, failing);
+    const response = await fetch(`http://127.0.0.1:${port}/api/live/position/${POSITION_ID}/series`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { fills: Array<Record<string, unknown>> };
+    expect(body.fills).toEqual([{ side: "buy", atMs: T0, price: ENTRY_PRICE, reason: null, pctOfEntry: 100, sol: 0.075, source: "position" }]);
+  });
+
+  it("builds a small price line since entry for each open position it holds", async () => {
+    const { hub, clock, open, apply } = setup();
+    for (let index = 0; index < 300; index += 1) {
+      apply(tradeAt(MINT, 2 + Math.sin(index / 9) * 0.4, T0 - 60_000 + index * 500, 900 + index));
+    }
+    await clock.advanceTo(T0 + 100_000);
+    open.push(position());
+    const lines = hub.sparklines([POSITION_ID, "7-unknown"]);
+    expect([...lines.keys()]).toEqual([POSITION_ID]);
+    const points = lines.get(POSITION_ID) ?? [];
+    expect(points.length).toBeGreaterThan(2);
+    expect(points.length).toBeLessThanOrEqual(2 * 48 + 1);
+    expect(points[0]?.atMs).toBeGreaterThanOrEqual(T0);
+    expect(points.at(-1)?.atMs).toBe(T0 - 60_000 + 299 * 500);
+  });
+
+  it("values the wallet with the same open-position estimate as the trades view", async () => {
+    const { hub, clock, open, apply } = setup();
+    apply(tradeAt(MINT, 3, T0 + 5_000, 990));
+    await clock.advanceTo(T0 + 10_000);
+    open.push(position());
+    const server = await startAnalyticsServer({
+      db: emptyDb,
+      port: 0,
+      host: "127.0.0.1",
+      token: TOKEN,
+      clock,
+      cacheTtlMs: 0,
+      live: hub,
+      wallet: () => ({ mode: "paper", address: null, walletLamports: null, equityLamports: 5_100_000_000n, unrealizedLamports: 40_000_000n, dayPnlLamports: 100_000_000n, entriesPaused: false, killReason: null, haltedForDay: false })
+    });
+    servers.push(server);
+    const body = (await (await fetch(`http://127.0.0.1:${server.port}/api/wallet`, { headers: { Authorization: `Bearer ${TOKEN}` } })).json()) as Record<string, number>;
+    const openPnl = hub.openValue().pnlSol;
+    expect(openPnl).toBeGreaterThan(0);
+    expect(body.equitySol).toBeCloseTo(5.1 - 0.04 + openPnl, 9);
+    expect(body.totalSol).toBeCloseTo(5.1 - 0.04 + openPnl, 9);
+    expect(body.todayPnlSol).toBeCloseTo(0.1 - 0.04 + openPnl, 9);
+    expect(body.openValueSol).toBeCloseTo(hub.openValue().valueSol, 9);
   });
 
   it("computes exit levels from the position state and the exit config", () => {

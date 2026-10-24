@@ -11,7 +11,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
   var LIVE_RETRY_MAX_MS = 60000;
   var LIVE_LOOKBACK_MS = 60000;
   var LIVE_CARD_REDRAW_MS = 5000;
-  var LIVE_LEVEL_WIDEN = 1.35;
+  var LIVE_LEVEL_WIDEN = 1.4;
   var LIVE_MIN_RANGE = 0.08;
   var LIVE_STALE_MS = 20000;
   var LIVE_X_MAX = 975;
@@ -296,12 +296,12 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     var now = liveNowMs();
     var chips = [];
     if (!(isNum(entry) && entry > 0)) { return chips; }
-    if (isNum(levels.stopLossPrice)) { var stop = levels.stopLossPrice / entry; chips.push(["lv-stop", "Stop", fmtMult(stop) + " " + fmtSignedPct((stop - 1) * 100)]); }
+    if (isNum(levels.stopLossPrice)) { var stop = levels.stopLossPrice / entry; chips.push(["lv-stop", "Stop", fmtMult(stop) + " " + signedText(String(Math.round(Math.abs(stop - 1) * 100)), stop - 1) + "%"]); }
     if (isNum(levels.trailingStopPrice)) { chips.push(["lv-trail", "Trail", fmtMult(levels.trailingStopPrice / entry)]); }
     else if (isNum(levels.moonbagStopPrice)) { chips.push(["lv-trail", "Moonbag stop", fmtMult(levels.moonbagStopPrice / entry)]); }
-    if (levels.nextTakeProfit) { chips.push(["lv-tp", "Next TP", fmtMult(levels.nextTakeProfit.multiple) + " sells " + fmtPlainPct(levels.nextTakeProfit.sellPctOfInitial)]); }
-    if (isNum(levels.timeStopAtMs) && levels.timeStopAtMs > now) { chips.push(["timer", "Time stop", "in " + fmtDur((levels.timeStopAtMs - now) / 1000) + " if flat"]); }
-    if (isNum(levels.maxHoldAtMs)) { chips.push(["timer", "Max hold", levels.maxHoldAtMs > now ? "in " + fmtDur((levels.maxHoldAtMs - now) / 1000) : "reached"]); }
+    if (levels.nextTakeProfit) { chips.push(["lv-tp", "TP", fmtMult(levels.nextTakeProfit.multiple) + DOT + fmtPlainPct(levels.nextTakeProfit.sellPctOfInitial)]); }
+    if (isNum(levels.timeStopAtMs) && levels.timeStopAtMs > now) { chips.push(["timer", "Time stop", fmtDur((levels.timeStopAtMs - now) / 1000)]); }
+    if (isNum(levels.maxHoldAtMs)) { chips.push(["timer", "Max hold", levels.maxHoldAtMs > now ? fmtDur((levels.maxHoldAtMs - now) / 1000) : "reached"]); }
     return chips;
   }
   function liveCardParts() {
@@ -336,14 +336,14 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     var valueUsd = usdOf(value);
     var mcapUsd = usdOf(mcap);
     entry.stats.replaceChildren(
-      miniStat("PnL est. SOL", fmtSol(v.pnlEstimateSol), fmtSignedPct(v.pnlEstimatePct), signClass(v.pnlEstimateSol), signClass(v.pnlEstimatePct)),
+      miniStat("PnL SOL", fmtSol(v.pnlEstimateSol), fmtSignedPct(v.pnlEstimatePct), signClass(v.pnlEstimateSol), signClass(v.pnlEstimatePct)),
       miniStat("Value SOL", fmtSolAmount(value), isNum(valueUsd) ? fmtUsd(valueUsd) : "cost " + fmtSolAmount(v.costSol)),
       miniStat("Market cap", fmtMcap(mcap), isNum(mcapUsd) ? fmtCompactUsd(mcapUsd) : null),
-      miniStat("Held", held, "peak " + fmtMult(v.peakMultiple) + DOT + "sold " + fmtPlainPct(v.soldPct)));
+      miniStat("Held", held, "peak " + fmtMult(v.peakMultiple)));
     renderLiveChart(entry);
     entry.levels.replaceChildren();
     append(entry.levels, liveExitChips(v).map(function (chip) {
-      return el("li", { class: "exit-chip " + chip[0] }, el("span", { class: "chip-key", text: chip[1] }), el("span", { class: "chip-val", text: chip[2] }));
+      return el("li", { class: "exit-chip " + chip[0], title: chip[0] === "lv-tp" ? "Next take-profit: sells this share of the entry" : chip[1] === "Time stop" ? "Sells if the price is still flat by then" : null }, el("span", { class: "chip-key", text: chip[1] }), el("span", { class: "chip-val", text: chip[2] }));
     }));
     entry.badges.replaceChildren();
     append(entry.badges, badges);

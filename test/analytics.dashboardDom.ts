@@ -196,6 +196,7 @@ export interface DashboardOptions {
   hash?: string;
   search?: string;
   responder?: Responder;
+  health?: () => Promise<FakeResponse>;
   eventSource?: boolean;
 }
 
@@ -249,7 +250,8 @@ export interface DashboardHarness {
   streams: FakeEventSource[];
   location: { hash: string };
   navigate(hash: string): Promise<void>;
-  pointer(className: string, type: string, clientX: number): Promise<void>;
+  pointer(className: string, type: string, clientX: number, pointerType?: string): Promise<void>;
+  bodyClass(): string;
   change(label: string, value: string): Promise<void>;
   click(text: string): Promise<void>;
   find(className: string): FakeNode[];
@@ -341,7 +343,7 @@ export async function startDashboard(positions: Record<string, unknown>, options
   }
   const fetch = (path: string, init: { headers?: Record<string, string> }) => {
     if (path === "/healthz") {
-      return Promise.resolve(jsonResponse({ ok: true }));
+      return options.health ? options.health() : Promise.resolve(jsonResponse({ ok: true }));
     }
     paths.push(path);
     authHeaders.push(init.headers?.Authorization ?? "");
@@ -364,12 +366,12 @@ export async function startDashboard(positions: Record<string, unknown>, options
       }
       await settle();
     },
-    async pointer(className, type, clientX) {
+    async pointer(className, type, clientX, pointerType = "mouse") {
       const node = nodes().find((item) => item.className.split(" ").includes(className));
       if (!node) {
         throw new Error(`no node ${className}`);
       }
-      node.dispatch(type, { clientX, pointerType: "mouse" });
+      node.dispatch(type, { clientX, pointerType });
       await settle();
     },
     async change(label, value) {
@@ -394,6 +396,9 @@ export async function startDashboard(positions: Record<string, unknown>, options
     },
     bodyText() {
       return body.textContent;
+    },
+    bodyClass() {
+      return body.className;
     },
     flush() {
       return settle();

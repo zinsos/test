@@ -298,7 +298,7 @@ const CORE_SCRIPT = String.raw`
       el("div", { class: "ms-value " + (cls || ""), text: value }),
       sub ? el("div", { class: "ms-sub " + (subCls || ""), text: sub }) : null);
   }
-  function grid(items) { return el("div", { class: "grid" }, items); }
+  function grid(items, cls) { return el("div", { class: "grid" + (cls ? " " + cls : "") }, items); }
   function badge(text, tone) { return el("span", { class: "badge " + (tone || ""), text: text }); }
   function banner(tone, iconName) {
     var node = el("div", { class: "banner " + (tone || ""), role: tone === "bad" ? "alert" : "status" }, icon(iconName || "alert"));
@@ -323,9 +323,10 @@ const CORE_SCRIPT = String.raw`
       narrative && narrative.detail ? el("p", { class: "detail", text: narrative.detail }) : null,
       extras || null);
   }
-  function table(headers, rows, narrowHidden, cls) {
+  function table(headers, rows, narrowHidden, cls, leftCols) {
     var hidden = narrowHidden || {};
-    var head = el("tr", null, headers.map(function (text, index) { return el("th", { class: hidden[index] ? "hide-narrow" : null, scope: "col", text: text }); }));
+    var left = leftCols || {};
+    var head = el("tr", null, headers.map(function (text, index) { return el("th", { class: ((hidden[index] ? "hide-narrow " : "") + (left[index] ? "t-left" : "")).trim() || null, scope: "col", text: text }); }));
     return el("div", { class: "table-wrap" + (cls ? " " + cls : "") }, el("table", null, el("thead", null, head), el("tbody", null, rows)));
   }
   function cell(text, cls) { return el("td", { class: cls || null, text: text }); }
@@ -594,6 +595,7 @@ const SHELL_SCRIPT = String.raw`
     renderStatus();
     renderAlert();
     renderOffline();
+    syncRunBadge();
     var w = wallet.data;
     if (!w || !w.enabled) { dom.ticker.replaceChildren(); syncStickyTop(); return; }
     var today = isNum(w.todayPnlSol) ? w.todayPnlSol : null;
@@ -765,6 +767,7 @@ const SHELL_SCRIPT = String.raw`
     window.setInterval(periodicRefresh, REFRESH_MS);
     window.setInterval(tick1s, TICK_MS);
     refresh(false);
+    loadWallet(true);
   }
 `;
 
