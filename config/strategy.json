@@ -225,5 +225,8 @@
     "hotTargetSol": 5,
     "reserveSol": 0.1,
     "minSweepSol": 0.25
+  },
+  "lab": {
+    "livePaperVariants": []
   }
 }

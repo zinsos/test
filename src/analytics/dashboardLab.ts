@@ -2,6 +2,10 @@ export const LAB_VIEW_SCRIPT = String.raw`
   var LAB_VERDICTS = { edge: ["Edge", "good"], no_edge: ["No edge yet", "warn"], insufficient_data: ["Too few trades", ""] };
   var LAB_DIRECTIONS = { higher_riskier: "riskier when higher", lower_riskier: "riskier when lower", none: "no clear direction" };
   var LAB_TONES = { good: "good", warn: "warn", bad: "bad", neutral: "neutral" };
+  var LIVE_PAPER_STATUS = {
+    running: ["Running", "good"], closing: ["Closing old run", "warn"], stopped: ["Stopped", "bad"], open: ["Not running here", ""], ended: ["Ended", ""]
+  };
+  var LIVE_PAPER_CHANGES_SHOWN = 2;
 
   function labWindow(run) {
     if (!run || !isNum(run.dataFromMs) || !isNum(run.dataToMs)) { return "unknown"; }
@@ -127,15 +131,67 @@ export const LAB_VIEW_SCRIPT = String.raw`
     return card("Baseline over time", "The current strategy's expectancy in each lab run. A drifting number means the market changed, not the code.",
       table(["Run", "Trades", "Exp/trade", "95% range"], rows, { 3: true }));
   }
+  function openTradesRun(runId) {
+    state.tradesRun = String(runId);
+    savePrefs();
+    selectTab("trades");
+  }
+  function livePaperChanges(row) {
+    if (row.isMain) { return "the strategy in the service's strategy config"; }
+    if (!row.changes || !row.changes.length) { return "same settings as the main strategy"; }
+    var shown = row.changes.slice(0, LIVE_PAPER_CHANGES_SHOWN).map(function (change) {
+      var parts = change.setting.split(".");
+      return parts[parts.length - 1] + " " + change.main + " → " + change.lane;
+    });
+    var more = row.changes.length - shown.length + (row.moreChanges || 0);
+    return shown.join(DOT) + (more > 0 ? DOT + "+" + more + " more" : "");
+  }
+  function livePaperRange(row) {
+    return isNum(row.ciLowSol) && isNum(row.ciHighSol) ? fmtSol(row.ciLowSol) + " to " + fmtSol(row.ciHighSol) : DASH;
+  }
+  function livePaperVsMain(row) {
+    if (row.isMain) { return DASH; }
+    if (!isNum(row.vsMainSol)) { return DASH; }
+    return fmtSol(row.vsMainSol) + " (" + fmtInt(row.mainSameWindowTrades) + " main)";
+  }
+  function livePaperRow(row) {
+    var status = LIVE_PAPER_STATUS[row.status] || [readable(row.status), ""];
+    var since = row.endedAtMs ? "ended " + fmtTime(row.endedAtMs) : fmtTime(row.startedAtMs) + " (" + fmtAgo(row.startedAtMs) + ")";
+    var name = el("div", { class: "strategy-cell" },
+      el("button", { class: "link-btn", type: "button", text: row.isMain ? "Main strategy" : readable(row.strategy), onclick: function () { openTradesRun(row.runId); } }),
+      el("div", { class: "meta", text: "run #" + row.runId + DOT + livePaperChanges(row) }),
+      el("div", { class: "badges" }, badge(status[0], status[1])));
+    return el("tr", { class: row.isMain ? "main-row" : null }, el("td", null, name),
+      cell(fmtInt(row.trades)), cell(fmtPct(row.winRate, 0), "hide-narrow"),
+      cell(row.trades > 0 ? fmtSol(row.expectancySol) : DASH, signClass(row.expectancySol)),
+      cell(livePaperRange(row), "hide-narrow"),
+      cell(livePaperVsMain(row), signClass(row.vsMainSol)),
+      cell(fmtSol(row.totalPnlSol), signClass(row.totalPnlSol)),
+      cell(fmtInt(row.openPositions)),
+      cell(since, "hide-narrow"));
+  }
+  function livePaperCard(result) {
+    var rows = result && Array.isArray(result.rows) ? result.rows : [];
+    if (!rows.length) { return null; }
+    return card("Live paper strategies",
+      "Every strategy trades the same live feed at the same time, each with its own bankroll, risk limits and positions, so their numbers are directly comparable. Expectancy is SOL per trade after fees with its 95% range. vs main compares a strategy's expectancy with the main strategy's trades opened since that strategy started. Tap a name to open its trades.",
+      table(["Strategy", "Trades", "Win rate", "Exp/trade", "95% range", "vs main", "Total PnL", "Open", "Running since"], rows.map(livePaperRow), { 2: true, 4: true, 8: true }));
+  }
   function labView() {
-    return api("/api/lab").then(function (lab) {
+    var livePaper = api("/api/lab/live").catch(function (error) {
+      if (error && error.auth) { throw error; }
+      return null;
+    });
+    return Promise.all([api("/api/lab"), livePaper]).then(function (results) {
+      var lab = results[0];
+      var paperCard = livePaperCard(results[1]);
       if (!lab.available) {
-        return empty("Lab tables are missing", "Run the database migrations (npm run migrate, or restart the service) so the lab job can store its results.");
+        return [paperCard, empty("Lab tables are missing", "Run the database migrations (npm run migrate, or restart the service) so the lab job can store its results.")];
       }
       if (!lab.run) {
-        return empty("No lab run yet", "The lab replays the recorded launches through several strategy variants with the real trader, fills and fees, and retrains the scorer, so you can compare ideas in minutes instead of weeks of paper trading. The first results appear here after the lab job has run once.");
+        return [paperCard, empty("No lab run yet", "The lab replays the recorded launches through several strategy variants with the real trader, fills and fees, and retrains the scorer, so you can compare ideas in minutes instead of weeks of paper trading. The first results appear here after the lab job has run once.")];
       }
-      var out = [labRunCard(lab), labTakeawayCard(lab.takeaway), labLeaderboard(lab)];
+      var out = [paperCard, labRunCard(lab), labTakeawayCard(lab.takeaway), labLeaderboard(lab)];
       lab.scorer.forEach(function (entry) { out.push(labScorerCard(entry)); });
       if (!lab.scorer.length) { out.push(card("Scorer training", "This run did not retrain the scorer.")); }
       out.push(labHistoryCard(lab.history));

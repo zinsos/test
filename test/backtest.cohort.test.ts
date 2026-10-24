@@ -136,9 +136,19 @@ describe.skipIf(!hasTestDatabase)("cohort replay gives every lane the trades of 
     const config = baseConfig();
     config.scorer.hardBlocks.bundleShareAbove = 1;
     config.tracker.convergence.maxRiskScore = 100;
+    return { key: "other-blocks", config: parseStrategyConfig(config) };
+  })();
+  const otherScorer = (() => {
+    const config = baseConfig();
+    config.scorer.earlyBuyerCount = 6;
+    config.scorer.hardBlocks.devShareAbove = 1;
     return { key: "other-scorer", config: parseStrategyConfig(config) };
   })();
-  const lanes: CohortLane[] = [...variants, blocked].map((variant) => ({ key: variant.key, config: variant.config, label: `cohort:${variant.key}` }));
+  const lanes: CohortLane[] = [...variants, blocked, otherScorer].map((variant) => ({
+    key: variant.key,
+    config: variant.config,
+    label: `cohort:${variant.key}`
+  }));
   const standalone = new Map<string, BacktestResult>();
   let first: CohortBacktestResult;
   let second: CohortBacktestResult;
@@ -169,11 +179,12 @@ describe.skipIf(!hasTestDatabase)("cohort replay gives every lane the trades of 
     expect(fingerprints.size).toBeGreaterThanOrEqual(5);
   });
 
-  it("replays lanes that share the scorer and market settings in one isolated pass and the other scorer in its own", () => {
+  it("replays lanes that share the scorer features and market settings in one isolated pass, whatever their hard blocks, and the other scorer in its own", () => {
     const isolated = first.passes.filter((pass) => pass.isolated);
     expect(isolated).toHaveLength(1);
-    expect(isolated[0]?.lanes).toEqual(variants.map((variant) => variant.key));
-    expect(first.passes.some((pass) => !pass.isolated && pass.lanes.join() === blocked.key)).toBe(true);
+    expect(isolated[0]?.lanes).toEqual([...variants.map((variant) => variant.key), blocked.key]);
+    expect(first.passes.some((pass) => !pass.isolated && pass.lanes.join() === otherScorer.key)).toBe(true);
+    expect(standalone.get(blocked.key)?.summary.fingerprint).not.toBe(standalone.get("base")?.summary.fingerprint);
     for (const pass of first.passes) {
       expect(pass.events).toBe(standalone.get("base")?.summary.counts.events);
     }

@@ -44,7 +44,8 @@ import {
 } from "./positionQueries.js";
 import { latestScore, recentLaunches, recentSignals, trackedWallets } from "./activityQueries.js";
 import { loadLabOverview } from "./labQueries.js";
-import type { LiveHub, LiveStatus } from "./liveHub.js";
+import { isPaperLaneLabel, laneRunSettings, loadLivePaperStrategies } from "./laneQueries.js";
+import { STRATEGY_NAME_PATTERN, type LiveHub, type LiveStatus } from "./liveHub.js";
 import { recorderHealth } from "./recorderQueries.js";
 import { scoreCheckpoints, scorerCalibration } from "./scorerQueries.js";
 import {
@@ -301,10 +302,11 @@ async function positionsRoute(ctx: AnalyticsContext, request: ApiRequest): Promi
     throw new HttpError(404, "run_not_found", "no strategy run with this id and mode");
   }
   const dayResetUtcHour = ctx.settings.dayResetUtcHour;
+  const lane = run && isPaperLaneLabel(run.label) ? await laneRunSettings(ctx.db, run.id) : null;
   const snapshot = run
-    ? await loadPositionsSnapshot(ctx.db, run, { closedLimit, nowMs, fees: ctx.settings.sellFees, dayResetUtcHour })
+    ? await loadPositionsSnapshot(ctx.db, run, { closedLimit, nowMs, fees: lane?.sellFees ?? ctx.settings.sellFees, dayResetUtcHour })
     : emptyPositionsSnapshot(nowMs, dayResetUtcHour);
-  return { filter: { runId, mode }, ...snapshot, entryRules: ctx.settings.entryRules };
+  return { filter: { runId, mode }, ...snapshot, entryRules: lane?.entryRules ?? ctx.settings.entryRules };
 }
 
 async function walletsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
@@ -322,8 +324,22 @@ const LIVE_DISABLED: LiveStatus = {
   events: 0,
   lastEventAtMs: null,
   openPositions: 0,
-  heartbeatMs: 0
+  heartbeatMs: 0,
+  strategies: []
 };
+
+const ALL_STRATEGIES = "all";
+
+export function parseStrategyFilter(params: URLSearchParams): string | null {
+  const raw = params.get("strategy");
+  if (raw === null || raw === "" || raw === ALL_STRATEGIES) {
+    return null;
+  }
+  if (!STRATEGY_NAME_PATTERN.test(raw)) {
+    throw new HttpError(400, "invalid_strategy", "strategy must be all, main or a paper variant name");
+  }
+  return raw;
+}
 
 function liveStatusRoute(ctx: AnalyticsContext): Promise<unknown> {
   return Promise.resolve(ctx.live ? ctx.live.status() : LIVE_DISABLED);
@@ -355,18 +371,27 @@ function liveEventsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<un
   }
   const stream = request.params.get("stream");
   const after = parseInteger(request.params, "after", { min: 0 }) ?? 0;
-  return Promise.resolve(ctx.live.poll(stream !== null && STREAM_ID.test(stream) ? stream : null, after));
+  const strategy = parseStrategyFilter(request.params);
+  return Promise.resolve(ctx.live.poll(stream !== null && STREAM_ID.test(stream) ? stream : null, after, strategy));
 }
 
-function liveStreamRoute(ctx: AnalyticsContext, _request: ApiRequest, req: IncomingMessage, res: ServerResponse): void {
+function liveStreamRoute(ctx: AnalyticsContext, request: ApiRequest, req: IncomingMessage, res: ServerResponse): void {
   if (!ctx.live) {
     throw new HttpError(404, "live_unavailable", "this service has no live event stream; run the dashboard in the trading service");
   }
-  ctx.live.connect(req, res);
+  ctx.live.connect(req, res, parseStrategyFilter(request.params));
 }
 
 async function labRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
   return loadLabOverview(ctx.db, { historyLimit: parseInteger(request.params, "history", { min: 1, max: 200 }) ?? undefined });
+}
+
+async function labLiveRoute(ctx: AnalyticsContext): Promise<unknown> {
+  return loadLivePaperStrategies(ctx.db, {
+    summary: { minTrades: ctx.settings.minTrades, bootstrapIterations: ctx.settings.bootstrapIterations, seed: ctx.settings.seed },
+    tradeLimit: ctx.settings.tradeLimit,
+    strategies: ctx.live ? ctx.live.strategies() : null
+  });
 }
 
 function scorerDatasetRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStream {
@@ -407,6 +432,7 @@ const ROUTES: ReadonlyMap<string, ApiRoute> = new Map<string, ApiRoute>([
   ["recorder/health", { kind: "json", cacheable: true, handle: (ctx) => recorderRoute(ctx) }],
   ["wallets/tracked", { kind: "json", cacheable: true, handle: walletsRoute }],
   ["lab", { kind: "json", cacheable: true, handle: labRoute }],
+  ["lab/live", { kind: "json", cacheable: true, handle: (ctx) => labLiveRoute(ctx) }],
   ["live/status", { kind: "json", cacheable: false, handle: (ctx) => liveStatusRoute(ctx) }],
   ["live/stream", { kind: "stream", handle: liveStreamRoute }],
   ["live/events", { kind: "json", cacheable: false, handle: liveEventsRoute }],

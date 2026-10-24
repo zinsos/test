@@ -57,6 +57,14 @@ function minuteOf(atMs: number): number {
   return Math.floor(atMs / MINUTE_MS);
 }
 
+function detect(tracker: TrendingTracker, target: CopycatSubject | { info: CopycatSubject }, nowMs: number, needed: boolean): CopycatResult {
+  if (needed) {
+    return tracker.isCopycat(target, nowMs);
+  }
+  tracker.touch(target, nowMs);
+  return NO_COPYCAT;
+}
+
 function hasAllKeys(stored: StoredFeatures | null, keys: readonly string[]): boolean {
   return stored !== null && keys.every((key) => key in stored.features);
 }
@@ -183,7 +191,7 @@ export class CohortScoring {
     }
   }
 
-  copycatFor(lane: LaneScoring, target: CopycatSubject | { info: CopycatSubject }, nowMs: number): CopycatResult {
+  copycatFor(lane: LaneScoring, target: CopycatSubject | { info: CopycatSubject }, nowMs: number, needed = true): CopycatResult {
     const minute = minuteOf(nowMs);
     const shared = this.sharedTrending?.minute === minute ? this.sharedTrending : null;
     const scratch = this.scratchTrending?.minute === minute ? this.scratchTrending : null;
@@ -191,33 +199,33 @@ export class CohortScoring {
     if (record === null) {
       if (shared && shared.version === this.version) {
         lane.rememberTrending(shared);
-        return this.options.shared.isCopycat(target, nowMs);
+        return detect(this.options.shared, target, nowMs, needed);
       }
       if (scratch && scratch.version === this.version) {
         lane.rememberTrending(scratch);
-        return this.options.scratch.isCopycat(target, nowMs);
+        return detect(this.options.scratch, target, nowMs, needed);
       }
-      const result = this.recompute(target, nowMs, minute);
+      const result = this.recompute(target, nowMs, minute, needed);
       lane.rememberTrending(this.scratchTrending);
       return result;
     }
     if (shared && (record === shared || sameEntries(record.list, shared.list))) {
-      return this.options.shared.isCopycat(target, nowMs);
+      return detect(this.options.shared, target, nowMs, needed);
     }
     if (scratch && (record === scratch || sameEntries(record.list, scratch.list))) {
-      return this.options.scratch.isCopycat(target, nowMs);
+      return detect(this.options.scratch, target, nowMs, needed);
     }
     if (record.version === this.version) {
-      return this.recompute(target, nowMs, minute);
+      return this.recompute(target, nowMs, minute, needed);
     }
     lane.diverge("its copycat trending list for the minute was replaced before it was used again");
     return NO_COPYCAT;
   }
 
-  private recompute(target: CopycatSubject | { info: CopycatSubject }, nowMs: number, minute: number): CopycatResult {
+  private recompute(target: CopycatSubject | { info: CopycatSubject }, nowMs: number, minute: number, needed: boolean): CopycatResult {
     const scratch = this.options.scratch;
     scratch.invalidate();
-    const result = scratch.isCopycat(target, nowMs);
+    const result = detect(scratch, target, nowMs, needed);
     this.scratchTrending = { minute, version: this.version, list: scratch.trending(nowMs), checkpoint: false };
     return result;
   }
@@ -244,6 +252,10 @@ class LaneCopycat implements CopycatDetector {
 
   isCopycat(target: CopycatSubject | { info: CopycatSubject }, nowMs: number): CopycatResult {
     return this.cohort.copycatFor(this.lane, target, nowMs);
+  }
+
+  touch(target: CopycatSubject | { info: CopycatSubject }, nowMs: number): void {
+    this.cohort.copycatFor(this.lane, target, nowMs, false);
   }
 }
 

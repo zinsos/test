@@ -145,9 +145,16 @@ export class LaunchState {
   droppedTrades = 0;
   dataComplete = true;
   private buyOrder = 0;
+  private readonly initialMcap: bigint;
+  private readonly initialMcapValue: number;
 
   constructor(info: LaunchInfo) {
     this.info = info;
+    this.initialMcap = marketCapQuote(
+      { virtualTokenReserves: info.initialVirtualTokenReserves, virtualQuoteReserves: info.initialVirtualQuoteReserves },
+      info.tokenTotalSupply
+    );
+    this.initialMcapValue = Number(this.initialMcap);
     this.virtualTokenReserves = info.initialVirtualTokenReserves;
     this.virtualQuoteReserves = info.initialVirtualQuoteReserves;
     this.realTokenReserves = info.initialRealTokenReserves;
@@ -175,18 +182,11 @@ export class LaunchState {
   }
 
   initialMcapQuote(): bigint {
-    return marketCapQuote(
-      {
-        virtualTokenReserves: this.info.initialVirtualTokenReserves,
-        virtualQuoteReserves: this.info.initialVirtualQuoteReserves
-      },
-      this.info.tokenTotalSupply
-    );
+    return this.initialMcap;
   }
 
   multipleOfInitial(mcapQuote: bigint): number {
-    const initial = this.initialMcapQuote();
-    return initial > 0n ? Number(mcapQuote) / Number(initial) : 0;
+    return this.initialMcap > 0n ? Number(mcapQuote) / this.initialMcapValue : 0;
   }
 
   mcapMultiple(): number {

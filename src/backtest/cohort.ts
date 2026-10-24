@@ -3,12 +3,13 @@ import { Bus } from "../core/bus.js";
 import { VirtualClock, type Clock } from "../core/clock.js";
 import type { RiskStatus, ScoreProvider, TradingStore } from "../core/contracts.js";
 import { moduleLogger } from "../core/logger.js";
-import type { ClosedTrade, Position } from "../core/types.js";
+import type { ClosedTrade, LaunchScore, Position } from "../core/types.js";
 import { jsonSafe, withTransaction, type Db } from "../db/pool.js";
 import { PaperExecutor } from "../execution/paperExecutor.js";
 import { ExitEventWatcher } from "../exits/watcher.js";
 import { MarketState } from "../market/state.js";
 import { RiskManager } from "../risk/manager.js";
+import { softFlags } from "../scorer/features.js";
 import { createScorerModule, seedTrending, TrendingTracker, type ScorerModule } from "../scorer/index.js";
 import type { ScoringModel } from "../scorer/model.js";
 import { createTrackerModule, TrackedWalletRegistry, type TrackerModule } from "../tracker/index.js";
@@ -98,6 +99,7 @@ interface Lane {
   trader: Trader;
   closedTrades: ClosedTrade[];
   detachClosed: () => void;
+  rescore: ((score: LaunchScore) => LaunchScore) | null;
   running: boolean;
   stopped: boolean;
   closedAtEnd: number;
@@ -117,11 +119,17 @@ interface PassOutcome {
   pass: CohortPass;
 }
 
-export function cohortGroupKey(lane: Pick<CohortLane, "config" | "weightsFile">): string {
+export interface CohortGroupOptions {
+  splitHardBlocks?: boolean;
+}
+
+export function cohortGroupKey(lane: Pick<CohortLane, "config" | "weightsFile">, options: CohortGroupOptions = {}): string {
   const { convergence: _convergence, ...tracker } = lane.config.tracker;
+  const { hardBlocks, ...scorer } = lane.config.scorer;
   return JSON.stringify(
     jsonSafe({
-      scorer: lane.config.scorer,
+      scorer,
+      hardBlocks: options.splitHardBlocks ? hardBlocks : null,
       memory: lane.config.recorder.memory,
       quoteMints: lane.config.signals.quoteMints,
       tracker,
@@ -130,10 +138,10 @@ export function cohortGroupKey(lane: Pick<CohortLane, "config" | "weightsFile">)
   );
 }
 
-export function groupCohortLanes<T extends Pick<CohortLane, "config" | "weightsFile">>(lanes: readonly T[]): T[][] {
+export function groupCohortLanes<T extends Pick<CohortLane, "config" | "weightsFile">>(lanes: readonly T[], options: CohortGroupOptions = {}): T[][] {
   const groups = new Map<string, T[]>();
   for (const lane of lanes) {
-    const key = cohortGroupKey(lane);
+    const key = cohortGroupKey(lane, options);
     const group = groups.get(key);
     if (group) {
       group.push(lane);
@@ -142,6 +150,24 @@ export function groupCohortLanes<T extends Pick<CohortLane, "config" | "weightsF
     }
   }
   return [...groups.values()];
+}
+
+function sameHardBlocks(a: StrategyConfig, b: StrategyConfig): boolean {
+  return JSON.stringify(a.scorer.hardBlocks) === JSON.stringify(b.scorer.hardBlocks);
+}
+
+export function hardBlockRescorer(scorer: ScorerModule, hardBlocks: StrategyConfig["scorer"]["hardBlocks"]): (score: LaunchScore) => LaunchScore {
+  return (score) => {
+    const model = scorer.service.currentModel().score(score.features, hardBlocks);
+    return {
+      ...score,
+      score: model.score,
+      hardBlocked: model.hardBlocked,
+      flags: [...new Set([...model.flags, ...softFlags(score.features)])],
+      contributions: model.contributions,
+      weightsVersion: model.weightsVersion
+    };
+  };
 }
 
 function messageOf(error: unknown): string {
@@ -186,7 +212,7 @@ export async function runCohortBacktest(options: CohortBacktestOptions): Promise
   }
   const results = new Map<string, CohortLaneResult>();
   const passes: CohortPass[] = [];
-  for (const group of groupCohortLanes(options.lanes)) {
+  for (const group of groupCohortLanes(options.lanes, { splitHardBlocks: options.isolateLanes === false })) {
     const isolated = options.isolateLanes ?? group.length > 1;
     const outcome = await runPass(options, group, isolated);
     passes.push(outcome.pass);
@@ -344,7 +370,9 @@ async function runPass(options: CohortBacktestOptions, specs: readonly CohortLan
       ? new CohortScoring({ db, market, shared: sharedScorer.trending, scratch, stored: (mint, checkpointSec) => stored.get(mint, checkpointSec) })
       : null;
     for (const entry of opened) {
-      lanes.push(createLane(entry, { options, base, isolated, market, registry, scorer: sharedScorer, cohortScoring, stored, weights }));
+      const lane = createLane(entry, { options, base, isolated, market, registry, scorer: sharedScorer, cohortScoring, stored, weights });
+      lane.rescore = isolated && !sameHardBlocks(entry.spec.config, config) ? hardBlockRescorer(sharedScorer, entry.spec.config.scorer.hardBlocks) : null;
+      lanes.push(lane);
     }
     await sharedScorer.start();
     if (scratch) {
@@ -375,8 +403,9 @@ async function runPass(options: CohortBacktestOptions, specs: readonly CohortLan
         cohortScoring?.onCheckpoint(score);
         for (const lane of lanes) {
           if (lane.running && lane.market.sees(score.mint)) {
-            lane.scoring?.remember(score);
-            lane.bus.emit("score", score);
+            const own = lane.rescore ? lane.rescore(score) : score;
+            lane.scoring?.remember(own);
+            lane.bus.emit("score", own);
           }
         }
       })
@@ -574,6 +603,7 @@ function createLane(
     trader,
     closedTrades,
     detachClosed,
+    rescore: null,
     running: true,
     stopped: false,
     closedAtEnd: 0,

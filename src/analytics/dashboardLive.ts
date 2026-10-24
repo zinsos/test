@@ -1,5 +1,6 @@
 export const LIVE_VIEW_SCRIPT = String.raw`
   var LIVE_FILTERS = [["all", "Everything"], ["trades", "Trades only"], ["signals", "Signals"], ["scores", "Scores"]];
+  var LIVE_ALL_STRATEGIES = "all";
   var LIVE_FEED_MAX = 300;
   var LIVE_FEED_KEEP = { score: 300, rejected: 150, other: 300 };
   var LIVE_POINTS_KEEP = 600;
@@ -26,7 +27,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     source: null, status: "idle", detail: "", streamId: "", lastId: 0, feed: [], held: 0, paused: false,
     positions: {}, root: null, chip: null, list: null, cards: null, pauseButton: null, note: null, gapNote: null,
     retryMs: 0, retryAtMs: 0, lastMessageMs: 0, clockOffsetMs: 0, dropped: 0, tradingActive: false,
-    mode: "stream", helloSeen: false, openedAtMs: 0, polling: false, lastPollMs: 0
+    mode: "stream", helloSeen: false, openedAtMs: 0, polling: false, lastPollMs: 0, strategies: [], strategyBox: null
   };
 
   function liveParse(text) {
@@ -37,6 +38,46 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     return isNum(ms) ? new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : DASH;
   }
   function liveCoin(symbol, mint) { return symbol ? "$" + symbol : shortAddr(mint); }
+  function liveMulti() { return live.strategies.length > 1; }
+  function liveStrategyParam() {
+    var wanted = state.liveStrategy || LIVE_ALL_STRATEGIES;
+    if (wanted === LIVE_ALL_STRATEGIES) { return ""; }
+    var known = live.strategies.some(function (item) { return item.name === wanted; });
+    return known ? wanted : "";
+  }
+  function liveStrategyLabel(item) {
+    if (item.name === "main") { return "Main strategy"; }
+    return readable(item.name.split("@")[0]) + (item.draining ? " (closing run #" + item.runId + ")" : "");
+  }
+  function liveStrategyOptions() {
+    return [[LIVE_ALL_STRATEGIES, "All strategies"]].concat(live.strategies.map(function (item) { return [item.name, liveStrategyLabel(item)]; }));
+  }
+  function liveSetStrategies(list) {
+    if (!Array.isArray(list)) { return; }
+    var names = list.map(function (item) { return item.name; }).join(",");
+    var before = live.strategies.map(function (item) { return item.name; }).join(",");
+    live.strategies = list;
+    if (names !== before) { liveRenderStrategies(); }
+  }
+  function liveRenderStrategies() {
+    if (!live.strategyBox) { return; }
+    if (!liveMulti()) { live.strategyBox.replaceChildren(); return; }
+    var select = selectBox(liveStrategyOptions(), liveStrategyParam() || LIVE_ALL_STRATEGIES, liveChooseStrategy, "Strategy");
+    live.strategyBox.replaceChildren(field("Strategy", select));
+  }
+  function liveChooseStrategy(value) {
+    state.liveStrategy = value;
+    savePrefs();
+    live.streamId = "";
+    live.lastId = 0;
+    live.feed = [];
+    live.held = 0;
+    live.dropped = 0;
+    live.positions = {};
+    liveRenderCards();
+    liveRenderFeed();
+    if (live.mode === "poll") { livePollStart(); } else { liveOpen(); }
+  }
   function liveShows(event) {
     var filter = state.liveFilter || "all";
     if (filter === "trades") { return event.category === "trade" || event.category === "system"; }
@@ -63,9 +104,10 @@ export const LIVE_VIEW_SCRIPT = String.raw`
 
   function liveFeedItem(event) {
     var label = LIVE_KIND_LABELS[event.kind] || readable(event.kind);
-    var row = el("button", { class: "feed-row", type: "button", "aria-label": label + ": " + event.text },
+    var tag = liveMulti() && event.strategy ? readable(event.strategy) : "";
+    var row = el("button", { class: "feed-row", type: "button", "aria-label": label + (tag ? " (" + tag + ")" : "") + ": " + event.text },
       el("span", { class: "feed-time", text: liveTime(event.atMs) }),
-      el("span", { class: "feed-kind", text: label }),
+      el("span", { class: "feed-kind" }, label, tag ? el("span", { class: "feed-strategy", text: tag }) : null),
       el("span", { class: "feed-text", text: event.text }));
     if (event.mint) { row.addEventListener("click", function () { openScore(event.mint, event.symbol ? "$" + event.symbol : null); }); }
     return el("li", { class: "feed-item tone-" + (event.tone || "neutral") }, row);
@@ -87,6 +129,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     for (var i = live.feed.length - 1; i >= 0 && items.length < LIVE_FEED_MAX; i -= 1) {
       if (liveShows(live.feed[i])) { items.push(liveFeedItem(live.feed[i])); }
     }
+    live.list.className = "list feed" + (liveMulti() ? " multi" : "");
     live.list.replaceChildren.apply(live.list, items);
     liveNote();
   }
@@ -142,6 +185,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     }
     live.clockOffsetMs = isNum(hello.serverTimeMs) ? hello.serverTimeMs - Date.now() : 0;
     live.tradingActive = !!hello.tradingActive;
+    liveSetStrategies(hello.strategies);
     var keep = {};
     (hello.positions || []).forEach(function (view) { keep[view.id] = true; livePositionUpdate(view, hello.serverTimeMs); });
     Object.keys(live.positions).forEach(function (id) { if (!keep[id]) { liveRemoveCard(id); } });
@@ -236,6 +280,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     if (v.exiting) { badges.push(badge("Selling: " + readable(v.exiting), "warn")); }
     if (v.takeProfitLevelsHit > 0) { badges.push(badge(v.takeProfitLevelsHit === 1 ? "1 take-profit hit" : v.takeProfitLevelsHit + " take-profits hit", "good")); }
     if (v.migrated) { badges.push(badge("Migrated", "info")); }
+    if (liveMulti() && v.strategy) { badges.unshift(badge(v.strategy === "main" ? "Main strategy" : readable(v.strategy.split("@")[0]), "info")); }
     var held = isNum(v.openedAtMs) ? fmtDur((liveNowMs() - v.openedAtMs) / 1000) : DASH;
     entry.node.replaceChildren();
     append(entry.node, [
@@ -322,6 +367,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
   function liveSyncPositions(hello) {
     live.clockOffsetMs = isNum(hello.serverTimeMs) ? hello.serverTimeMs - Date.now() : live.clockOffsetMs;
     live.tradingActive = !!hello.tradingActive;
+    liveSetStrategies(hello.strategies);
     var keep = {};
     (hello.positions || []).forEach(function (view) { keep[view.id] = true; livePositionUpdate(view, hello.serverTimeMs); });
     Object.keys(live.positions).forEach(function (id) { if (!keep[id]) { liveRemoveCard(id); } });
@@ -330,9 +376,10 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     if (live.polling) { return; }
     live.polling = true;
     live.lastPollMs = Date.now();
-    api("/api/live/events", { stream: live.streamId || "", after: live.lastId || 0 }).then(function (result) {
+    var asked = liveStrategyParam();
+    api("/api/live/events", { stream: live.streamId || "", after: live.lastId || 0, strategy: asked }).then(function (result) {
       live.polling = false;
-      if (state.tab !== "live" || live.mode !== "poll" || !result) { return; }
+      if (state.tab !== "live" || live.mode !== "poll" || !result || asked !== liveStrategyParam()) { return; }
       if (result.hello) {
         if (result.hello.streamId !== live.streamId) { liveHello(result.hello); } else { liveSyncPositions(result.hello); }
       }
@@ -361,7 +408,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     live.helloSeen = false;
     live.openedAtMs = Date.now();
     if (typeof Source !== "function") { livePollStart(); return; }
-    var source = new Source("/api/live/stream" + queryString({ token: token() }));
+    var source = new Source("/api/live/stream" + queryString({ token: token(), strategy: liveStrategyParam() }));
     live.source = source;
     live.lastMessageMs = Date.now();
     liveSetStatus("connecting");
@@ -431,13 +478,16 @@ export const LIVE_VIEW_SCRIPT = String.raw`
     live.list = el("ul", { class: "list feed" });
     live.note = el("p", { class: "hint" });
     live.gapNote = el("p", { class: "hint" });
+    live.strategyBox = el("div", { class: "live-strategy" });
     var filter = selectBox(LIVE_FILTERS, state.liveFilter || "all", function (value) { state.liveFilter = value; savePrefs(); liveRenderFeed(); }, "Show");
     live.root = el("div", { class: "live" },
       el("div", { class: "live-bar" }, live.chip, field("Show", filter), live.pauseButton),
+      live.strategyBox,
       live.cards,
       card("What the bot is doing", "Newest first, as it happens. Tap a line for the coin's score.", live.note, live.gapNote, live.list));
     liveSetStatus(live.status, live.detail);
     liveUpdatePause();
+    liveRenderStrategies();
     liveRenderCards();
     liveRenderFeed();
     return live.root;
@@ -449,6 +499,7 @@ export const LIVE_VIEW_SCRIPT = String.raw`
         return empty("No live stream in this service", "The live feed comes from the service that runs the scorer, tracker and trader. Add dashboard to MODULES of that service (the VPS runs them together) to watch it here.");
       }
       live.tradingActive = !!status.tradingActive;
+      liveSetStrategies(status.strategies || []);
       var root = liveRoot();
       if (!live.source && !live.retryAtMs) { liveOpen(); }
       return root;

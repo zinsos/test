@@ -2,7 +2,7 @@ import { SOL_QUOTE } from "../core/constants.js";
 import type { FeatureVector, LaunchScore, Pubkey } from "../core/types.js";
 import { toBigInt, toNullableNumber, toNumber, type Db } from "../db/pool.js";
 import { PUBLISHED_RUN_SQL } from "../tracker/registry.js";
-import { LAB_RUN_IDS_SQL } from "./labQueries.js";
+import { SIDE_RUN_IDS_SQL } from "./labQueries.js";
 import { clampLimit } from "./tradeQueries.js";
 import { lamportsRatio } from "./units.js";
 
@@ -137,7 +137,7 @@ export async function recentSignals(
      FROM signals s
      LEFT JOIN launches l ON l.mint = s.mint
      WHERE ($2::bigint IS NULL OR s.run_id = $2)
-       AND ($2::bigint IS NOT NULL OR s.run_id IS NULL OR s.run_id NOT IN (${LAB_RUN_IDS_SQL}))
+       AND ($2::bigint IS NOT NULL OR s.run_id IS NULL OR s.run_id NOT IN (${SIDE_RUN_IDS_SQL}))
        AND ($3::text IS NULL OR s.type = $3)
      ORDER BY s.at DESC, s.id DESC
      LIMIT $1`,

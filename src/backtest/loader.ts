@@ -51,6 +51,14 @@ export const TRADE_SELECT = `t.launch_id, l.mint, l.pool AS launch_pool, t.block
   t.protocol_fee_bps, t.creator_fee_bps, t.lp_fee_bps, t.virtual_token, t.virtual_quote, t.real_token, t.real_quote, t.ix_name,
   t.received_at`;
 
+export const REPLAY_TRADE_SELECT = `t.launch_id::float8 AS launch_id, floor(extract(epoch FROM t.block_time) * 1000)::float8 AS block_ms,
+  t.slot::float8 AS slot, t.seq::float8 AS seq, t.signature, t.event_index, t.venue, t.wallet, t.is_buy, t.token_amount, t.quote_amount,
+  t.user_quote, t.protocol_fee, t.creator_fee, t.lp_fee, t.protocol_fee_bps, t.creator_fee_bps, t.lp_fee_bps, t.virtual_token,
+  t.virtual_quote, t.real_token, t.real_quote, t.ix_name, floor(extract(epoch FROM t.received_at) * 1000)::float8 AS received_ms,
+  CASE WHEN t.venue = 1 THEN l.pool END AS launch_pool`;
+
+const POOL_VENUE_CODE = 1;
+
 function msOf(value: unknown): number {
   return value instanceof Date ? value.getTime() : toNumber(value);
 }
@@ -74,7 +82,11 @@ export function observedAtMs(blockMs: number, receivedAt: unknown, observation: 
   if (!(receivedAt instanceof Date)) {
     return blockMs + observation.defaultDelayMs;
   }
-  return Math.min(Math.max(receivedAt.getTime(), blockMs), blockMs + observation.maxLagMs);
+  return clampObserved(blockMs, receivedAt.getTime(), observation);
+}
+
+function clampObserved(blockMs: number, receivedMs: number, observation: ObservationModel): number {
+  return Math.min(Math.max(receivedMs, blockMs), blockMs + observation.maxLagMs);
 }
 
 export function launchEventFromRow(row: DbRecord, observation: ObservationModel = DEFAULT_OBSERVATION): LaunchCreatedEvent {
@@ -126,6 +138,43 @@ export function tradeEventFromRow(row: DbRecord, observation: ObservationModel =
     venue,
     mint: text(row.mint),
     pool: venue === "pool" && typeof row.launch_pool === "string" ? row.launch_pool : null,
+    wallet: text(row.wallet),
+    isBuy: row.is_buy === true,
+    tokenAmount: toBigInt(row.token_amount),
+    quoteAmount: toBigInt(row.quote_amount),
+    userQuote: toBigInt(row.user_quote),
+    protocolFee: toBigInt(row.protocol_fee),
+    creatorFee: toBigInt(row.creator_fee),
+    lpFee: toBigInt(row.lp_fee),
+    protocolFeeBps: toNumber(row.protocol_fee_bps),
+    creatorFeeBps: toNumber(row.creator_fee_bps),
+    lpFeeBps: toNumber(row.lp_fee_bps),
+    virtualTokenReserves: toBigInt(row.virtual_token),
+    virtualQuoteReserves: toBigInt(row.virtual_quote),
+    realTokenReserves: toNullableBigInt(row.real_token),
+    realQuoteReserves: toNullableBigInt(row.real_quote),
+    timestampMs: atMs,
+    ixName: typeof row.ix_name === "string" ? row.ix_name : null
+  };
+}
+
+export function tradeEventFromReplayRow(row: DbRecord, mint: Pubkey, observation: ObservationModel = DEFAULT_OBSERVATION): TradeEvent {
+  const atMs = row.block_ms as number;
+  const receivedMs = row.received_ms;
+  const venueCode = row.venue as number;
+  const venue = VENUE_BY_CODE[venueCode] ?? "curve";
+  return {
+    kind: "trade",
+    tx: {
+      signature: text(row.signature),
+      slot: row.slot as number,
+      seq: row.seq as number,
+      eventIndex: row.event_index as number,
+      receivedAtMs: typeof receivedMs === "number" ? clampObserved(atMs, receivedMs, observation) : atMs + observation.defaultDelayMs
+    },
+    venue,
+    mint,
+    pool: venueCode === POOL_VENUE_CODE && typeof row.launch_pool === "string" ? row.launch_pool : null,
     wallet: text(row.wallet),
     isBuy: row.is_buy === true,
     tokenAmount: toBigInt(row.token_amount),
@@ -214,23 +263,37 @@ export function scheduleIncomplete(clock: Clock, market: MarketState, replay: Re
 }
 
 export function replayEventOf(event: ChainEvent, launchId: number): ReplayEvent {
-  const base = {
-    launchId,
-    event,
-    atMs: event.timestampMs,
-    visibleAtMs: Math.max(event.timestampMs, event.tx.receivedAtMs),
-    slot: event.tx.slot,
-    tiebreak: event.tx.signature
-  };
+  const atMs = event.timestampMs;
+  const visibleAtMs = Math.max(atMs, event.tx.receivedAtMs);
   switch (event.kind) {
     case "create":
-      return { ...base, phase: REPLAY_PHASE.create, seq: -1, eventIndex: -1 };
+      return { atMs, visibleAtMs, slot: event.tx.slot, phase: REPLAY_PHASE.create, seq: -1, eventIndex: -1, tiebreak: event.tx.signature, launchId, event };
     case "migrate":
-      return { ...base, phase: REPLAY_PHASE.migrate, seq: -1, eventIndex: -1 };
+      return { atMs, visibleAtMs, slot: event.tx.slot, phase: REPLAY_PHASE.migrate, seq: -1, eventIndex: -1, tiebreak: event.tx.signature, launchId, event };
     case "complete":
-      return { ...base, phase: REPLAY_PHASE.complete, seq: Number.MAX_SAFE_INTEGER, eventIndex: 0 };
+      return {
+        atMs,
+        visibleAtMs,
+        slot: event.tx.slot,
+        phase: REPLAY_PHASE.complete,
+        seq: Number.MAX_SAFE_INTEGER,
+        eventIndex: 0,
+        tiebreak: event.tx.signature,
+        launchId,
+        event
+      };
     default:
-      return { ...base, phase: REPLAY_PHASE.trade, seq: event.tx.seq, eventIndex: event.tx.eventIndex };
+      return {
+        atMs,
+        visibleAtMs,
+        slot: event.tx.slot,
+        phase: REPLAY_PHASE.trade,
+        seq: event.tx.seq,
+        eventIndex: event.tx.eventIndex,
+        tiebreak: event.tx.signature,
+        launchId,
+        event
+      };
   }
 }
 
@@ -276,6 +339,7 @@ export class BacktestLoader {
   private readonly observation: ObservationModel;
   private lifecycle: ReplayEvent[] = [];
   private lifecycleIndex = 0;
+  private readonly mints = new Map<number, Pubkey>();
   private readonly counts: LoaderCounts = { launches: 0, incompleteLaunches: 0, trades: 0, lifecycle: 0, windows: 0 };
 
   constructor(options: BacktestLoaderOptions) {
@@ -346,11 +410,12 @@ export class BacktestLoader {
 
   private async loadWindow(startMs: number): Promise<ReplayEvent[]> {
     const endMs = Math.min(startMs + this.windowMs, this.toMs);
-    const [launches, trades] = await Promise.all([this.loadLaunches(startMs, endMs), this.loadTrades(startMs, endMs)]);
+    const [launches, rows] = await Promise.all([this.loadLaunches(startMs, endMs), this.loadTradeRows(startMs, endMs)]);
+    const trades = await this.tradeEvents(rows);
     this.counts.launches += launches.length;
     this.counts.incompleteLaunches += launches.filter((launch) => launch.incompleteFromMs !== null).length;
     this.counts.trades += trades.length;
-    return [...launches, ...trades];
+    return launches.concat(trades);
   }
 
   private async loadLaunches(startMs: number, endMs: number): Promise<ReplayEvent[]> {
@@ -360,15 +425,19 @@ export class BacktestLoader {
         ORDER BY created_at, create_slot, id`,
       [new Date(startMs), new Date(endMs)]
     );
-    return result.rows.map((row) => ({
-      ...replayEventOf(launchEventFromRow(row, this.observation), toNumber(row.id)),
-      incompleteFromMs: this.includeIncomplete ? null : incompleteFromOf(row)
-    }));
+    return result.rows.map((row) => {
+      const launchId = toNumber(row.id);
+      const event = launchEventFromRow(row, this.observation);
+      this.mints.set(launchId, event.mint);
+      const replay = replayEventOf(event, launchId);
+      replay.incompleteFromMs = this.includeIncomplete ? null : incompleteFromOf(row);
+      return replay;
+    });
   }
 
-  private async loadTrades(startMs: number, endMs: number): Promise<ReplayEvent[]> {
+  private async loadTradeRows(startMs: number, endMs: number): Promise<DbRecord[]> {
     const result = await this.db.query<DbRecord>(
-      `SELECT ${TRADE_SELECT}
+      `SELECT ${REPLAY_TRADE_SELECT}
          FROM trades t JOIN launches l ON l.id = t.launch_id
         WHERE t.block_time >= $1 AND t.block_time < $2
           AND l.created_at >= $3 AND l.created_at < $4
@@ -376,7 +445,37 @@ export class BacktestLoader {
         ORDER BY t.block_time, t.slot, t.seq, t.event_index, t.signature`,
       [new Date(startMs), new Date(endMs), new Date(this.fromMs), new Date(this.toMs), this.tradeQuoteMints]
     );
-    return result.rows.map((row) => replayEventOf(tradeEventFromRow(row, this.observation), toNumber(row.launch_id)));
+    return result.rows;
+  }
+
+  private async tradeEvents(rows: readonly DbRecord[]): Promise<ReplayEvent[]> {
+    await this.resolveMints(rows);
+    const events: ReplayEvent[] = new Array<ReplayEvent>(rows.length);
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index] as DbRecord;
+      const launchId = row.launch_id as number;
+      events[index] = replayEventOf(tradeEventFromReplayRow(row, this.mints.get(launchId) ?? "", this.observation), launchId);
+    }
+    return events;
+  }
+
+  private async resolveMints(rows: readonly DbRecord[]): Promise<void> {
+    const missing = new Set<number>();
+    for (const row of rows) {
+      const launchId = row.launch_id as number;
+      if (!this.mints.has(launchId)) {
+        missing.add(launchId);
+      }
+    }
+    if (missing.size === 0) {
+      return;
+    }
+    const result = await this.db.query<{ id: unknown; mint: unknown }>("SELECT id, mint FROM launches WHERE id = ANY($1::bigint[])", [
+      [...missing].map(String)
+    ]);
+    for (const row of result.rows) {
+      this.mints.set(toNumber(row.id), text(row.mint));
+    }
   }
 }
 

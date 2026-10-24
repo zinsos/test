@@ -8,7 +8,7 @@ import { attemptCosts } from "../execution/model.js";
 import { isUsablePrice, valueAtPrice } from "../exits/math.js";
 import { dayKeyFor } from "../risk/day.js";
 import { isMintAddress } from "./http.js";
-import { LAB_LABEL_PREFIX } from "./labQueries.js";
+import { sideRunLabelSql } from "./labQueries.js";
 import { clampLimit } from "./tradeQueries.js";
 import { lamportsToSol } from "./units.js";
 
@@ -341,7 +341,7 @@ export async function selectPositionsRun(
      FROM strategy_runs r
      WHERE ($1::bigint IS NULL OR r.id = $1)
        AND ($2::text IS NULL OR r.mode = $2)
-       AND ($1::bigint IS NOT NULL OR r.label IS NULL OR r.label NOT LIKE '${LAB_LABEL_PREFIX}%')
+       AND ($1::bigint IS NOT NULL OR r.label IS NULL OR NOT ${sideRunLabelSql("r")})
      ORDER BY (r.mode = ANY($3::text[])) DESC,
               (r.ended_at IS NULL) DESC,
               EXISTS (SELECT 1 FROM positions p WHERE p.run_id = r.id) DESC,

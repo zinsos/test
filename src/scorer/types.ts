@@ -61,6 +61,7 @@ export interface CopycatResult {
 
 export interface CopycatDetector {
   isCopycat(target: CopycatSubject | { info: CopycatSubject }, nowMs: number): CopycatResult;
+  touch?(target: CopycatSubject | { info: CopycatSubject }, nowMs: number): void;
 }
 
 export interface StoredFeatures {

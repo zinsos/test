@@ -4,6 +4,7 @@ import { toNumber, type Db } from "../db/pool.js";
 import { positionFromRow, POSITION_COLUMNS } from "./rows.js";
 
 export const KILL_RESET_REQUEST_KIND = "kill_reset_requested";
+export const PAPER_LANE_LABEL_PREFIX = "paper:";
 
 export interface OpenRun {
   runId: number;
@@ -33,9 +34,9 @@ export function canonicalJson(value: unknown): string {
 export async function findOpenRun(db: Db, mode: TradingMode): Promise<OpenRun | null> {
   const result = await db.query<{ id: unknown; label: string | null; started_at: Date; config: unknown }>(
     `SELECT id, label, started_at, config FROM strategy_runs
-      WHERE mode = $1 AND ended_at IS NULL
+      WHERE mode = $1 AND ended_at IS NULL AND (label IS NULL OR label NOT LIKE $2)
       ORDER BY id DESC LIMIT 1`,
-    [mode]
+    [mode, `${PAPER_LANE_LABEL_PREFIX}%`]
   );
   const row = result.rows[0];
   return row ? { runId: toNumber(row.id), label: row.label, startedAtMs: row.started_at.getTime(), config: row.config } : null;

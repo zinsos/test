@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cohortGroupKey, groupCohortLanes } from "../src/backtest/cohort.js";
+import { cohortGroupKey, groupCohortLanes, hardBlockRescorer } from "../src/backtest/cohort.js";
 import { ScopedClock } from "../src/backtest/laneClock.js";
 import { evictableAt, evictionWindowOf, LaneMarket } from "../src/backtest/laneMarket.js";
 import { CohortScoring, DevCacheEmulator, devHistoryKey, devHistoryWallets, LaneScoring } from "../src/backtest/laneScoring.js";
@@ -12,6 +12,7 @@ import type { Db } from "../src/db/pool.js";
 import { MarketState } from "../src/market/state.js";
 import { TrendingTracker } from "../src/scorer/copycat.js";
 import { DevHistoryService } from "../src/scorer/devHistory.js";
+import { softFlags } from "../src/scorer/features.js";
 import { ScoringModel } from "../src/scorer/model.js";
 import type { CopycatSubject, StoredFeatures } from "../src/scorer/types.js";
 
@@ -81,6 +82,7 @@ describe("cohort copycat trending emulation", () => {
       let atMs = T0;
       let compared = 0;
       let adhoc = 0;
+      let touched = 0;
       for (let step = 0; step < 3_000; step += 1) {
         atMs += Math.floor(rng() * 4_000);
         const roll = rng();
@@ -100,12 +102,19 @@ describe("cohort copycat trending emulation", () => {
           cohort.eventApplied();
         } else if (roll < 0.92) {
           const subject = pick(rng, created);
-          const result = shared.isCopycat(subject, atMs);
-          cohort.onCheckpoint(scoreAt(subject.mint, atMs));
           const consumed = copycatStored(subject.mint) === null;
+          const result = consumed ? shared.isCopycat(subject, atMs) : null;
+          if (!consumed) {
+            shared.touch(subject, atMs);
+          }
+          cohort.onCheckpoint(scoreAt(subject.mint, atMs));
           references.forEach((reference, index) => {
+            if (!consumed) {
+              reference.touch(subject, atMs);
+              return;
+            }
             const expected = reference.isCopycat(subject, atMs);
-            if (consumed && lanes[index]?.active()) {
+            if (lanes[index]?.active()) {
               expect(result).toEqual(expected);
               compared += 1;
             }
@@ -116,18 +125,25 @@ describe("cohort copycat trending emulation", () => {
           const reference = references[index];
           const subject = pick(rng, created);
           if (lane && reference) {
-            const result = cohort.copycatFor(lane, subject, atMs);
-            const expected = reference.isCopycat(subject, atMs);
-            if (lane.active()) {
-              expect(result).toEqual(expected);
-              compared += 1;
-              adhoc += 1;
+            if (rng() < 0.4) {
+              cohort.copycatFor(lane, subject, atMs, false);
+              reference.touch(subject, atMs);
+              touched += 1;
+            } else {
+              const result = cohort.copycatFor(lane, subject, atMs);
+              const expected = reference.isCopycat(subject, atMs);
+              if (lane.active()) {
+                expect(result).toEqual(expected);
+                compared += 1;
+                adhoc += 1;
+              }
             }
           }
         }
       }
       expect(compared).toBeGreaterThan(300);
       expect(adhoc).toBeGreaterThan(30);
+      expect(touched).toBeGreaterThan(20);
       expect(lanes.filter((lane) => lane.active()).length).toBeGreaterThanOrEqual(1);
     });
   }
@@ -287,19 +303,53 @@ describe("cohort lane helpers", () => {
     const signals = structuredClone(base);
     signals.tracker.convergence.minWallets = 2;
     signals.signals.scoreMomentum.maxRiskScore = 10;
+    const blocks = structuredClone(base);
+    blocks.scorer.hardBlocks.devShareAbove = 1;
     const scorer = structuredClone(base);
-    scorer.scorer.hardBlocks.devShareAbove = 1;
+    scorer.scorer.earlyBuyerCount = 5;
     const memory = structuredClone(base);
     memory.recorder.memory.evictInactiveMinutes = 5;
-    const groups = groupCohortLanes([
+    const lanes = [
       { key: "base", config: base },
       { key: "exits", config: exits },
+      { key: "blocks", config: blocks },
       { key: "scorer", config: scorer },
       { key: "signals", config: signals },
       { key: "memory", config: memory },
       { key: "weights", config: base, weightsFile: "weights.json" }
-    ]);
-    expect(groups.map((group) => group.map((lane) => lane.key))).toEqual([["base", "exits", "signals"], ["scorer"], ["memory"], ["weights"]]);
+    ];
+    const groups = groupCohortLanes(lanes);
+    expect(groups.map((group) => group.map((lane) => lane.key))).toEqual([["base", "exits", "blocks", "signals"], ["scorer"], ["memory"], ["weights"]]);
     expect(cohortGroupKey({ config: base })).toBe(cohortGroupKey({ config: signals }));
+    expect(cohortGroupKey({ config: base })).toBe(cohortGroupKey({ config: blocks }));
+    const split = groupCohortLanes(lanes, { splitHardBlocks: true });
+    expect(split.map((group) => group.map((lane) => lane.key))).toEqual([["base", "exits", "signals"], ["blocks"], ["scorer"], ["memory"], ["weights"]]);
+  });
+
+  it("rescores a shared checkpoint score with a lane's own hard blocks exactly like that lane's scorer", () => {
+    const config = defaultStrategyConfig().scorer;
+    const loose = structuredClone(config);
+    loose.hardBlocks.bundleShareAbove = 1;
+    loose.hardBlocks.devShareAbove = 1;
+    const model = ScoringModel.default();
+    const scorer = { service: { currentModel: () => model } } as unknown as Parameters<typeof hardBlockRescorer>[0];
+    const rescore = hardBlockRescorer(scorer, loose.hardBlocks);
+    const features = { dev_share: 0.4, bundle_share: 0.5, creation_slot_buyers: 4, wash_ratio: 0.5, top10_share: 0.7, socials_count: 0 };
+    const strict = model.score(features, config.hardBlocks);
+    const shared: LaunchScore = {
+      ...scoreAt("MintR", T0),
+      score: strict.score,
+      hardBlocked: strict.hardBlocked,
+      flags: [...new Set([...strict.flags, ...softFlags(features)])],
+      features,
+      contributions: strict.contributions,
+      weightsVersion: strict.weightsVersion
+    };
+    expect(shared.hardBlocked).toBe(true);
+    const own = model.score(features, loose.hardBlocks);
+    expect(rescore(shared)).toEqual({ ...shared, hardBlocked: own.hardBlocked, flags: [...new Set([...own.flags, ...softFlags(features)])] });
+    expect(rescore(shared).hardBlocked).toBe(false);
+    expect(rescore(shared).flags).not.toContain("hard_bundle_share");
+    expect(rescore(shared).flags).toContain("bundled");
   });
 });

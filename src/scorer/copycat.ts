@@ -169,6 +169,10 @@ export class TrendingTracker implements CopycatDetector {
     this.cachedMinute = Number.NaN;
   }
 
+  touch(_target: CopycatSubject | { info: CopycatSubject }, nowMs: number): void {
+    this.trending(nowMs);
+  }
+
   isCopycat(target: CopycatSubject | { info: CopycatSubject }, nowMs: number): CopycatResult {
     const subject = "info" in target ? target.info : target;
     const ticker = normalizeText(subject.symbol);

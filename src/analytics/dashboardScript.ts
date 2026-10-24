@@ -40,6 +40,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     lean_cut: ["Leaning −", "warn"], insufficient: ["Too few", ""]
   };
   var TONE_LABELS = { good: "Looks good", warn: "Not proven", bad: "Problem", neutral: "Waiting for data" };
+  var LANE_PREFIX = "paper:";
 
   var state = loadPrefs();
   var meta = { runs: [], modes: [] };
@@ -61,7 +62,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     } catch (e) { return; }
   }
   function loadPrefs() {
-    var prefs = { v: "", tab: "trades", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "", liveFilter: "all" };
+    var prefs = { v: "", tab: "trades", mode: "auto", runId: "", period: "all", checkpoint: "", quote: "", tradesRun: "", liveFilter: "all", liveStrategy: "all" };
     var raw = storageGet(PREFS_KEY);
     if (raw) {
       try {
@@ -675,11 +676,18 @@ export const DASHBOARD_SCRIPT = String.raw`
   }
   function modeWord(mode) { return mode === "live" ? "Live" : mode === "paper" ? "Paper" : readable(mode); }
   function sinceRead(data, ms) { return isNum(ms) ? fmtDur((data.readAtMs - ms) / 1000) + " ago" : DASH; }
+  function laneOf(label) { return label && label.indexOf(LANE_PREFIX) === 0 ? label.slice(LANE_PREFIX.length) : ""; }
+  function runTitle(run) {
+    var lane = laneOf(run.label);
+    if (lane) { return "#" + run.id + " paper strategy " + readable(lane); }
+    return "#" + run.id + " " + run.mode + (run.label ? " " + run.label : run.mode === "paper" ? " main" : "");
+  }
   function tradesRunOptions() {
     var runs = meta.runs.filter(function (run) { return run.mode === "paper" || run.mode === "live"; });
     if (runs.length < 2) { return null; }
-    return [["", "Latest run (auto)"]].concat(runs.map(function (run) {
-      return [String(run.id), "#" + run.id + " " + run.mode + (run.label ? " " + run.label : "") + (run.endedAtMs ? " (ended)" : "")];
+    var ordered = runs.filter(function (run) { return !laneOf(run.label); }).concat(runs.filter(function (run) { return !!laneOf(run.label); }));
+    return [["", "Latest run (auto)"]].concat(ordered.map(function (run) {
+      return [String(run.id), runTitle(run) + (run.endedAtMs ? " (ended)" : "")];
     }));
   }
   function tradesRunParam() {
@@ -709,7 +717,7 @@ export const DASHBOARD_SCRIPT = String.raw`
     var run = data.run;
     var figure = isNum(data.equityEstimateSol) ? fmtSol(data.equityEstimateSol, false) : null;
     return el("section", { class: "card hero " + riskTone(data) },
-      el("div", { class: "row" }, el("h2", { text: modeWord(run.mode) + " run #" + run.id + (run.label ? DOT + run.label : "") }), riskBadge(data)),
+      el("div", { class: "row" }, el("h2", { text: laneOf(run.label) ? "Paper strategy " + readable(laneOf(run.label)) + DOT + "run #" + run.id : modeWord(run.mode) + " run #" + run.id + (run.label ? DOT + run.label : "") }), riskBadge(data)),
       figure ? el("div", { class: "figure", text: figure }) : null,
       figure ? el("div", { class: "figure-unit", text: "SOL equity, open positions at their estimated exit value" }) : el("p", { class: "detail", text: "No bankroll saved for this run yet. It appears with the first trade, or within a minute while positions are open." }),
       b && b.killed ? el("p", { class: "detail", text: "Kill switch: " + (b.killReason || "tripped") + ". New entries stay blocked until it is reset from the CLI." }) : null,
@@ -810,7 +818,10 @@ export const DASHBOARD_SCRIPT = String.raw`
     if (!a.byType.length) { return null; }
     var pairs = a.byType.map(function (item) { return [readable(item.type), fmtInt(item.total) + " seen" + DOT + fmtInt(item.acted) + " traded"]; });
     a.skipReasons.forEach(function (item) { pairs.push(["skipped: " + readable(item.reason), fmtInt(item.count)]); });
-    return card("Entry signals, last " + a.windowHours + "h", "Every signal this run received, and why the rest were not traded.", kv(pairs));
+    var hint = laneOf(data.run && data.run.label)
+      ? "Signals this strategy traded, and the ones its trader skipped. Signals its entry filter rejected are not stored for extra strategies, to keep the database small."
+      : "Every signal this run received, and why the rest were not traded.";
+    return card("Entry signals, last " + a.windowHours + "h", hint, kv(pairs));
   }
   function tradesView() {
     return api("/api/positions", { runId: tradesRunParam() }).then(function (data) {

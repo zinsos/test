@@ -276,14 +276,16 @@ describe.skipIf(!hasTestDatabase)("lab end to end on a recorded synthetic market
     expect(notes.variants.baseline?.runtimeMs).toBeGreaterThan(0);
   });
 
-  it("replays variants that share the scorer settings together and each exactly like its own backtest", async () => {
-    const together = variants.filter((variant) => variant.name !== "trade-blocked-event-exits").map((variant) => variant.name);
-    expect(first.passes.map((pass) => pass.variants)).toEqual([["baseline", ...together], ["trade-blocked-event-exits"]]);
-    expect(first.passes.map((pass) => pass.isolated)).toEqual([true, false]);
-    expect(first.variants.map((variant) => variant.pass)).toEqual(first.variants.map((variant) => (variant.name === "trade-blocked-event-exits" ? 2 : 1)));
+  it("replays variants that share the scorer features together, whatever their hard blocks, and each exactly like its own backtest", async () => {
+    const together = variants.map((variant) => variant.name);
+    expect(together).toContain("trade-blocked-event-exits");
+    expect(first.passes.map((pass) => pass.variants)).toEqual([["baseline", ...together]]);
+    expect(first.passes.map((pass) => pass.isolated)).toEqual([true]);
+    expect(first.variants.map((variant) => variant.pass)).toEqual(first.variants.map(() => 1));
     const notes = (await labRuns())[1]?.notes as { passes: Array<{ variants: string[] }>; variants: Record<string, { pass: number }> };
-    expect(notes.passes.map((pass) => pass.variants.length)).toEqual([together.length + 1, 1]);
+    expect(notes.passes.map((pass) => pass.variants.length)).toEqual([together.length + 1]);
     expect(notes.variants["fast-exits"]?.pass).toBe(1);
+    expect(notes.variants["trade-blocked-event-exits"]?.pass).toBe(1);
     for (const name of ["baseline", "fast-exits", "trade-blocked-event-exits"]) {
       const overrides = variants.find((variant) => variant.name === name)?.overrides ?? {};
       const config = applyOverrides(labBaseline(base), overrides);

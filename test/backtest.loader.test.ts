@@ -1,13 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   BacktestLoader,
+  LAUNCH_SELECT,
   REPLAY_PHASE,
+  TRADE_SELECT,
   compareReplayEvents,
   completeEventFromRow,
   DEFAULT_OBSERVATION,
   hydrateLaunch,
   launchEventFromRow,
   migrateEventFromRow,
+  incompleteFromOf,
+  lifecycleEventsOf,
   observedAtMs,
   replayEventOf,
   tradeEventFromRow,
@@ -279,5 +283,59 @@ describe.skipIf(!hasTestDatabase)("replay loader on Postgres", () => {
     expect(market.mintForPool("PoolA")).toBe("LoaderA");
     expect(await hydrateLaunch(database.db, market, "Missing")).toBe(false);
     expect(await hydrateLaunch(database.db, market, "LoaderA")).toBe(true);
+  });
+
+  it("streams exactly the events the row converters build from full rows, for microsecond, missing and early receive times and pool trades", async () => {
+    const odd = await seedLaunch(database.db, { mint: "LoaderOdd", dev: "DevO", createdAtMs: T + 200_000, slot: 3_000, trades: convergenceTrades(["l", "m"]) });
+    await database.db.query(
+      `UPDATE trades SET block_time = block_time + interval '123457 microseconds', received_at = received_at + interval '999 microseconds'
+        WHERE launch_id = $1 AND seq % 3 = 0`,
+      [odd]
+    );
+    await database.db.query("UPDATE trades SET received_at = NULL WHERE launch_id = $1 AND seq % 3 = 1", [odd]);
+    await database.db.query("UPDATE trades SET received_at = block_time - interval '2 seconds' WHERE launch_id = $1 AND seq % 5 = 2", [odd]);
+    await database.db.query("UPDATE trades SET received_at = block_time + interval '45 seconds' WHERE launch_id = $1 AND seq % 7 = 3", [odd]);
+    await database.db.query("UPDATE trades SET venue = 1 WHERE launch_id = $1 AND seq % 4 = 0", [odd]);
+    await database.db.query("UPDATE launches SET pool = 'PoolOdd' WHERE id = $1", [odd]);
+    await database.db.query(
+      `INSERT INTO trades (launch_id, block_time, slot, seq, signature, event_index, venue, wallet, is_buy, token_amount, quote_amount, user_quote,
+         virtual_token, virtual_quote, real_token, real_quote, received_at)
+       VALUES ($1, $2, 2990, 999999, 'earlyTrade', 0, 0, 'EarlyWallet', TRUE, 5, 6, 7, 1000, 2000, NULL, NULL, $3)`,
+      [odd, new Date(T + 170_000), new Date(T + 170_400)]
+    );
+    const fromMs = T;
+    const toMs = T + 600_000;
+    const launchRows = await database.db.query<Record<string, unknown>>(`SELECT ${LAUNCH_SELECT} FROM launches WHERE created_at >= $1 AND created_at < $2`, [
+      new Date(fromMs),
+      new Date(toMs)
+    ]);
+    const tradeRows = await database.db.query<Record<string, unknown>>(
+      `SELECT ${TRADE_SELECT} FROM trades t JOIN launches l ON l.id = t.launch_id
+        WHERE t.block_time >= $1 AND t.block_time < $2 AND l.created_at >= $1 AND l.created_at < $2 AND l.quote_mint = 'SOL'`,
+      [new Date(fromMs), new Date(toMs)]
+    );
+    const expected: ReplayEvent[] = [];
+    for (const row of launchRows.rows) {
+      expected.push({ ...replayEventOf(launchEventFromRow(row), Number(row.id)), incompleteFromMs: incompleteFromOf(row) });
+      if (row.quote_mint === "SOL") {
+        expected.push(...lifecycleEventsOf(row).filter((event) => event.atMs >= fromMs && event.atMs < toMs));
+      }
+    }
+    for (const row of tradeRows.rows) {
+      expected.push(replayEventOf(tradeEventFromRow(row), Number(row.launch_id)));
+    }
+    expected.sort(compareReplayEvents);
+    const loader = new BacktestLoader({ db: database.db, fromMs, toMs, tradeQuoteMints: ["SOL"], windowMs: 45_000 });
+    await loader.prepare();
+    const streamed: ReplayEvent[] = [];
+    for await (const window of loader.windows()) {
+      streamed.push(...window);
+    }
+    const normalize = (event: ReplayEvent): ReplayEvent => (event.event.kind === "create" ? event : { ...event, incompleteFromMs: undefined });
+    expect(streamed.map(normalize)).toEqual(expected.map(normalize));
+    const oddTrades = streamed.filter((event) => event.event.kind === "trade" && event.event.mint === "LoaderOdd");
+    expect(oddTrades.some((event) => event.event.kind === "trade" && event.event.pool === "PoolOdd")).toBe(true);
+    expect(oddTrades.some((event) => event.atMs % 1000 === 123)).toBe(true);
+    expect(oddTrades.some((event) => event.event.tx.signature === "earlyTrade")).toBe(true);
   });
 });

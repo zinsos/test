@@ -32,6 +32,13 @@ function strictFlag<T extends boolean | undefined>(fallback: T) {
     });
 }
 
+export function parseNameList(value: string): string[] {
+  return value
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+}
+
 const ModuleName = z.enum(["recorder", "scorer", "tracker", "trader", "dashboard"]);
 export type ModuleName = z.infer<typeof ModuleName>;
 
@@ -47,14 +54,13 @@ const EnvSchema = z.object({
   MODULES: z
     .string()
     .default("recorder,scorer,dashboard")
-    .transform((value) =>
-      value
-        .split(",")
-        .map((part) => part.trim())
-        .filter((part) => part.length > 0)
-    )
+    .transform(parseNameList)
     .pipe(z.array(ModuleName)),
   TRADING_MODE: z.enum(["paper", "live"]).default("paper"),
+  PAPER_VARIANTS: z
+    .string()
+    .optional()
+    .transform((value) => (value === undefined ? undefined : parseNameList(value))),
   LIVE_DRY_RUN: strictFlag(true),
   STRATEGY_CONFIG: z.string().default("config/strategy.json"),
   HOT_WALLET_SECRET_KEY: z.string().optional(),

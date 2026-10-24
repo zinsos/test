@@ -23,6 +23,7 @@ export interface LiveEventDraft {
 
 export interface LiveEvent extends LiveEventDraft {
   id: number;
+  strategy: string | null;
 }
 
 export interface LiveThresholds {

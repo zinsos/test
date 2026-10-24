@@ -106,9 +106,12 @@ export {
   DEFAULT_LIVE_MAX_CLIENTS,
   DEFAULT_UPDATE_THROTTLE_MS,
   LiveHub,
+  MAIN_STRATEGY,
   type LiveHello,
   type LiveHubOptions,
-  type LiveStatus
+  type LiveStatus,
+  type LiveStrategy,
+  type LiveStrategyInfo
 } from "./liveHub.js";
 export { thresholdsOf, type LiveEvent, type LiveKind, type LiveThresholds } from "./liveEvents.js";
 export { exitLevels, livePositionView, positionSeries, type ExitLevels, type LivePositionView, type PositionSeries } from "./liveSeries.js";

@@ -44,6 +44,7 @@ export {
 export { fillRow, positionFromRow, positionRow, signalRow, POSITION_COLUMNS, FILL_COLUMNS, SIGNAL_COLUMNS } from "./rows.js";
 export {
   KILL_RESET_REQUEST_KIND,
+  PAPER_LANE_LABEL_PREFIX,
   canonicalJson,
   countOpenPositions,
   findOpenRun,

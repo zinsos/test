@@ -232,6 +232,15 @@ export const SweeperConfigSchema = z.object({
   minSweepSol: z.number().positive().default(0.25)
 });
 
+const VARIANT_NAME = /^[a-z0-9][a-z0-9_-]{0,47}$/;
+
+export const LabConfigSchema = z.object({
+  livePaperVariants: z
+    .array(z.string().trim().regex(VARIANT_NAME, "use the name of a variant in config/lab-variants.json"))
+    .default([])
+    .refine((names) => new Set(names).size === names.length, "list each variant once")
+});
+
 export const StrategyConfigSchema = z.object({
   recorder: RecorderConfigSchema.prefault({}),
   scorer: ScorerConfigSchema.prefault({}),
@@ -240,7 +249,8 @@ export const StrategyConfigSchema = z.object({
   execution: ExecutionConfigSchema.prefault({}),
   exits: ExitConfigSchema.prefault({}),
   risk: RiskConfigSchema.prefault({}),
-  sweeper: SweeperConfigSchema.prefault({})
+  sweeper: SweeperConfigSchema.prefault({}),
+  lab: LabConfigSchema.prefault({})
 });
 
 export type RecorderConfig = z.infer<typeof RecorderConfigSchema>;
@@ -251,7 +261,16 @@ export type ExecutionConfig = z.infer<typeof ExecutionConfigSchema>;
 export type ExitConfig = z.infer<typeof ExitConfigSchema>;
 export type RiskConfig = z.infer<typeof RiskConfigSchema>;
 export type SweeperConfig = z.infer<typeof SweeperConfigSchema>;
+export type LabConfig = z.infer<typeof LabConfigSchema>;
 export type StrategyConfig = z.infer<typeof StrategyConfigSchema>;
+
+export type RunConfig = Omit<StrategyConfig, "lab">;
+
+export function tradingRunConfig(config: StrategyConfig): RunConfig {
+  const copy: Partial<StrategyConfig> = { ...config };
+  delete copy.lab;
+  return copy as RunConfig;
+}
 
 export function parseStrategyConfig(raw: unknown): StrategyConfig {
   const parsed = StrategyConfigSchema.safeParse(raw ?? {});

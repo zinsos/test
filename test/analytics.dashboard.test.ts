@@ -208,7 +208,7 @@ describe("dashboard html", () => {
     expect(csp).toContain(`style-src ${hashOf(style ?? "")}`);
     expect(csp).toContain("default-src 'none'");
     expect(csp).toContain("connect-src 'self'");
-    expect(DASHBOARD_SCRIPT).toContain('new Source("/api/live/stream" + queryString({ token: token() }))');
+    expect(DASHBOARD_SCRIPT).toContain('new Source("/api/live/stream" + queryString({ token: token(), strategy: liveStrategyParam() }))');
     expect(csp).not.toContain("unsafe-inline");
     expect(html).not.toMatch(/\sstyle=/);
   });

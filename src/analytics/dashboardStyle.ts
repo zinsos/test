@@ -255,6 +255,11 @@ const LIVE_RULES = `
 .feed-time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .feed-kind { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); }
 .feed-text { grid-column: 1 / -1; font-size: 14px; overflow-wrap: anywhere; min-width: 0; }
+.feed-strategy {
+  display: block; font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--accent-ink); overflow-wrap: anywhere;
+}
+.live-strategy { margin: 0 0 12px; }
+.live-strategy:empty { display: none; }
 .tone-good { border-left-color: var(--good); }
 .tone-good .feed-kind { color: var(--good-ink); }
 .tone-bad { border-left-color: var(--bad); }
@@ -268,6 +273,10 @@ const LIVE_RULES = `
 .lab-name { font-size: 16px; overflow-wrap: anywhere; min-width: 0; }
 .big-num .unit { font-size: 12px; font-weight: 500; color: var(--ink-2); }
 .lab-variant.baseline { background: var(--accent-wash); margin: 0 -16px; padding: 12px 16px; }
+tr.main-row td { background: var(--accent-wash); }
+.strategy-cell { min-width: 140px; }
+.strategy-cell .link-btn { min-height: 32px; white-space: normal; text-align: left; }
+.strategy-cell .meta { margin: 2px 0 6px; }
 .link-btn {
   border: none; background: none; padding: 0; min-height: 44px; color: var(--accent-ink); font-weight: 600; font-size: 14px;
   cursor: pointer; flex: 0 0 auto; white-space: nowrap;
@@ -281,6 +290,7 @@ const LIVE_RULES = `
   .live-bar { grid-template-columns: auto minmax(0, 1fr) auto; }
   .live-chip { grid-column: auto; align-self: center; }
   .feed-row { grid-template-columns: 76px 70px minmax(0, 1fr); }
+  .feed.multi .feed-row { grid-template-columns: 76px 128px minmax(0, 1fr); }
   .feed-text { grid-column: auto; }
 }
 @media (prefers-reduced-motion: reduce) {

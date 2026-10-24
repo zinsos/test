@@ -1,4 +1,4 @@
-import { entryRulesOf, latestSkipReason, LiveHub, sellFeeDefaultsOf, startAnalyticsServer, thresholdsOf } from "../analytics/index.js";
+import { entryRulesOf, latestSkipReason, LiveHub, sellFeeDefaultsOf, startAnalyticsServer, thresholdsOf, type LiveStrategy } from "../analytics/index.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
 import type { StrategyConfig } from "../config/strategy.js";
@@ -18,6 +18,8 @@ import { createTrackerModule, TrackedWalletRegistry, type TrackerModule } from "
 import type { Trader } from "../trader/trader.js";
 import { createMarket, createRpc, openDatabase } from "./context.js";
 import { startHealthServer } from "./health.js";
+import { paperLaneSpecsFor, type PaperLaneSpec } from "./paperLaneSpecs.js";
+import { PaperLanes, type PaperLane } from "./paperLanes.js";
 import { Repeater } from "./repeater.js";
 import {
   createSignalObserver,
@@ -85,6 +87,7 @@ export interface LiveApp {
   readonly trader: Trader | null;
   readonly risk: RiskManager | null;
   readonly runId: number | null;
+  readonly paperLanes: PaperLanes | null;
   readonly httpPort: number;
   readonly done: Promise<string>;
   stats(): Record<string, unknown>;
@@ -101,6 +104,7 @@ const SHUTDOWN_ORDER = [
   "repeater",
   "sweeper",
   "trader",
+  "paper-lanes",
   "tracker",
   "registry",
   "scorer",
@@ -126,6 +130,63 @@ function lamportsToSol(value: bigint): number {
   return Math.round((Number(value) / 1e9) * 10_000) / 10_000;
 }
 
+function laneStrategy(db: Db, lane: PaperLane): LiveStrategy {
+  return {
+    name: lane.strategy,
+    bus: lane.bus,
+    config: { exits: lane.config.exits, execution: lane.config.execution },
+    thresholds: thresholdsOf(lane.config),
+    runId: lane.runId,
+    label: lane.label,
+    draining: lane.kind === "draining",
+    positions: () => lane.trader.openPositions(),
+    tradingActive: () => lane.trader.isRunning(),
+    skipReason: (signal) => latestSkipReason(db, lane.runId, signal.mint, signal.atMs - SKIP_REASON_LOOKBACK_MS)
+  };
+}
+
+interface LaneOpenOptions {
+  db: Db;
+  bus: Bus;
+  market: MarketState;
+  clock: Clock;
+  config: StrategyConfig;
+  specs: readonly PaperLaneSpec[];
+  tracker: TrackerModule;
+  scorer: ScorerModule;
+  liveHub: LiveHub | null;
+  killResetPollMs?: number;
+}
+
+async function openPaperLanes(options: LaneOpenOptions): Promise<PaperLanes | null> {
+  const detachers = new Map<PaperLane, () => void>();
+  try {
+    const lanes = await PaperLanes.open({
+      db: options.db,
+      bus: options.bus,
+      market: options.market,
+      clock: options.clock,
+      tracked: options.tracker.registry,
+      scores: options.scorer.service,
+      base: options.config,
+      specs: options.specs,
+      killResetPollMs: options.killResetPollMs,
+      onLaneFinished: (lane) => {
+        detachers.get(lane)?.();
+        detachers.delete(lane);
+      }
+    });
+    if (options.liveHub) {
+      for (const lane of lanes.lanes()) {
+        detachers.set(lane, options.liveHub.addStrategy(laneStrategy(options.db, lane)));
+      }
+    }
+    return lanes;
+  } catch (error) {
+    log.error({ err: error }, "paper strategy lanes failed to start; the main paper trader continues without them");
+    return null;
+  }
+}
 async function shutdown(stoppables: readonly Stoppable[], reason: string, db: Db | null): Promise<void> {
   log.info({ reason }, "shutting down");
   const ordered = [...stoppables].sort((a, b) => SHUTDOWN_ORDER.indexOf(a.name) - SHUTDOWN_ORDER.indexOf(b.name));
@@ -225,6 +286,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
     if (tokenProblem) {
       log.warn({ problem: tokenProblem }, "DASHBOARD_ALLOW_OPEN is on: the dashboard API is served without a strong token");
     }
+    const laneSpecs = await paperLaneSpecsFor(env, config, modules);
     await waitForDatabase(db, {
       clock,
       abort: () => stopping !== null || (options.abort?.() ?? false),
@@ -246,6 +308,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       log.info("this service reads wallet intel stored by the recorder/scorer service and makes no wallet-intel RPC calls");
     }
     let tradingParts: TradingParts | null = null;
+    let paperLanes: PaperLanes | null = null;
     let observer: SignalObserver | null = null;
     const onRejected = (signal: Signal, reason: string): void => {
       if (tradingParts) {
@@ -270,6 +333,18 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
         recorder: recorder ? pick(recorder.stats().recorder, ["launchesInserted", "tradesRecorded", "tradesDropped", "tradesBuffered", "pendingLaunches"]) : null,
         signals: tracker ? tracker.signals.stats() : null,
         trader: tradingParts ? tradingParts.trader.stats() : null,
+        paperLanes: paperLanes
+          ? paperLanes.status().map((lane) => ({
+              strategy: lane.strategy,
+              runId: lane.runId,
+              state: lane.state,
+              open: lane.open,
+              closed: lane.closed,
+              equitySol: lane.equitySol,
+              killed: lane.killed,
+              errors: lane.errors
+            }))
+          : null,
         risk: status
           ? {
               runId: status.runId,
@@ -293,6 +368,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           thresholds: thresholdsOf(config),
           positions: () => tradingParts?.trader.openPositions() ?? [],
           tradingActive: () => tradingParts?.trader.isRunning() ?? false,
+          runId: () => tradingParts?.runId ?? null,
           skipReason: (signal) =>
             tradingParts ? latestSkipReason(db, tradingParts.runId, signal.mint, signal.atMs - SKIP_REASON_LOOKBACK_MS) : Promise.resolve(null)
         })
@@ -352,6 +428,24 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       tradingParts = await createTrading(env, config, { db, bus, market, clock, tracker });
       const store = tradingParts.store;
       stoppables.push({ name: "trading-store", stop: () => store.stop() });
+      if (tradingParts.mode === "paper" && scorer) {
+        paperLanes = await openPaperLanes({
+          db,
+          bus,
+          market,
+          clock,
+          config,
+          specs: laneSpecs,
+          tracker,
+          scorer,
+          liveHub,
+          killResetPollMs: options.killResetPollMs
+        });
+        const lanes = paperLanes;
+        if (lanes) {
+          stoppables.push({ name: "paper-lanes", stop: () => lanes.stop() });
+        }
+      }
     } else if (tracker) {
       const activeObserver = createSignalObserver(db, bus, market);
       observer = activeObserver;
@@ -389,7 +483,10 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
         name: "evict",
         intervalMs: options.evictIntervalMs ?? MINUTE_MS,
         run: () => {
-          const evicted = market.evict(clock.nowMs(), (launch) => tradingParts?.trader.hasOpenPosition(launch.mint) ?? false);
+          const evicted = market.evict(
+            clock.nowMs(),
+            (launch) => (tradingParts?.trader.hasOpenPosition(launch.mint) ?? false) || (paperLanes?.hasOpenPosition(launch.mint) ?? false)
+          );
           if (evicted.length > 0) {
             log.debug({ evicted: evicted.length, remaining: market.size }, "market launches evicted");
           }
@@ -408,6 +505,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       const parts = tradingParts;
       parts.trader.start();
       stoppables.push({ name: "trader", stop: () => parts.trader.stop() });
+      paperLanes?.start();
       repeaters.push(...(await tradingRepeaters(parts, db, clock, options)));
       const sweeper = createSweeper(env, config, parts, db, clock);
       if (sweeper) {
@@ -423,7 +521,16 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       await ingest.start();
       stoppables.push({ name: "ingest", stop: () => ingest.stop() });
     }
-    log.info({ modules: [...modules], port: http.port, tradingMode: tradingParts?.mode ?? null, runId: tradingParts?.runId ?? null }, "snypra-edge started");
+    log.info(
+      {
+        modules: [...modules],
+        port: http.port,
+        tradingMode: tradingParts?.mode ?? null,
+        runId: tradingParts?.runId ?? null,
+        paperLanes: paperLanes?.status().map((lane) => `${lane.strategy}#${lane.runId}`) ?? []
+      },
+      "snypra-edge started"
+    );
     return {
       modules,
       bus,
@@ -435,6 +542,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       trader: tradingParts?.trader ?? null,
       risk: tradingParts?.risk ?? null,
       runId: tradingParts?.runId ?? null,
+      paperLanes,
       httpPort: http.port,
       done,
       stats: statsSnapshot,

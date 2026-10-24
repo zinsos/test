@@ -38,6 +38,10 @@ const RESERVATION_MATCH_MS = 5_000;
 const POSITION_SYNC_MS = 15_000;
 const REFERENCE_TTL_MS = 10 * 60_000;
 const MAX_TRACKED_MINTS = 256;
+const SHARED_RING = "shared";
+
+export const MAIN_STRATEGY = "main";
+export const STRATEGY_NAME_PATTERN = /^[a-z0-9][a-z0-9_@-]{0,63}$/;
 
 export type RingClass = "trade" | "rejected" | "score";
 
@@ -52,6 +56,27 @@ const SSE_HEADERS: Readonly<Record<string, string>> = {
   Connection: "keep-alive"
 };
 
+export interface LiveStrategy {
+  name: string;
+  bus: Bus;
+  config: LiveConfig;
+  thresholds: LiveThresholds;
+  runId?: number | null;
+  label?: string | null;
+  draining?: boolean;
+  positions?: (() => readonly Position[]) | null;
+  tradingActive?: (() => boolean) | null;
+  skipReason?: ((signal: Signal) => Promise<string | null>) | null;
+}
+
+export interface LiveStrategyInfo {
+  name: string;
+  runId: number | null;
+  label: string | null;
+  draining: boolean;
+  tradingActive: boolean;
+}
+
 export interface LiveHubOptions {
   bus: Bus;
   clock: Clock;
@@ -61,6 +86,7 @@ export interface LiveHubOptions {
   positions?: (() => readonly Position[]) | null;
   tradingActive?: (() => boolean) | null;
   skipReason?: ((signal: Signal) => Promise<string | null>) | null;
+  runId?: (() => number | null) | null;
   maxClients?: number;
   heartbeatMs?: number;
   updateThrottleMs?: number;
@@ -80,7 +106,10 @@ export interface LiveStatus {
   lastEventAtMs: number | null;
   openPositions: number;
   heartbeatMs: number;
+  strategies: LiveStrategyInfo[];
 }
+
+export type LiveStrategyPositionView = LivePositionView & { strategy: string };
 
 export interface LiveHello {
   streamId: string;
@@ -89,7 +118,9 @@ export interface LiveHello {
   clients: number;
   tradingActive: boolean;
   heartbeatMs: number;
-  positions: LivePositionView[];
+  strategy: string | null;
+  strategies: LiveStrategyInfo[];
+  positions: LiveStrategyPositionView[];
 }
 
 export interface LivePoll {
@@ -100,15 +131,30 @@ export interface LivePoll {
 
 interface StreamClient {
   res: ServerResponse;
+  strategy: string | null;
   congested: boolean;
   congestedSinceMs: number;
   dropped: number;
 }
 
+interface StrategySource {
+  info: LiveStrategy;
+  references: Map<Pubkey, ReferencePrice>;
+  reservations: Map<Pubkey, number>;
+  skips: Map<Pubkey, number>;
+  unsubscribers: Array<() => void>;
+}
+
 interface PositionWatch {
   position: Position;
+  source: StrategySource;
   lastSentMs: number;
   timer: TimerHandle | null;
+}
+
+interface OpenEntry {
+  position: Position;
+  source: StrategySource;
 }
 
 interface ReferencePrice {
@@ -127,6 +173,14 @@ export function ringClassOf(kind: LiveKind): RingClass {
   return kind === "rejected" ? "rejected" : "trade";
 }
 
+export function strategyMatches(filter: string | null, strategy: string | null): boolean {
+  return filter === null || strategy === null || strategy === filter;
+}
+
+function ringKey(ringClass: RingClass, strategy: string | null): string {
+  return ringClass === "score" || strategy === null ? `${ringClass}:${SHARED_RING}` : `${ringClass}:${strategy}`;
+}
+
 function headerText(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) {
     return value[0] ?? null;
@@ -139,11 +193,9 @@ export class LiveHub {
   private readonly bus: Bus;
   private readonly clock: Clock;
   private readonly market: LiveMarket;
-  private readonly config: LiveConfig;
-  private readonly thresholds: LiveThresholds;
-  private readonly positions: (() => readonly Position[]) | null;
-  private readonly tradingActive: (() => boolean) | null;
-  private readonly skipReason: ((signal: Signal) => Promise<string | null>) | null;
+  private readonly main: StrategySource;
+  private readonly sources = new Map<string, StrategySource>();
+  private readonly mainRunId: (() => number | null) | null;
   private readonly maxClients: number;
   private readonly heartbeatMs: number;
   private readonly updateThrottleMs: number;
@@ -151,12 +203,9 @@ export class LiveHub {
   private readonly maxBufferedBytes: number;
   private readonly skipLookupDelayMs: number;
   private readonly maxCongestedMs: number;
-  private readonly rings: Record<RingClass, LiveEvent[]> = { trade: [], rejected: [], score: [] };
+  private readonly rings = new Map<string, LiveEvent[]>();
   private readonly watches = new Map<string, PositionWatch>();
   private readonly byMint = new Map<Pubkey, Set<string>>();
-  private readonly references = new Map<Pubkey, ReferencePrice>();
-  private readonly reservations = new Map<Pubkey, number>();
-  private readonly skips = new Map<Pubkey, number>();
   private readonly clients = new Set<StreamClient>();
   private readonly lookups = new Set<TimerHandle>();
   private unsubscribers: Array<() => void> = [];
@@ -170,11 +219,17 @@ export class LiveHub {
     this.bus = options.bus;
     this.clock = options.clock;
     this.market = options.market;
-    this.config = options.config;
-    this.thresholds = options.thresholds;
-    this.positions = options.positions ?? null;
-    this.tradingActive = options.tradingActive ?? null;
-    this.skipReason = options.skipReason ?? null;
+    this.mainRunId = options.runId ?? null;
+    this.main = this.sourceOf({
+      name: MAIN_STRATEGY,
+      bus: options.bus,
+      config: options.config,
+      thresholds: options.thresholds,
+      positions: options.positions ?? null,
+      tradingActive: options.tradingActive ?? null,
+      skipReason: options.skipReason ?? null
+    });
+    this.sources.set(MAIN_STRATEGY, this.main);
     this.maxClients = options.maxClients ?? DEFAULT_LIVE_MAX_CLIENTS;
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.updateThrottleMs = options.updateThrottleMs ?? DEFAULT_UPDATE_THROTTLE_MS;
@@ -190,17 +245,32 @@ export class LiveHub {
       return;
     }
     const bus = this.bus;
-    this.unsubscribers = [
-      bus.on("score", (score) => this.onScore(score)),
-      bus.on("signal", (signal) => this.onSignal(signal)),
-      bus.on("signalRejected", (rejection) => this.onRejected(rejection)),
-      bus.on("signalSkipped", (skip) => this.onSkipped(skip)),
-      bus.on("risk", (event) => this.onRisk(event)),
-      bus.on("positionOpened", (position) => this.onOpened(position)),
-      bus.on("positionUpdated", (position) => this.onUpdated(position)),
-      bus.on("positionClosed", (position) => this.onClosed(position)),
-      bus.on("chain", (event) => this.onChain(event))
-    ];
+    this.unsubscribers = [bus.on("score", (score) => this.onScore(score)), bus.on("chain", (event) => this.onChain(event))];
+    for (const source of this.sources.values()) {
+      this.subscribe(source);
+    }
+  }
+
+  addStrategy(strategy: LiveStrategy): () => void {
+    if (!STRATEGY_NAME_PATTERN.test(strategy.name) || this.sources.has(strategy.name)) {
+      throw new Error(`live strategy name ${JSON.stringify(strategy.name)} is invalid or already in use`);
+    }
+    const source = this.sourceOf(strategy);
+    this.sources.set(strategy.name, source);
+    if (this.unsubscribers.length > 0) {
+      this.subscribe(source);
+    }
+    return () => this.removeStrategy(source);
+  }
+
+  strategies(): LiveStrategyInfo[] {
+    return [...this.sources.values()].map((source) => ({
+      name: source.info.name,
+      runId: source === this.main ? this.safeMainRunId() : (source.info.runId ?? null),
+      label: source.info.label ?? null,
+      draining: source.info.draining === true,
+      tradingActive: this.isSourceTrading(source)
+    }));
   }
 
   stop(): void {
@@ -209,6 +279,9 @@ export class LiveHub {
       unsubscribe();
     }
     this.unsubscribers = [];
+    for (const source of this.sources.values()) {
+      this.unsubscribe(source);
+    }
     this.disconnectAll();
     for (const watch of this.watches.values()) {
       if (watch.timer) {
@@ -234,8 +307,16 @@ export class LiveHub {
     return this.clients.size;
   }
 
-  recentEvents(): LiveEvent[] {
-    return [...this.rings.trade, ...this.rings.rejected, ...this.rings.score].sort((a, b) => a.id - b.id);
+  recentEvents(strategy: string | null = null): LiveEvent[] {
+    const events: LiveEvent[] = [];
+    for (const ring of this.rings.values()) {
+      for (const event of ring) {
+        if (strategyMatches(strategy, event.strategy)) {
+          events.push(event);
+        }
+      }
+    }
+    return events.sort((a, b) => a.id - b.id);
   }
 
   status(): LiveStatus {
@@ -247,33 +328,33 @@ export class LiveHub {
       tradingActive: this.isTrading(),
       events: this.nextId - 1,
       lastEventAtMs: this.lastEventAtMs,
-      openPositions: this.positions ? this.openPrimaryPositions().length : this.watches.size,
-      heartbeatMs: this.heartbeatMs
+      openPositions: this.openPositionCount(),
+      heartbeatMs: this.heartbeatMs,
+      strategies: this.strategies()
     };
   }
 
   series(positionId: string): PositionSeries | null {
-    const position = this.findOpen(positionId);
-    if (!position) {
+    const entry = this.findOpen(positionId);
+    if (!entry) {
       return null;
     }
-    return positionSeries(position, this.market.get(position.mint), this.config, this.clock.nowMs());
+    const series = positionSeries(entry.position, this.market.get(entry.position.mint), entry.source.info.config, this.clock.nowMs());
+    return { ...series, position: { ...series.position, strategy: entry.source.info.name } as LiveStrategyPositionView };
   }
 
-  poll(streamId: string | null, afterId: number): LivePoll {
+  poll(streamId: string | null, afterId: number, strategy: string | null = null): LivePoll {
     const nowMs = this.clock.nowMs();
-    if (this.positions) {
-      this.syncPositions(nowMs);
-    }
+    this.syncPositions(nowMs);
     const after = streamId === this.streamId && Number.isSafeInteger(afterId) && afterId > 0 ? afterId : 0;
     return {
-      hello: this.hello(nowMs),
-      events: this.recentEvents().filter((event) => event.id > after),
+      hello: this.hello(nowMs, strategy),
+      events: this.recentEvents(strategy).filter((event) => event.id > after),
       lastId: this.nextId - 1
     };
   }
 
-  connect(req: IncomingMessage, res: ServerResponse): void {
+  connect(req: IncomingMessage, res: ServerResponse, strategy: string | null = null): void {
     if (this.stopped) {
       sendJson(res, 503, { error: "live_stopped", message: "the live stream is shutting down" }, { "Retry-After": "15" });
       return;
@@ -290,24 +371,28 @@ export class LiveHub {
     res.writeHead(200, SSE_HEADERS);
     req.socket.setNoDelay(true);
     req.socket.setKeepAlive(true);
-    const client: StreamClient = { res, congested: false, congestedSinceMs: 0, dropped: 0 };
+    const client: StreamClient = { res, strategy, congested: false, congestedSinceMs: 0, dropped: 0 };
     this.clients.add(client);
     res.on("close", () => this.drop(client));
     res.on("error", () => this.drop(client));
     const nowMs = this.clock.nowMs();
-    if (this.positions) {
-      this.syncPositions(nowMs);
-    }
+    this.syncPositions(nowMs);
     const afterId = this.lastSeenId(headerText(req.headers["last-event-id"]));
-    const replay = this.recentEvents()
+    const replay = this.recentEvents(strategy)
       .filter((event) => event.id > afterId)
       .map((event) => this.eventChunk(event))
       .join("");
-    this.write(client, `retry: ${RETRY_MS}\n\n${sseChunk("hello", null, this.hello(nowMs))}${replay}`);
+    this.write(client, `retry: ${RETRY_MS}\n\n${sseChunk("hello", null, this.hello(nowMs, strategy))}${replay}`);
     this.ensureHeartbeat();
   }
 
-  private hello(nowMs: number): LiveHello {
+  private hello(nowMs: number, strategy: string | null): LiveHello {
+    const positions: LiveStrategyPositionView[] = [];
+    for (const watch of this.watches.values()) {
+      if (strategyMatches(strategy, watch.source.info.name)) {
+        positions.push(this.viewOf(this.currentPosition(watch), watch.source, nowMs));
+      }
+    }
     return {
       streamId: this.streamId,
       serverTimeMs: nowMs,
@@ -315,8 +400,58 @@ export class LiveHub {
       clients: this.clients.size,
       tradingActive: this.isTrading(),
       heartbeatMs: this.heartbeatMs,
-      positions: [...this.watches.values()].map((watch) => this.viewOf(this.currentPosition(watch), nowMs))
+      strategy,
+      strategies: this.strategies(),
+      positions
     };
+  }
+
+  private sourceOf(info: LiveStrategy): StrategySource {
+    return { info, references: new Map(), reservations: new Map(), skips: new Map(), unsubscribers: [] };
+  }
+
+  private subscribe(source: StrategySource): void {
+    if (source.unsubscribers.length > 0) {
+      return;
+    }
+    const bus = source.info.bus;
+    source.unsubscribers = [
+      bus.on("signal", (signal) => this.onSignal(source, signal)),
+      bus.on("signalRejected", (rejection) => this.onRejected(source, rejection)),
+      bus.on("signalSkipped", (skip) => this.onSkipped(source, skip)),
+      bus.on("risk", (event) => this.onRisk(source, event)),
+      bus.on("positionOpened", (position) => this.onOpened(source, position)),
+      bus.on("positionUpdated", (position) => this.onUpdated(source, position)),
+      bus.on("positionClosed", (position) => this.onClosed(source, position))
+    ];
+  }
+
+  private unsubscribe(source: StrategySource): void {
+    for (const unsubscribe of source.unsubscribers) {
+      unsubscribe();
+    }
+    source.unsubscribers = [];
+  }
+
+  private removeStrategy(source: StrategySource): void {
+    if (source === this.main || this.sources.get(source.info.name) !== source) {
+      return;
+    }
+    this.unsubscribe(source);
+    this.sources.delete(source.info.name);
+    for (const [id, watch] of [...this.watches]) {
+      if (watch.source === source) {
+        this.unwatch(id);
+      }
+    }
+  }
+
+  private safeMainRunId(): number | null {
+    try {
+      return this.mainRunId?.() ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private lastSeenId(header: string | null): number {
@@ -328,34 +463,51 @@ export class LiveHub {
     return stream === this.streamId && Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
   }
 
-  private isTrading(): boolean {
+  private isSourceTrading(source: StrategySource): boolean {
     try {
-      return this.tradingActive?.() ?? false;
+      return source.info.tradingActive?.() ?? false;
     } catch {
       return false;
     }
+  }
+
+  private isTrading(): boolean {
+    for (const source of this.sources.values()) {
+      if (this.isSourceTrading(source)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private eventChunk(event: LiveEvent): string {
     return sseChunk(null, `${this.streamId}:${event.id}`, event);
   }
 
-  private publish(draft: LiveEventDraft): LiveEvent {
-    const event: LiveEvent = { id: this.nextId, ...draft };
+  private publish(draft: LiveEventDraft, strategy: string | null): LiveEvent {
+    const event: LiveEvent = { id: this.nextId, strategy, ...draft };
     this.nextId += 1;
     this.lastEventAtMs = this.clock.nowMs();
     if (event.kind !== "position") {
       const ringClass = ringClassOf(event.kind);
-      const ring = this.rings[ringClass];
+      const key = ringKey(ringClass, strategy);
+      let ring = this.rings.get(key);
+      if (!ring) {
+        ring = [];
+        this.rings.set(key, ring);
+      }
       ring.push(event);
       if (ring.length > this.ringSizes[ringClass]) {
         ring.splice(0, ring.length - this.ringSizes[ringClass]);
       }
     }
     if (this.clients.size > 0) {
-      const chunk = this.eventChunk(event);
+      let chunk: string | null = null;
       for (const client of [...this.clients]) {
-        this.write(client, chunk);
+        if (strategyMatches(client.strategy, strategy)) {
+          chunk ??= this.eventChunk(event);
+          this.write(client, chunk);
+        }
       }
     }
     return event;
@@ -422,9 +574,7 @@ export class LiveHub {
       return;
     }
     const nowMs = this.clock.nowMs();
-    if (this.positions) {
-      this.syncPositions(nowMs);
-    }
+    this.syncPositions(nowMs);
     const chunk = sseChunk("heartbeat", null, { atMs: nowMs, clients: this.clients.size, tradingActive: this.isTrading() });
     for (const client of [...this.clients]) {
       this.write(client, chunk);
@@ -436,28 +586,56 @@ export class LiveHub {
     return cleanSymbol(this.market.get(mint)?.info.symbol);
   }
 
-  private openPrimaryPositions(): Position[] {
-    if (!this.positions) {
+  private sourcePositions(source: StrategySource): Position[] {
+    const positions = source.info.positions;
+    if (!positions) {
       return [];
     }
     try {
-      return this.positions().filter((position) => position.shadowOf === null && position.status === "open");
+      return positions().filter((position) => position.shadowOf === null && position.status === "open");
     } catch (error) {
-      log.warn({ err: error }, "open positions lookup failed");
+      log.warn({ err: error, strategy: source.info.name }, "open positions lookup failed");
       return [];
     }
   }
 
-  private findOpen(positionId: string): Position | null {
-    if (this.positions) {
-      return this.openPrimaryPositions().find((position) => position.id === positionId) ?? null;
+  private openPositionCount(): number {
+    let count = 0;
+    for (const source of this.sources.values()) {
+      if (source.info.positions) {
+        count += this.sourcePositions(source).length;
+        continue;
+      }
+      for (const watch of this.watches.values()) {
+        if (watch.source === source) {
+          count += 1;
+        }
+      }
     }
-    return this.watches.get(positionId)?.position ?? null;
+    return count;
+  }
+
+  private findOpen(positionId: string): OpenEntry | null {
+    const watch = this.watches.get(positionId);
+    const sources = watch ? [watch.source] : [...this.sources.values()];
+    for (const source of sources) {
+      if (!source.info.positions) {
+        if (watch && watch.source === source) {
+          return { position: watch.position, source };
+        }
+        continue;
+      }
+      const position = this.sourcePositions(source).find((candidate) => candidate.id === positionId);
+      if (position) {
+        return { position, source };
+      }
+    }
+    return null;
   }
 
   private currentPosition(watch: PositionWatch): Position {
-    if (this.positions) {
-      const current = this.openPrimaryPositions().find((position) => position.id === watch.position.id);
+    if (watch.source.info.positions) {
+      const current = this.sourcePositions(watch.source).find((position) => position.id === watch.position.id);
       if (current) {
         watch.position = current;
       }
@@ -465,47 +643,50 @@ export class LiveHub {
     return watch.position;
   }
 
-  private viewOf(position: Position, nowMs: number): LivePositionView {
-    return livePositionView(position, this.market.get(position.mint), this.config, nowMs);
+  private viewOf(position: Position, source: StrategySource, nowMs: number): LiveStrategyPositionView {
+    return { ...livePositionView(position, this.market.get(position.mint), source.info.config, nowMs), strategy: source.info.name };
   }
 
   private syncPositions(nowMs: number): void {
     this.lastSyncMs = nowMs;
-    const open = this.openPrimaryPositions();
     const seen = new Set<string>();
-    for (const position of open) {
-      seen.add(position.id);
-      const watch = this.watches.get(position.id);
-      if (watch) {
-        watch.position = position;
-      } else {
-        this.watch(position);
+    const synced = new Set<StrategySource>();
+    for (const source of this.sources.values()) {
+      if (!source.info.positions) {
+        continue;
+      }
+      synced.add(source);
+      for (const position of this.sourcePositions(source)) {
+        seen.add(position.id);
+        const watch = this.watches.get(position.id);
+        if (watch) {
+          watch.position = position;
+        } else {
+          this.watch(position, source);
+        }
       }
     }
-    for (const id of [...this.watches.keys()]) {
-      if (!seen.has(id)) {
+    for (const [id, watch] of [...this.watches]) {
+      if (synced.has(watch.source) && !seen.has(id)) {
         this.unwatch(id);
       }
     }
   }
 
   private maybeSync(): void {
-    if (!this.positions) {
-      return;
-    }
     const nowMs = this.clock.nowMs();
     if (nowMs - this.lastSyncMs >= POSITION_SYNC_MS) {
       this.syncPositions(nowMs);
     }
   }
 
-  private watch(position: Position): PositionWatch {
+  private watch(position: Position, source: StrategySource): PositionWatch {
     const existing = this.watches.get(position.id);
     if (existing) {
       existing.position = position;
       return existing;
     }
-    const watch: PositionWatch = { position, lastSentMs: Number.NEGATIVE_INFINITY, timer: null };
+    const watch: PositionWatch = { position, source, lastSentMs: Number.NEGATIVE_INFINITY, timer: null };
     this.watches.set(position.id, watch);
     let ids = this.byMint.get(position.mint);
     if (!ids) {
@@ -556,19 +737,19 @@ export class LiveHub {
   private sendPosition(watch: PositionWatch, nowMs: number): void {
     watch.lastSentMs = nowMs;
     try {
-      this.publish(positionEvent(this.viewOf(this.currentPosition(watch), nowMs), nowMs));
+      this.publish(positionEvent(this.viewOf(this.currentPosition(watch), watch.source, nowMs), nowMs), watch.source.info.name);
     } catch (error) {
       log.warn({ err: error, positionId: watch.position.id }, "live position update failed");
     }
   }
 
-  private pruneMaps(nowMs: number): void {
-    for (const [mint, reference] of this.references) {
-      if (nowMs - reference.atMs > REFERENCE_TTL_MS || this.references.size > MAX_TRACKED_MINTS) {
-        this.references.delete(mint);
+  private pruneMaps(source: StrategySource, nowMs: number): void {
+    for (const [mint, reference] of source.references) {
+      if (nowMs - reference.atMs > REFERENCE_TTL_MS || source.references.size > MAX_TRACKED_MINTS) {
+        source.references.delete(mint);
       }
     }
-    for (const decisions of [this.reservations, this.skips]) {
+    for (const decisions of [source.reservations, source.skips]) {
       for (const [mint, atMs] of decisions) {
         if (nowMs - atMs > REFERENCE_TTL_MS || decisions.size > MAX_TRACKED_MINTS) {
           decisions.delete(mint);
@@ -590,103 +771,108 @@ export class LiveHub {
   }
 
   private onScore(score: LaunchScore): void {
-    this.publish(scoreEvent(score, this.symbolOf(score.mint), this.thresholds));
+    this.publish(scoreEvent(score, this.symbolOf(score.mint), this.main.info.thresholds), null);
   }
 
-  private onSignal(signal: Signal): void {
+  private onSignal(source: StrategySource, signal: Signal): void {
     const nowMs = this.clock.nowMs();
-    this.pruneMaps(nowMs);
+    this.pruneMaps(source, nowMs);
     const price = this.market.get(signal.mint)?.price() ?? 0;
     if (isUsablePrice(price)) {
-      this.references.set(signal.mint, { price, atMs: nowMs });
+      source.references.set(signal.mint, { price, atMs: nowMs });
     }
-    this.publish(signalEvent(signal, this.symbolOf(signal.mint)));
-    if (this.isTrading()) {
-      queueMicrotask(() => this.checkEntered(signal, nowMs));
+    this.publish(signalEvent(signal, this.symbolOf(signal.mint)), source.info.name);
+    if (this.isSourceTrading(source)) {
+      queueMicrotask(() => this.checkEntered(source, signal, nowMs));
     }
   }
 
-  private decided(mint: Pubkey, seenAtMs: number): boolean {
-    const reservedAtMs = this.reservations.get(mint);
-    const skippedAtMs = this.skips.get(mint);
+  private decided(source: StrategySource, mint: Pubkey, seenAtMs: number): boolean {
+    const reservedAtMs = source.reservations.get(mint);
+    const skippedAtMs = source.skips.get(mint);
     return (
       (reservedAtMs !== undefined && reservedAtMs >= seenAtMs - RESERVATION_MATCH_MS) ||
       (skippedAtMs !== undefined && skippedAtMs >= seenAtMs - RESERVATION_MATCH_MS)
     );
   }
 
-  private checkEntered(signal: Signal, seenAtMs: number): void {
-    if (this.stopped || this.decided(signal.mint, seenAtMs)) {
+  private isAttached(source: StrategySource): boolean {
+    return !this.stopped && this.sources.get(source.info.name) === source;
+  }
+
+  private checkEntered(source: StrategySource, signal: Signal, seenAtMs: number): void {
+    if (!this.isAttached(source) || this.decided(source, signal.mint, seenAtMs)) {
       return;
     }
-    const lookup = this.skipReason;
+    const lookup = source.info.skipReason ?? null;
     if (!lookup) {
-      this.publish(skippedEvent(signal, null, this.symbolOf(signal.mint), this.clock.nowMs()));
+      this.publish(skippedEvent(signal, null, this.symbolOf(signal.mint), this.clock.nowMs()), source.info.name);
       return;
     }
     const handle = this.clock.schedule(this.clock.nowMs() + this.skipLookupDelayMs, () => {
       this.lookups.delete(handle);
-      if (this.stopped || this.decided(signal.mint, seenAtMs)) {
+      if (!this.isAttached(source) || this.decided(source, signal.mint, seenAtMs)) {
         return undefined;
       }
       return lookup(signal)
         .catch(() => null)
         .then((reason) => {
-          if (!this.stopped && !this.decided(signal.mint, seenAtMs)) {
-            this.publish(skippedEvent(signal, reason, this.symbolOf(signal.mint), this.clock.nowMs()));
+          if (this.isAttached(source) && !this.decided(source, signal.mint, seenAtMs)) {
+            this.publish(skippedEvent(signal, reason, this.symbolOf(signal.mint), this.clock.nowMs()), source.info.name);
           }
         });
     });
     this.lookups.add(handle);
   }
 
-  private onSkipped(skip: SignalRejection): void {
+  private onSkipped(source: StrategySource, skip: SignalRejection): void {
     const nowMs = this.clock.nowMs();
-    this.skips.set(skip.signal.mint, nowMs);
-    this.publish(skippedEvent(skip.signal, skip.reason, this.symbolOf(skip.signal.mint), nowMs));
+    source.skips.set(skip.signal.mint, nowMs);
+    this.publish(skippedEvent(skip.signal, skip.reason, this.symbolOf(skip.signal.mint), nowMs), source.info.name);
   }
 
-  private onRejected(rejection: SignalRejection): void {
-    this.publish(rejectedEvent(rejection, this.symbolOf(rejection.signal.mint), this.thresholds, this.clock.nowMs()));
+  private onRejected(source: StrategySource, rejection: SignalRejection): void {
+    this.publish(rejectedEvent(rejection, this.symbolOf(rejection.signal.mint), source.info.thresholds, this.clock.nowMs()), source.info.name);
   }
 
-  private onRisk(event: RiskEvent): void {
+  private onRisk(source: StrategySource, event: RiskEvent): void {
     if (event.kind === "entry_reserved") {
       const mint = typeof event.detail.mint === "string" ? event.detail.mint : null;
       if (mint) {
-        this.reservations.set(mint, this.clock.nowMs());
-        this.publish(enteringEvent(event, mint, this.symbolOf(mint)));
+        source.reservations.set(mint, this.clock.nowMs());
+        this.publish(enteringEvent(event, mint, this.symbolOf(mint)), source.info.name);
       }
       return;
     }
     const draft = riskEventDraft(event);
     if (draft) {
-      this.publish(draft);
+      this.publish(draft, source.info.name);
     }
   }
 
-  private onOpened(position: Position): void {
+  private onOpened(source: StrategySource, position: Position): void {
     if (position.shadowOf !== null) {
       return;
     }
     const launch = this.market.get(position.mint);
-    const reference = this.references.get(position.mint) ?? null;
-    this.references.delete(position.mint);
+    const reference = source.references.get(position.mint) ?? null;
+    source.references.delete(position.mint);
     this.publish(
       openedEvent(position, {
         symbol: this.symbolOf(position.mint),
         entryMcapMultiple: launch && launch.isSolQuoted ? launch.mcapMultiple() : null,
         referencePrice: reference?.price ?? null,
         signalAtMs: signalTimeOf(position) ?? reference?.atMs ?? null
-      })
+      }),
+      source.info.name
     );
     if (position.status === "open") {
-      this.watch(position);
+      this.watch(position, source);
       this.touch(position.id);
     }
   }
 
-  private onUpdated(position: Position): void {
+  private onUpdated(source: StrategySource, position: Position): void {
     if (position.shadowOf !== null) {
       return;
     }
@@ -696,18 +882,18 @@ export class LiveHub {
       const reason = readExitState(position).liquidating?.reason ?? null;
       const draft = partialEvent(watch.position, position, this.symbolOf(position.mint), isUsablePrice(price) ? price : null, reason, this.clock.nowMs());
       if (draft) {
-        this.publish(draft);
+        this.publish(draft, source.info.name);
       }
     }
-    this.watch(position);
+    this.watch(position, source);
     this.touch(position.id);
   }
 
-  private onClosed(position: Position): void {
+  private onClosed(source: StrategySource, position: Position): void {
     if (position.shadowOf !== null) {
       return;
     }
     this.unwatch(position.id);
-    this.publish(closedEvent(position, this.symbolOf(position.mint)));
+    this.publish(closedEvent(position, this.symbolOf(position.mint)), source.info.name);
   }
 }

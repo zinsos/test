@@ -5,7 +5,7 @@ import type { ScoreProvider } from "../core/contracts.js";
 import { moduleLogger } from "../core/logger.js";
 import type { ChainEvent, FeatureVector, LaunchScore, Pubkey } from "../core/types.js";
 import type { LaunchState } from "../market/state.js";
-import { DEV_HISTORY_FEATURES, REPLAY_STORED_FEATURES } from "./featureNames.js";
+import { COPYCAT_FEATURES, DEV_HISTORY_FEATURES, REPLAY_STORED_FEATURES } from "./featureNames.js";
 import {
   computeFeatures,
   devWalletsOf,
@@ -18,6 +18,7 @@ import { LruCache } from "./lru.js";
 import type { ScoringModel } from "./model.js";
 import type {
   CopycatDetector,
+  CopycatResult,
   DevHistoryProvider,
   DevHistorySummary,
   IntelRequest,
@@ -348,6 +349,14 @@ export class ScorerService implements ScoreProvider {
     }
   }
 
+  private copycatOf(launch: LaunchState, nowMs: number, stored: StoredFeatures | null): CopycatResult | null {
+    if (this.trending.touch && hasAllKeys(stored, COPYCAT_FEATURES)) {
+      this.trending.touch(launch, nowMs);
+      return null;
+    }
+    return this.trending.isCopycat(launch, nowMs);
+  }
+
   private finish(launch: LaunchState, inputs: ScoringInputs, options: FinishOptions): LaunchScore {
     const nowMs = this.clock.nowMs();
     const result = computeFeatures(launch, {
@@ -355,7 +364,7 @@ export class ScorerService implements ScoreProvider {
       config: this.config,
       intel: inputs.intel,
       devHistory: inputs.devHistory,
-      copycat: this.trending.isCopycat(launch, nowMs)
+      copycat: this.copycatOf(launch, nowMs, inputs.stored)
     });
     const features = overlayStored(result.features, inputs.stored, REPLAY_STORED_FEATURES);
     const modelScore = this.model.score(features, this.config.hardBlocks);

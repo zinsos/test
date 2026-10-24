@@ -1,7 +1,7 @@
 import type { ClosedTrade, OrderSide, SignalType, TradingMode } from "../core/types.js";
 import { toBigInt, toNullableNumber, toNumber, type Db } from "../db/pool.js";
 import type { FillSummary, PaperLivePair } from "./compare.js";
-import { LAB_LABEL_PREFIX, LAB_RUN_IDS_SQL } from "./labQueries.js";
+import { LAB_LABEL_PREFIX, SIDE_RUN_IDS_SQL } from "./labQueries.js";
 import { equitySeries, type EquityOptions, type EquityPoint } from "./metrics.js";
 import { lamportsToSol } from "./units.js";
 
@@ -139,7 +139,7 @@ const TRADE_FILTER_SQL = `p.status = 'closed' AND p.closed_at IS NOT NULL
    AND ($3::timestamptz IS NULL OR p.closed_at >= $3)
    AND ($4::timestamptz IS NULL OR p.closed_at < $4)
    AND ($5::boolean OR p.shadow_of IS NULL)
-   AND ($1::bigint IS NOT NULL OR p.run_id NOT IN (${LAB_RUN_IDS_SQL}))`;
+   AND ($1::bigint IS NOT NULL OR p.run_id NOT IN (${SIDE_RUN_IDS_SQL}))`;
 
 export async function loadClosedTrades(db: Db, filter: TradeFilter = {}): Promise<ClosedTradeRecord[]> {
   const limit = clampLimit(filter.limit, DEFAULT_TRADE_LIMIT, MAX_TRADE_LIMIT);
@@ -243,7 +243,7 @@ export async function loadModes(db: Db): Promise<ModeInfo[]> {
   const result = await db.query<DbRecord>(
     `SELECT mode, count(*)::int AS closed, max(closed_at) AS last_closed
      FROM positions
-     WHERE status = 'closed' AND shadow_of IS NULL AND run_id NOT IN (${LAB_RUN_IDS_SQL})
+     WHERE status = 'closed' AND shadow_of IS NULL AND run_id NOT IN (${SIDE_RUN_IDS_SQL})
      GROUP BY mode
      ORDER BY max(closed_at) DESC NULLS LAST`
   );

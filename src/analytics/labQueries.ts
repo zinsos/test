@@ -1,9 +1,15 @@
 import { toNullableNumber, toNumber, type Db } from "../db/pool.js";
+import { PAPER_LANE_LABEL_PREFIX } from "../trader/runs.js";
 import { formatInterval, formatSol } from "./format.js";
 import type { Narrative } from "./narrative.js";
 
 export const LAB_LABEL_PREFIX = "lab:";
 export const LAB_RUN_IDS_SQL = `SELECT id FROM strategy_runs WHERE label LIKE '${LAB_LABEL_PREFIX}%'`;
+export const SIDE_RUN_IDS_SQL = `SELECT id FROM strategy_runs WHERE label LIKE '${LAB_LABEL_PREFIX}%' OR label LIKE '${PAPER_LANE_LABEL_PREFIX}%'`;
+
+export function sideRunLabelSql(alias: string): string {
+  return `(${alias}.label LIKE '${LAB_LABEL_PREFIX}%' OR ${alias}.label LIKE '${PAPER_LANE_LABEL_PREFIX}%')`;
+}
 export const DEFAULT_LAB_HISTORY = 20;
 export const MIN_LAB_TRADES = 30;
 const MAX_FEATURES = 15;

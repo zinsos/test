@@ -1,7 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { hydrateLaunches } from "../backtest/loader.js";
 import { requireEnv, type Env } from "../config/env.js";
-import type { StrategyConfig } from "../config/strategy.js";
+import { tradingRunConfig, type StrategyConfig } from "../config/strategy.js";
 import type { Bus } from "../core/bus.js";
 import type { Clock } from "../core/clock.js";
 import type { Executor } from "../core/contracts.js";
@@ -77,7 +77,7 @@ export async function createTrading(env: Env, config: StrategyConfig, shared: Tr
   await store.prepare();
   store.start();
   const label = mode === "live" && env.LIVE_DRY_RUN ? "live-dry-run" : null;
-  const run = await resumeOrCreateRun(db, store, { mode, label, config });
+  const run = await resumeOrCreateRun(db, store, { mode, label, config: tradingRunConfig(config) });
   if (run.configChanged) {
     log.warn(
       { runId: run.runId },
