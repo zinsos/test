@@ -1,0 +1,87 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { loadEnv } from "../src/config/env.js";
+import { defaultStrategyConfig, parseStrategyConfig } from "../src/config/strategy.js";
+
+const ENV_NAMES = [
+  "DATABASE_URL",
+  "DATABASE_SSL",
+  "DB_MAX_CONNECTIONS",
+  "RPC_HTTP_URL",
+  "RPC_WS_URL",
+  "RPC_MAX_RPS",
+  "RPC_MAX_CONCURRENCY",
+  "STREAM_COMMITMENT",
+  "MODULES",
+  "TRADING_MODE",
+  "PAPER_VARIANTS",
+  "LIVE_DRY_RUN",
+  "STRATEGY_CONFIG",
+  "HOT_WALLET_SECRET_KEY",
+  "COLD_WALLET_ADDRESS",
+  "JITO_BLOCK_ENGINE_URL",
+  "DASHBOARD_TOKEN",
+  "DASHBOARD_ALLOW_OPEN",
+  "PORT",
+  "HOST",
+  "LOG_LEVEL",
+  "METADATA_GATEWAY"
+];
+
+function envExample(): Map<string, string> {
+  const values = new Map<string, string>();
+  for (const line of readFileSync(new URL("../.env.example", import.meta.url), "utf8").split("\n")) {
+    const match = /^#?\s*([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line.trim());
+    if (match?.[1]) {
+      values.set(match[1], match[2] ?? "");
+    }
+  }
+  return values;
+}
+
+describe("config/strategy.json", () => {
+  const raw = JSON.parse(readFileSync(new URL("../config/strategy.json", import.meta.url), "utf8")) as unknown;
+
+  it("is valid and spells out every knob explicitly", () => {
+    expect(parseStrategyConfig(raw)).toEqual(raw);
+  });
+
+  it("matches the code defaults", () => {
+    expect(parseStrategyConfig(raw)).toEqual(defaultStrategyConfig());
+  });
+});
+
+describe(".env.example", () => {
+  it("documents every environment variable the service reads", () => {
+    expect([...envExample().keys()].sort()).toEqual([...ENV_NAMES].sort());
+  });
+
+  it("parses with its safe defaults", () => {
+    const values = Object.fromEntries([...envExample().entries()].filter(([name, value]) => value.length > 0 && name !== "DATABASE_SSL"));
+    const env = loadEnv(values);
+    expect(env.TRADING_MODE).toBe("paper");
+    expect(env.LIVE_DRY_RUN).toBe(true);
+    expect(env.MODULES).toEqual(["recorder", "scorer", "tracker", "trader", "dashboard"]);
+    expect(env.HOST).toBeUndefined();
+  });
+
+  it("binds the http server to a trimmed HOST when set", () => {
+    expect(loadEnv({ HOST: " 127.0.0.1 " }).HOST).toBe("127.0.0.1");
+    expect(loadEnv({ HOST: "" }).HOST).toBeUndefined();
+  });
+});
+
+describe("railway.json", () => {
+  it("builds with npm, starts the compiled CLI and checks /healthz", () => {
+    const railway = JSON.parse(readFileSync(new URL("../railway.json", import.meta.url), "utf8")) as {
+      build: { buildCommand: string };
+      deploy: { startCommand: string; healthcheckPath: string; restartPolicyType: string; overlapSeconds: number; restartPolicyMaxRetries?: number };
+    };
+    expect(railway.build.buildCommand).toBe("npm run build");
+    expect(railway.deploy.startCommand).toBe("node dist/src/main.js start");
+    expect(railway.deploy.healthcheckPath).toBe("/healthz");
+    expect(railway.deploy.restartPolicyType).toBe("ALWAYS");
+    expect(railway.deploy.restartPolicyMaxRetries).toBeUndefined();
+    expect(railway.deploy.overlapSeconds).toBeGreaterThan(0);
+  });
+});

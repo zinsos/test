@@ -1,0 +1,232 @@
+{
+  "recorder": {
+    "trackMaxAgeHours": 24,
+    "postMigrationTrackHours": 24,
+    "holderCheckpointsSec": [
+      30,
+      60,
+      300,
+      900
+    ],
+    "rpcSnapshotsEnabled": true,
+    "rpcSnapshotMinTrades": 15,
+    "finalizeIntervalSec": 60,
+    "partitionDaysAhead": 3,
+    "metadata": {
+      "enabled": true,
+      "timeoutMs": 6000,
+      "gateway": "https://ipfs.io/ipfs/",
+      "concurrency": 8,
+      "maxRetries": 2
+    },
+    "outcome": {
+      "deadInactivityMinutes": 30,
+      "deadMaxMcapMultiple": 1.5,
+      "rugWindowSec": 120,
+      "rugInsiderSellFraction": 0.5,
+      "rugDropFraction": 0.7,
+      "rugLookaheadSec": 300,
+      "surviveCheckSec": 900,
+      "surviveRecentTradeSec": 300,
+      "surviveMinMultipleOfInitial": 1,
+      "finalizeAfterHours": 24
+    },
+    "memory": {
+      "evictInactiveMinutes": 45,
+      "evictMaxAgeHours": 6,
+      "maxTradesPerLaunch": 25000
+    }
+  },
+  "scorer": {
+    "checkpointsSec": [
+      10,
+      30,
+      60,
+      120
+    ],
+    "earlyBuyerCount": 20,
+    "earlyWindowSec": 60,
+    "bundleSlotWindow": 1,
+    "weightsFile": "config/scorer-weights.json",
+    "maxRisk": 55,
+    "hardBlocks": {
+      "devShareAbove": 0.2,
+      "bundleShareAbove": 0.25,
+      "clusterShareAbove": 0.3,
+      "devRugRateAbove": 0.6,
+      "devRugMinLaunches": 3
+    },
+    "deepIntel": {
+      "enabled": true,
+      "minBuyersForDeep": 5,
+      "freshMaxPriorTxs": 5,
+      "signatureLookback": 25,
+      "maxFundingLookups": 5,
+      "minFundingLamports": 10000000,
+      "cacheTtlHours": 72,
+      "hubFanoutThreshold": 40,
+      "maxWalletsPerLaunch": 25,
+      "minClusterCoverage": 0.6,
+      "timeoutMs": 8000
+    },
+    "copycat": {
+      "trendingWindowMinutes": 60,
+      "trendingTopN": 50,
+      "similarityThreshold": 0.85
+    }
+  },
+  "tracker": {
+    "rerankIntervalHours": 168,
+    "shortWindowDays": 30,
+    "longWindowDays": 90,
+    "minTradesShort": 8,
+    "minTradesLong": 15,
+    "minMedianHoldSec": 45,
+    "maxCreationSlotEntryRate": 0.3,
+    "maxMedianEntryDelaySec": 3600,
+    "minEntryDelaySec": 3,
+    "topN": 100,
+    "excludeDevLinked": true,
+    "backfill": {
+      "enabled": true,
+      "maxWallets": 200,
+      "maxSignaturesPerWallet": 3000,
+      "concurrency": 3
+    },
+    "convergence": {
+      "windowSec": 120,
+      "minWallets": 3,
+      "maxRiskScore": 55,
+      "waitForScoreMs": 5000,
+      "maxScoreAgeSec": 30,
+      "maxLaunchAgeSec": 3600
+    }
+  },
+  "signals": {
+    "enabled": [
+      "smart_convergence"
+    ],
+    "cooldownPerMintSec": 3600,
+    "quoteMints": [
+      "SOL"
+    ],
+    "scoreMomentum": {
+      "checkpointSec": 60,
+      "maxRiskScore": 35,
+      "minUniqueBuyersPerMin": 15,
+      "minBuySellRatio": 1.5,
+      "minMcapSol": 35,
+      "maxMcapSol": 150
+    }
+  },
+  "execution": {
+    "latencySlots": 2,
+    "latencyJitterSlots": 2,
+    "failureRate": 0.12,
+    "maxRetries": 2,
+    "retryDelaySlots": 3,
+    "buySlippageBps": 1500,
+    "sellSlippageBps": 2000,
+    "emergencySellSlippageBps": 5000,
+    "priorityFeeLamports": 300000,
+    "useJito": false,
+    "jitoTipLamports": 1000000,
+    "baseFeeLamports": 5000,
+    "ataRentLamports": 1513840,
+    "refundAtaOnClose": true,
+    "extraPlatformFeeBps": 0,
+    "defaultProtocolFeeBps": 95,
+    "defaultCreatorFeeBps": 30,
+    "defaultPoolLpFeeBps": 20,
+    "defaultPoolProtocolFeeBps": 5,
+    "defaultPoolCreatorFeeBps": 5,
+    "fillTimeoutMs": 15000,
+    "seed": "snypra-edge"
+  },
+  "exits": {
+    "takeProfit": [
+      {
+        "atMultiple": 2,
+        "sellFractionOfInitial": 0.5
+      },
+      {
+        "atMultiple": 3,
+        "sellFractionOfInitial": 0.15
+      },
+      {
+        "atMultiple": 5,
+        "sellFractionOfInitial": 0.15
+      },
+      {
+        "atMultiple": 10,
+        "sellFractionOfInitial": 0.1
+      }
+    ],
+    "moonbagFraction": 0.1,
+    "stopLossMultiple": 0.65,
+    "trailing": [
+      {
+        "peakMultiple": 1.3,
+        "trailFraction": 0.25
+      },
+      {
+        "peakMultiple": 2,
+        "trailFraction": 0.22
+      },
+      {
+        "peakMultiple": 3,
+        "trailFraction": 0.18
+      },
+      {
+        "peakMultiple": 5,
+        "trailFraction": 0.15
+      }
+    ],
+    "moonbagTrailFraction": 0.45,
+    "timeStop": {
+      "afterSec": 300,
+      "flatBandFraction": 0.15
+    },
+    "maxHoldSec": 3600,
+    "events": {
+      "devSellExit": true,
+      "devSellMinFraction": 0.1,
+      "insiderSellExitFraction": 0.3,
+      "smartExitMinWallets": 2
+    },
+    "migration": {
+      "action": "switch",
+      "trailFraction": 0.3,
+      "timeStopSec": 1800
+    },
+    "liquidity": {
+      "maxImpactBps": 300,
+      "emergencyMaxImpactBps": 3000,
+      "minChunkLamports": 10000000
+    },
+    "evaluateIntervalMs": 2000
+  },
+  "risk": {
+    "startingBankrollSol": 5,
+    "fractionPerTrade": 0.015,
+    "minPositionSol": 0.02,
+    "maxPositionSol": 0.5,
+    "maxConcurrent": 5,
+    "dailyLossLimitFraction": 0.08,
+    "killSwitchDrawdownFraction": 0.25,
+    "dayResetUtcHour": 0,
+    "flattenOnKill": true,
+    "maxEntriesPerDevPerDay": 1,
+    "minFeeReserveSol": 0.05
+  },
+  "sweeper": {
+    "enabled": false,
+    "intervalMinutes": 60,
+    "hotTargetSol": 5,
+    "reserveSol": 0.1,
+    "minSweepSol": 0.25
+  },
+  "lab": {
+    "livePaperVariants": []
+  }
+}
