@@ -12,7 +12,9 @@ import {
   runLab,
   type LabProgress
 } from "../../lab/index.js";
+import { loadLearnedSettings } from "../../lab/learned.js";
 import { DATASET_LABELS, type DatasetLabelName } from "../../scorer/dataset.js";
+import { tradingModeOf } from "../trading.js";
 import { flagOption, numberOption, stringOption, UsageError } from "../args.js";
 import { commandConfig, EXIT_FAILURE, EXIT_OK, isoDay, withDatabase, type CommandContext } from "../commandContext.js";
 import { isDatasetLabel } from "./scorer.js";
@@ -66,6 +68,20 @@ export function progressText(progress: LabProgress): string | null {
   }
 }
 
+export function promotionBlockers(input: { hours: number; windowHours: number; maxVariants: number | null; variantsFile: string | undefined }): string[] {
+  const blockers: string[] = [];
+  if (Math.abs(input.hours - input.windowHours) * 3_600_000 > 60_000) {
+    blockers.push(`--hours ${input.hours} differs from lab.autoLearn.windowHours ${input.windowHours}`);
+  }
+  if (input.maxVariants !== null) {
+    blockers.push("--max-variants is set");
+  }
+  if (input.variantsFile !== undefined && input.variantsFile !== LAB_VARIANTS_FILE) {
+    blockers.push("--variants points at another variants file");
+  }
+  return blockers;
+}
+
 export async function labCommand(ctx: CommandContext): Promise<number> {
   const pruneKeep = wholeNumber(ctx, "prune-keep", 1);
   if (pruneKeep !== undefined) {
@@ -80,18 +96,25 @@ export async function labCommand(ctx: CommandContext): Promise<number> {
   }
   const maxVariants = wholeNumber(ctx, "max-variants", 0) ?? null;
   const labels = parseLabLabels(stringOption(ctx.options, "labels"));
-  const variantsFile = stringOption(ctx.options, "variants") ?? LAB_VARIANTS_FILE;
-  const variants = await loadLabVariants(variantsFile);
-  const config = await commandConfig(ctx);
+  const variantsOption = stringOption(ctx.options, "variants");
+  const variants = await loadLabVariants(variantsOption ?? LAB_VARIANTS_FILE);
+  const fileConfig = await commandConfig(ctx);
   const configSource = stringOption(ctx.options, "config") ?? ctx.env.STRATEGY_CONFIG;
+  const blockers = promotionBlockers({ hours, windowHours: fileConfig.lab.autoLearn.windowHours, maxVariants, variantsFile: variantsOption });
+  if (blockers.length > 0) {
+    ctx.io.err(`learning is report-only for this run: ${blockers.join("; ")}`);
+  }
   return withDatabase(ctx, "lab", async (db) => {
+    const learned = await loadLearnedSettings(db, fileConfig, tradingModeOf(ctx.env));
+    const learnedText = learned.changes.length > 0 ? ` plus learned changes from promotion #${learned.eventId ?? "?"}: ${learned.changes.join(", ")}` : "";
     const result = await runLab(db, {
-      config,
+      config: learned.config,
       variants,
       hours,
       labels,
       maxVariants,
-      baselineDescription: `the strategy the service runs (${configSource})`,
+      canPromote: blockers.length === 0,
+      baselineDescription: `the strategy the paper trader runs (${configSource}${learnedText})`,
       onProgress: (progress) => {
         const line = progressText(progress);
         if (line) {

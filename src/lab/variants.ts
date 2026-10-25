@@ -7,6 +7,7 @@ import { parseStrategyConfig, type StrategyConfig } from "../config/strategy.js"
 export const BASELINE_NAME = "baseline";
 export const LAB_VARIANTS_FILE = "config/lab-variants.json";
 export const LAB_LABEL_PREFIX = "lab:";
+export const UNDO_VARIANT_PREFIX = "undo-";
 
 export type JsonObject = { [key: string]: unknown };
 
@@ -20,7 +21,8 @@ const VariantSchema = z.object({
   name: z
     .string()
     .regex(/^[a-z0-9][a-z0-9_-]{0,47}$/, "use 1 to 48 lowercase letters, digits, - or _")
-    .refine((name) => name !== BASELINE_NAME, `"${BASELINE_NAME}" is reserved`),
+    .refine((name) => name !== BASELINE_NAME, `"${BASELINE_NAME}" is reserved`)
+    .refine((name) => !name.startsWith(UNDO_VARIANT_PREFIX), `names starting with "${UNDO_VARIANT_PREFIX}" are reserved for the undo arm of a promotion on probation`),
   description: z.string().trim().min(1),
   overrides: z.record(z.string(), z.unknown())
 });
@@ -83,7 +85,8 @@ const REPLAY_UNUSED: ReadonlyArray<{ prefix: string; except: string | null }> = 
   { prefix: "recorder.", except: "recorder.memory." },
   { prefix: "scorer.deepIntel.", except: null },
   { prefix: "tracker.", except: "tracker.convergence." },
-  { prefix: "sweeper.", except: null }
+  { prefix: "sweeper.", except: null },
+  { prefix: "lab.", except: null }
 ];
 
 export function unusedInReplay(setting: string): boolean {
@@ -113,7 +116,7 @@ export function inertReason(merged: StrategyConfig, changed: readonly string[]):
     parts.push(`settings of ${[...disabledSignals].join(" and ")}, which signals.enabled does not include`);
   }
   if (unused.length > 0) {
-    parts.push(`settings a replay does not use (${unused.join(", ")}; the recorder, wallet intel, wallet ranking and sweeper run only live)`);
+    parts.push(`settings a replay does not use (${unused.join(", ")}; the recorder, wallet intel, wallet ranking and sweeper run only live, and lab settings only steer the lab)`);
   }
   return `only changes ${parts.join(" and ")}`;
 }

@@ -232,6 +232,33 @@ export const SweeperConfigSchema = z.object({
   minSweepSol: z.number().positive().default(0.25)
 });
 
+export const AutoLearnConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    windowHours: z.number().positive().max(48).default(3),
+    minTrades: z.number().int().positive().default(100),
+    minWindows: z.number().int().min(4).default(10),
+    maxWindows: z.number().int().min(4).default(40),
+    confirmWindows: z.number().int().min(6).default(24),
+    familyConfidence: z.number().gt(0.5).lt(1).default(0.95),
+    bootstrapIterations: z.number().int().min(500).max(100_000).default(10_000),
+    seed: z.string().min(1).default("snypra-edge-learner"),
+    minPaperTrades: z.number().int().nonnegative().default(20),
+    minHoursBetweenPromotions: z.number().nonnegative().default(24),
+    weights: z
+      .object({
+        minAucGain: z.number().positive().max(0.5).default(0.03),
+        minValidationRows: z.number().int().positive().default(1000)
+      })
+      .prefault({})
+  })
+  .refine((value) => value.minWindows <= value.maxWindows, { message: "minWindows must not exceed maxWindows", path: ["minWindows"] })
+  .refine((value) => value.confirmWindows <= value.maxWindows, { message: "confirmWindows must not exceed maxWindows", path: ["confirmWindows"] });
+
+export const LabConfigSchema = z.object({
+  autoLearn: AutoLearnConfigSchema.prefault({})
+});
+
 export const StrategyConfigSchema = z.object({
   recorder: RecorderConfigSchema.prefault({}),
   scorer: ScorerConfigSchema.prefault({}),
@@ -240,7 +267,8 @@ export const StrategyConfigSchema = z.object({
   execution: ExecutionConfigSchema.prefault({}),
   exits: ExitConfigSchema.prefault({}),
   risk: RiskConfigSchema.prefault({}),
-  sweeper: SweeperConfigSchema.prefault({})
+  sweeper: SweeperConfigSchema.prefault({}),
+  lab: LabConfigSchema.prefault({})
 });
 
 export type RecorderConfig = z.infer<typeof RecorderConfigSchema>;
@@ -251,6 +279,8 @@ export type ExecutionConfig = z.infer<typeof ExecutionConfigSchema>;
 export type ExitConfig = z.infer<typeof ExitConfigSchema>;
 export type RiskConfig = z.infer<typeof RiskConfigSchema>;
 export type SweeperConfig = z.infer<typeof SweeperConfigSchema>;
+export type AutoLearnConfig = z.infer<typeof AutoLearnConfigSchema>;
+export type LabConfig = z.infer<typeof LabConfigSchema>;
 export type StrategyConfig = z.infer<typeof StrategyConfigSchema>;
 
 export function parseStrategyConfig(raw: unknown): StrategyConfig {

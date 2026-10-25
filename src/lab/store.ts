@@ -1,5 +1,6 @@
 import { hashString } from "../core/rng.js";
 import { jsonSafe, toNumber, withTransaction, type Db, type DbClient } from "../db/pool.js";
+import type { StoredTrade } from "./learner.js";
 import type { LabScorerEntry } from "./scorerLab.js";
 import type { LabVariantSummary } from "./summary.js";
 import { LAB_LABEL_PREFIX, type JsonObject } from "./variants.js";
@@ -14,6 +15,8 @@ export interface NewLabRun {
   dataFromMs: number;
   dataToMs: number;
   notes: JsonObject;
+  baselineHash?: string | null;
+  engineVersion?: string | null;
 }
 
 export interface NewLabVariant {
@@ -29,6 +32,7 @@ export interface LabVariantUpdate {
   strategyRunId?: number | null;
   summary?: LabVariantSummary | null;
   error?: string | null;
+  trades?: StoredTrade[] | null;
 }
 
 export interface LabPruneResult {
@@ -91,9 +95,9 @@ export async function failInterruptedLabRuns(db: Db, atMs: number): Promise<numb
 
 export async function createLabRun(db: Db, input: NewLabRun): Promise<number> {
   const result = await db.query<{ id: unknown }>(
-    `INSERT INTO lab_runs (started_at, status, data_from, data_to, notes)
-     VALUES ($1, 'running', $2, $3, $4) RETURNING id`,
-    [new Date(input.startedAtMs), new Date(input.dataFromMs), new Date(input.dataToMs), json(input.notes)]
+    `INSERT INTO lab_runs (started_at, status, data_from, data_to, notes, baseline_hash, engine_version)
+     VALUES ($1, 'running', $2, $3, $4, $5, $6) RETURNING id`,
+    [new Date(input.startedAtMs), new Date(input.dataFromMs), new Date(input.dataToMs), json(input.notes), input.baselineHash ?? null, input.engineVersion ?? null]
   );
   const row = result.rows[0];
   if (!row) {
@@ -142,7 +146,8 @@ export async function updateLabVariant(db: Db, variantId: number, update: LabVar
     `UPDATE lab_variants
         SET strategy_run_id = CASE WHEN $2::boolean THEN $3::bigint ELSE strategy_run_id END,
             summary = CASE WHEN $4::boolean THEN $5::jsonb ELSE summary END,
-            error = CASE WHEN $6::boolean THEN $7::text ELSE error END
+            error = CASE WHEN $6::boolean THEN $7::text ELSE error END,
+            trades = CASE WHEN $8::boolean THEN $9::jsonb ELSE trades END
       WHERE id = $1`,
     [
       variantId,
@@ -151,7 +156,9 @@ export async function updateLabVariant(db: Db, variantId: number, update: LabVar
       update.summary !== undefined,
       update.summary === undefined || update.summary === null ? null : json(update.summary),
       update.error !== undefined,
-      update.error ?? null
+      update.error ?? null,
+      update.trades !== undefined,
+      update.trades === undefined || update.trades === null ? null : json(update.trades)
     ]
   );
 }

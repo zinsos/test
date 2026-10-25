@@ -179,6 +179,218 @@ export const LAB_VIEW_SCRIPT = String.raw`
     return card("Baseline over time", "The current strategy's expectancy in each lab run, with its 95% range. A drifting number means the market changed, not the code.",
       labHistoryChart(history), table(["Run", "Trades", "Exp/trade", "95% range"], rows, { 3: true }));
   }
+  var LEARN_VERDICTS = {
+    candidate: ["Candidate", "good"], collecting: ["Collecting", "info"], not_better: ["Not better", ""], worse: ["Worse", "bad"],
+    owner_only: ["Owner decides", "warn"], not_run: ["Not run", ""], tried: ["Tried", ""], confirming: ["Confirming", "info"], pending: ["Confirmed", "good"]
+  };
+  var PROMOTION_STATUS = {
+    confirming: ["Confirming", "info"], pending: ["Waiting to apply", "info"], applied: ["Applied", "good"], rejected: ["Not confirmed", "bad"],
+    superseded: ["Superseded", ""], reverted: ["Undone", "warn"]
+  };
+  var WEIGHTS_VERDICTS = { ready: ["Better twice", "good"], collecting: ["Collecting", "info"], not_better: ["Not better", ""] };
+  var PAPER_CHECK = {
+    no_run: "no paper run is open, so nothing is tested or changed",
+    other_settings: "the open paper run started with other settings, so it is not compared",
+    too_few: "too few paper trades match a replayed trade yet",
+    unmatched: "the paper trader and the replay took different coins, so the replay is not trusted",
+    consistent: "the replay matches the paper fills of the same coins",
+    replay_optimistic: "the replay is more optimistic than the paper fills of the same coins, so nothing is changed"
+  };
+  var DECISION_TONE = { nominate: "info", confirm: "good", reject: "warn", withdraw: "", revert: "warn", keep: "good", hold: "" };
+
+  function learnBets(value) { return isNum(value) ? signedText(Math.abs(value).toFixed(2), value) + " bets" : DASH; }
+  function learnShare(value) { return isNum(value) ? fmtSignedPct(value * 100) : DASH; }
+  function learnLevel(value) { return isNum(value) ? fmtPct(value, 2).replace(/\.?0+%$/, "%") : DASH; }
+  function learnAuc(value) { return isNum(value) ? (value > 0 ? "+" : "") + minus(value.toFixed(3)) : DASH; }
+  function learnScale(variants) {
+    var lo = 0;
+    var hi = 0;
+    variants.forEach(function (v) {
+      var st = v.stats;
+      if (!st) { return; }
+      [st.gain, st.gainLow, st.gainHigh].forEach(function (value) { if (isNum(value)) { lo = Math.min(lo, value); hi = Math.max(hi, value); } });
+    });
+    if (hi - lo < 1e-9) { return null; }
+    var pad = (hi - lo) * 0.06;
+    return { lo: lo - pad, hi: hi + pad };
+  }
+  function learnAxis(scale) {
+    if (!scale) { return null; }
+    var at = labAt(scale, 0);
+    var zero = el("span", { class: "lb-tick zero", text: "0" });
+    zero.style.left = at.toFixed(2) + "%";
+    return el("div", { class: "lb-axis-labels learn-axis", "aria-hidden": "true" },
+      at > 30 ? el("span", { class: "lb-tick first", text: learnBets(scale.lo) }) : null, zero, at < 70 ? el("span", { class: "lb-tick last", text: learnBets(scale.hi) }) : null);
+  }
+  function learnBar(st, scale) {
+    if (!scale || !st || !isNum(st.gain)) { return null; }
+    var zero = el("span", { class: "lb-zero" });
+    zero.style.left = labAt(scale, 0).toFixed(2) + "%";
+    var parts = [el("span", { class: "lb-axis" }), zero];
+    if (isNum(st.gainLow) && isNum(st.gainHigh)) {
+      var ci = el("span", { class: "lb-ci " + (st.gainLow > 0 ? "pos" : st.gainHigh < 0 ? "neg" : "") });
+      ci.style.left = labAt(scale, st.gainLow).toFixed(2) + "%";
+      ci.style.width = Math.max(0.5, labAt(scale, st.gainHigh) - labAt(scale, st.gainLow)).toFixed(2) + "%";
+      parts.push(ci);
+    }
+    var point = el("span", { class: "lb-pt " + signClass(st.gain) });
+    point.style.left = labAt(scale, st.gain).toFixed(2) + "%";
+    parts.push(point);
+    return el("div", { class: "lb-range", role: "img", "aria-label": "Gain " + learnBets(st.gain) + " per window, range " + learnBets(st.gainLow) + " to " + learnBets(st.gainHigh) }, parts);
+  }
+  function learnStatsLine(st) {
+    if (!st) { return null; }
+    return el("div", { class: "meta", text: "Better in " + fmtInt(st.positive) + " of " + fmtInt(st.windows) + " windows" + DOT + "without its best window " + learnBets(st.withoutBest) +
+      DOT + "older half " + learnBets(st.older) + DOT + "newer half " + learnBets(st.newer) + DOT + "own " + learnBets(st.own) + " per window" +
+      DOT + learnShare(st.variantPerTrade) + " per trade vs " + learnShare(st.baselinePerTrade) });
+  }
+  function learnVariantRow(v, report, scale) {
+    var verdict = LEARN_VERDICTS[v.verdict] || [sentence(readable(v.verdict)), ""];
+    var st = v.stats;
+    var fewest = st ? Math.min(st.variantTrades, st.baselineTrades) : 0;
+    return el("li", { class: "learn-row" },
+      el("div", { class: "row" }, el("strong", { class: "lab-name", text: sentence(readable(v.name)) }), badge(verdict[0], verdict[1])),
+      v.description ? el("div", { class: "meta learn-desc", text: v.description }) : null,
+      st ? el("div", { class: "learn-figs" },
+        el("span", { class: "big-num " + signClass(st.gain), text: learnBets(st.gain) }),
+        el("span", { class: "meta", text: " per window vs the baseline" + DOT + learnLevel(st.confidence) + " lower bound " + learnBets(st.gainLow) })) : null,
+      learnBar(st, scale),
+      learnStatsLine(st),
+      meter(v.tradeProgress),
+      el("div", { class: "meta learn-progress", text: fmtInt(fewest) + " of " + fmtInt(report.minTrades) + " trades in both" + DOT + fmtInt(st ? st.windows : 0) + " of " + fmtInt(report.minWindows) + " windows" }),
+      v.reasons.length ? el("ul", { class: "learn-reasons" }, v.reasons.map(function (reason) { return el("li", { text: reason }); })) : null,
+      v.changes.length ? el("p", { class: "learn-changes", text: v.changes.join("; ") }) : null);
+  }
+  function learnRuleText(r) {
+    var hours = isNum(r.windowHours) ? r.windowHours : 3;
+    return "Step 1, nominate: with " + fmtInt(r.minTrades) + "+ trades in it and in the baseline over " + fmtInt(r.minWindows) + "+ non-overlapping " + hours + "-hour replays, a variant's extra profit per window must be above zero with " +
+      learnLevel(r.discoveryConfidence) + " confidence (corrected for " + fmtInt(r.comparisons) + (r.comparisons === 1 ? " candidate" : " candidates") +
+      "), it must make money on its own, be better in most windows, still be ahead without its best window and in both the older and the newer half, and the paper fills must back the replay. " +
+      "Step 2, confirm: the nominee is replayed on at least " + fmtInt(r.confirmWindows) + " fresh windows that start after the nomination and is tested once, at " + learnLevel(r.nextConfirmConfidence) +
+      " for the next nominee with these settings (each nominee is held to a stricter level than the one before). Only then does the paper trader switch. Step 3, probation: after the switch the old settings keep being replayed; if they do as well on fresh windows, the change is undone. " +
+      "Trades opened in the last max-hold of a window are not counted, so no trade is cut off by the window end. Risk limits, bet sizing, the fill model, hard blocks and looser risk-score limits are never changed, and live mode never uses learned settings.";
+  }
+  function learnDecision(r) {
+    var d = r.decision;
+    var tone = DECISION_TONE[d.kind] || "";
+    var how = "";
+    if (d.kind === "confirm") {
+      how = r.enabled ? " The paper trader switches once no position is open, then restarts and keeps its bankroll, peak and day." : " Auto-apply is off (lab.autoLearn.enabled), so nothing changes until it is turned on.";
+    }
+    var lead = { nominate: "Testing on fresh data. ", confirm: "Confirmed. ", reject: "Not confirmed. ", withdraw: "Withdrawn. ", revert: "Undoing a change. ", keep: "Change kept. " }[d.kind] || "Keeping the current settings. ";
+    return banner(tone, tone === "good" ? "check" : "info", el("strong", { text: lead }), el("span", { text: d.reason + "." + how }));
+  }
+  function learnInEffect(inEffect) {
+    if (!inEffect) { return null; }
+    if (inEffect.problem) { return banner("warn", "alert", el("span", { text: inEffect.problem + "." })); }
+    if (!inEffect.changes.length) {
+      return el("p", { class: "subline", text: inEffect.autoLearn ? "The paper trader runs the strategy file as is; no learned change is in effect." : "Auto-learn is off, so the paper trader runs the strategy file as is." });
+    }
+    return banner("info", "lab", el("strong", { text: "Learned changes in effect. " }),
+      el("span", { text: "The paper trader runs the strategy file plus promotion #" + inEffect.promotionId + " (" + sentence(readable(inEffect.name)) + ", " + fmtAgo(inEffect.appliedAtMs) + "): " + inEffect.changes.join("; ") + ". Live mode and the file itself are never changed." }));
+  }
+  function learnStage(r) {
+    var out = [];
+    var c = r.confirmation;
+    if (c) {
+      out.push(el("div", { class: "learn-stage" },
+        el("div", { class: "row" }, el("strong", { text: "Confirming " + sentence(readable(c.name)) }), badge(c.complete ? "Tested" : "Collecting", c.complete ? "" : "info")),
+        meter(c.needed > 0 ? c.collected / c.needed : 0),
+        el("div", { class: "meta", text: fmtInt(c.collected) + " of " + fmtInt(c.needed) + " fresh windows since " + fmtTime(c.fromMs) + DOT + fmtInt(c.variantTrades) + " trades" + DOT + "tested once at " + learnLevel(c.confidence) + " (nominee #" + fmtInt(c.index) + " with these settings)" }),
+        c.stats ? learnStatsLine(c.stats) : null,
+        c.reasons.length ? el("ul", { class: "learn-reasons" }, c.reasons.map(function (reason) { return el("li", { text: reason }); })) : null));
+    }
+    var p = r.probation;
+    if (p) {
+      out.push(el("div", { class: "learn-stage" },
+        el("div", { class: "row" }, el("strong", { text: "Probation for " + sentence(readable(p.name)) }), badge(p.result === "revert" ? "Undo" : p.result === "kept" ? "Kept" : "Running", p.result === "revert" ? "warn" : p.result === "kept" ? "good" : "info")),
+        meter(p.needed > 0 ? p.collected / p.needed : 0),
+        el("div", { class: "meta", text: fmtInt(p.collected) + " of " + fmtInt(p.needed) + " fresh windows replay the old settings (" + p.undoName + ") next to the new ones" + (p.stats ? DOT + "old minus new " + learnBets(p.stats.gain) + " per window" : "") })));
+    }
+    return out;
+  }
+  function learnPaperText(p) {
+    var base = PAPER_CHECK[p.status] || readable(p.status);
+    if (p.status === "no_run" || p.status === "other_settings") { return sentence(base); }
+    return sentence(base) + DOT + fmtInt(p.matched) + " paper trades matched a replayed trade (" + (isNum(p.coverage) ? fmtPlainPct(p.coverage * 100) : DASH) + " of the coins, needs " + fmtInt(p.needed) + ")" +
+      DOT + "replay minus paper " + learnShare(p.bias) + " per trade (95% range " + learnShare(p.biasLow) + " to " + learnShare(p.biasHigh) + ")";
+  }
+  function learnWeights(r) {
+    var gain = isNum(r.weightsMinGain) ? learnAuc(r.weightsMinGain) : "+0.030";
+    var rows = isNum(r.weightsMinRows) ? fmtInt(r.weightsMinRows) : "1,000";
+    var hint = "Retrained weights qualify when they beat the active " + (r.weightsActive || "weights") + " by " + gain + " AUC on " + rows + "+ held-out launches in two lab runs whose validation windows do not overlap. This is a hint, not a confirmed result, and they are never activated: new weights move every risk score, and the entry thresholds were set on the current scale.";
+    if (!r.weights.length) { return [el("h3", { text: "Scorer weights (reported only)" }), el("p", { class: "hint", text: hint }), el("p", { class: "subline", text: "Nothing was trained in the latest lab run." })]; }
+    var body = r.weights.map(function (w) {
+      var verdict = WEIGHTS_VERDICTS[w.verdict] || [sentence(readable(w.verdict)), ""];
+      return el("tr", { title: w.reasons.join("; ") || null },
+        cell(readable(w.label) + (isNum(w.checkpointSec) ? " at " + w.checkpointSec + "s" : ""), "t-left"),
+        cell(learnAuc(w.latestGain), signClass(w.latestGain)),
+        cell(learnAuc(w.previousGain), "hide-narrow " + signClass(w.previousGain)),
+        cell(fmtInt(w.latestRows), "hide-narrow"),
+        el("td", null, badge(verdict[0], verdict[1])));
+    });
+    return [el("h3", { text: "Scorer weights (reported only)" }), el("p", { class: "hint", text: hint }),
+      table(["Label", "AUC gain", "Earlier run", "Rows", "Verdict"], body, { 2: true, 3: true }, null, { 0: true })];
+  }
+  function learnEvidence(p) {
+    if (!isNum(p.gain)) { return DASH; }
+    return learnBets(p.gain) + " per window (lower bound " + learnBets(p.gainLow) + ")" + (isNum(p.trades) ? " over " + fmtInt(p.trades) + " trades" : "") + (isNum(p.windows) ? " in " + fmtInt(p.windows) + " windows" : "");
+  }
+  function learnPromotions(list) {
+    if (!list.length) { return [el("h3", { text: "Promotions" }), el("p", { class: "subline", text: "No promotion yet. A nominee needs days of replays with the same settings, then days of fresh replays to confirm." })]; }
+    var last = list[0];
+    var status = PROMOTION_STATUS[last.status] || [sentence(readable(last.status)), ""];
+    var pairs = [
+      [last.kind === "revert" ? "Undo" : "Variant", sentence(readable(last.name))],
+      ["Evidence", learnEvidence(last)],
+      ["Created", fmtTime(last.createdAtMs) + (isNum(last.labRunId) ? DOT + "lab run #" + last.labRunId : "")]
+    ];
+    if (isNum(last.confirmWindows)) { pairs.push(["Confirmation", fmtInt(last.confirmWindows) + " fresh windows" + (isNum(last.confirmIndex) ? DOT + "nominee #" + last.confirmIndex : "")]); }
+    if (isNum(last.appliedAtMs)) { pairs.push(["Applied", fmtTime(last.appliedAtMs) + (isNum(last.endedRunId) ? DOT + "paper run #" + last.endedRunId + " ended, bankroll carried over" : "")]); }
+    if (last.probationResult) { pairs.push(["Probation", last.probationResult === "kept" ? "passed" : "undone"]); }
+    if (last.changes.length) { pairs.push(["Changes", last.changes.join("; ")]); }
+    if (last.note) { pairs.push(["Note", last.note]); }
+    var out = [el("div", { class: "row learn-last" }, el("h3", { text: "Last promotion #" + last.id }), badge(status[0], status[1])), kv(pairs)];
+    if (list.length > 1) {
+      out.push(table(["When", "Variant", "Status", "Gain"], list.map(function (p) {
+        var s = PROMOTION_STATUS[p.status] || [sentence(readable(p.status)), ""];
+        return el("tr", { title: p.note || null }, cell(fmtWhen(isNum(p.appliedAtMs) ? p.appliedAtMs : p.createdAtMs)), cell(sentence(readable(p.name)), "t-left"), el("td", null, badge(s[0], s[1])), cell(learnBets(p.gain), signClass(p.gain)));
+      }), null, null, { 1: true }));
+    }
+    return out;
+  }
+  function learningCard(learning) {
+    var hint = "Pools the replays that used exactly the paper settings and the current code, and changes the paper settings only after a nominee confirms on fresh data.";
+    if (!learning) { return null; }
+    if (!learning.available) { return card("Learning", "Run the database migrations so the learner can store its results."); }
+    var r = learning.report;
+    var failed = learning.error ? el("p", { class: "error-text", text: "The latest learner run failed: " + learning.error }) : null;
+    if (!r) {
+      return card("Learning", hint, failed, learnInEffect(learning.inEffect), el("p", { class: "subline", text: "The learner runs at the end of every lab run. Its first verdicts appear after the next one." }), learnPromotions(learning.promotions));
+    }
+    var scale = learnScale(r.variants);
+    var span = isNum(r.windowsFromMs) && isNum(r.windowsToMs) ? fmtDay(r.windowsFromMs) + " to " + fmtDay(r.windowsToMs) : "none yet";
+    return el("section", { class: "card learn-card" },
+      el("div", { class: "card-head" },
+        el("div", null, el("h2", { class: "card-title", text: "Learning" }), el("p", { class: "hint", text: hint }),
+          el("div", { class: "badges" }, badge(r.enabled ? "Auto-apply on" : "Auto-apply off", r.enabled ? "good" : ""), badge("Paper only", "info"), r.canPromote ? null : badge("Report only", "warn")))),
+      failed,
+      learnInEffect(learning.inEffect),
+      learnDecision(r),
+      learnStage(r),
+      grid([
+        stat("Windows", fmtInt(r.windows), span),
+        stat("Baseline trades", fmtInt(r.baseline.trades), "replayed with the paper settings"),
+        stat("Baseline per window", learnBets(r.baseline.perWindow), learnShare(r.baseline.perTrade) + " per trade", signClass(r.baseline.perWindow)),
+        stat("Settings", r.settings, "code " + (r.engine || DASH) + "; evidence restarts when either changes")
+      ]),
+      el("p", { class: "subline", text: learnRuleText(r) }),
+      r.variants.length ? [learnAxis(scale), el("ul", { class: "learn-list" }, r.variants.map(function (v) { return learnVariantRow(v, r, scale); }))]
+        : el("p", { class: "subline", text: "No variants are configured in config/lab-variants.json." }),
+      el("p", { class: "subline", text: "Paper check: " + learnPaperText(r.paper) + "." }),
+      learnWeights(r),
+      learnPromotions(learning.promotions));
+  }
   function labView() {
     return api("/api/lab").then(function (lab) {
       if (!lab.available) {
@@ -187,7 +399,7 @@ export const LAB_VIEW_SCRIPT = String.raw`
       if (!lab.run) {
         return empty("No lab run yet", "The lab replays the recorded launches through several strategy variants with the real trader, fills and fees, and retrains the scorer, so you can compare ideas in minutes instead of weeks of paper trading. The first results appear here after the lab job has run once.");
       }
-      var out = [labRunCard(lab), labTakeawayCard(lab.takeaway), labLeaderboard(lab)];
+      var out = [labRunCard(lab), labTakeawayCard(lab.takeaway), learningCard(lab.learning), labLeaderboard(lab)];
       lab.scorer.forEach(function (entry) { out.push(labScorerCard(entry)); });
       if (!lab.scorer.length) { out.push(card("Scorer training", "This run did not retrain the scorer.")); }
       out.push(labHistoryCard(lab.history));

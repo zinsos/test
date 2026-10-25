@@ -21,6 +21,7 @@ import type { TrackerModule } from "../tracker/index.js";
 import { killResetRequestsAfter, latestKillResetRequestId, loadOpenPositions, resumeOrCreateRun } from "../trader/runs.js";
 import { PgTradingStore } from "../trader/store.js";
 import { Trader } from "../trader/trader.js";
+import { seedCarriedRisk } from "./carry.js";
 import { Repeater } from "./repeater.js";
 
 const log = moduleLogger("app.trading");
@@ -83,6 +84,9 @@ export async function createTrading(env: Env, config: StrategyConfig, shared: Tr
       { runId: run.runId },
       "strategy config differs from the one this run started with; results before and after the change are mixed in this run"
     );
+  }
+  if (!run.resumed && mode === "paper") {
+    await seedCarriedRisk(db, run.runId, config.risk);
   }
   const persisted = await loadRiskState(db, run.runId);
   const risk = new RiskManager({ runId: run.runId, config: config.risk, clock, mode, store, persisted, bus });

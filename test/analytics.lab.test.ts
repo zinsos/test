@@ -347,7 +347,8 @@ describe.skipIf(!hasTestDatabase)("lab queries and run pickers", () => {
         variants: [],
         scorer: [],
         history: [],
-        takeaway: null
+        takeaway: null,
+        learning: { available: true, report: null, error: null, promotions: [], inEffect: null }
       });
     } finally {
       await empty.drop();

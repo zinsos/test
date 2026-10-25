@@ -60,3 +60,43 @@ export {
   unusedInReplay,
   type LabVariant
 } from "./variants.js";
+export {
+  isPromotableSetting,
+  loosenedCeilings,
+  overridePaths,
+  overridesHash,
+  ownerOnlySettings,
+  RISK_CEILINGS,
+  shortHash,
+  storedStrategyHash,
+  strategyHash,
+  undoOverrides,
+  variantKey
+} from "./identity.js";
+export { computeEngineVersion, replayEngineVersion, REPLAY_ENGINE_DIRS } from "./engine.js";
+export {
+  confirmConfidenceOf,
+  discoveryConfidenceOf,
+  evaluateLearning,
+  evaluateWeights,
+  learnerRuleOf,
+  selectWindows,
+  storedTradesOf,
+  UNDO_PREFIX,
+  weightsRuleOf,
+  type LearnerDecision,
+  type LearnerReport,
+  type VariantVerdict,
+  type WeightsReport
+} from "./learner.js";
+export { fileSettings, learnedFrom, loadLearnedSettings, usesLearnedSettings, type LearnedSettings } from "./learned.js";
+export { loadEvidenceWindows, loadPaperEvidence, runLearner } from "./learnerStore.js";
+export {
+  latestAppliedAtMs,
+  latestEvent,
+  loadPendingPromotion,
+  reconcilePromotions,
+  recentPromotions,
+  type Promotion,
+  type PromotionStatus
+} from "./promotions.js";

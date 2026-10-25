@@ -167,3 +167,108 @@ export function maxDrawdown(equityCurve: readonly number[]): number {
   }
   return worst;
 }
+
+const LANCZOS_G = 7;
+const LANCZOS: readonly number[] = [
+  0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905,
+  -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7
+];
+const BETA_EPSILON = 1e-14;
+const BETA_TINY = 1e-300;
+const BETA_MAX_STEPS = 400;
+const QUANTILE_STEPS = 200;
+
+export function logGamma(x: number): number {
+  if (x < 0.5) {
+    return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - logGamma(1 - x);
+  }
+  const shifted = x - 1;
+  let acc = LANCZOS[0] ?? 1;
+  for (let i = 1; i < LANCZOS_G + 2; i += 1) {
+    acc += (LANCZOS[i] ?? 0) / (shifted + i);
+  }
+  const t = shifted + LANCZOS_G + 0.5;
+  return 0.5 * Math.log(2 * Math.PI) + (shifted + 0.5) * Math.log(t) - t + Math.log(acc);
+}
+
+function betaFraction(a: number, b: number, x: number): number {
+  const qab = a + b;
+  const qap = a + 1;
+  const qam = a - 1;
+  let c = 1;
+  let d = 1 - (qab * x) / qap;
+  d = Math.abs(d) < BETA_TINY ? BETA_TINY : d;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= BETA_MAX_STEPS; m += 1) {
+    const m2 = 2 * m;
+    let aa = (m * (b - m) * x) / ((qam + m2) * (a + m2));
+    d = 1 + aa * d;
+    d = Math.abs(d) < BETA_TINY ? BETA_TINY : d;
+    c = 1 + aa / c;
+    c = Math.abs(c) < BETA_TINY ? BETA_TINY : c;
+    d = 1 / d;
+    h *= d * c;
+    aa = (-(a + m) * (qab + m) * x) / ((a + m2) * (qap + m2));
+    d = 1 + aa * d;
+    d = Math.abs(d) < BETA_TINY ? BETA_TINY : d;
+    c = 1 + aa / c;
+    c = Math.abs(c) < BETA_TINY ? BETA_TINY : c;
+    d = 1 / d;
+    const step = d * c;
+    h *= step;
+    if (Math.abs(step - 1) < BETA_EPSILON) {
+      break;
+    }
+  }
+  return h;
+}
+
+export function regularizedBeta(x: number, a: number, b: number): number {
+  if (x <= 0) {
+    return 0;
+  }
+  if (x >= 1) {
+    return 1;
+  }
+  const front = Math.exp(logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log(1 - x));
+  if (x < (a + 1) / (a + b + 2)) {
+    return (front * betaFraction(a, b, x)) / a;
+  }
+  return 1 - (front * betaFraction(b, a, 1 - x)) / b;
+}
+
+export function studentTCdf(t: number, degreesOfFreedom: number): number {
+  if (!Number.isFinite(t)) {
+    return t > 0 ? 1 : 0;
+  }
+  const tail = 0.5 * regularizedBeta(degreesOfFreedom / (degreesOfFreedom + t * t), degreesOfFreedom / 2, 0.5);
+  return t >= 0 ? 1 - tail : tail;
+}
+
+export function studentTQuantile(probability: number, degreesOfFreedom: number): number {
+  if (!(probability > 0 && probability < 1) || !(degreesOfFreedom > 0)) {
+    return Number.NaN;
+  }
+  if (probability < 0.5) {
+    return -studentTQuantile(1 - probability, degreesOfFreedom);
+  }
+  if (probability === 0.5) {
+    return 0;
+  }
+  let low = 0;
+  let high = 1;
+  while (studentTCdf(high, degreesOfFreedom) < probability && high < 1e12) {
+    low = high;
+    high *= 2;
+  }
+  for (let step = 0; step < QUANTILE_STEPS && high - low > 1e-12 * Math.max(1, high); step += 1) {
+    const middle = (low + high) / 2;
+    if (studentTCdf(middle, degreesOfFreedom) < probability) {
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+  return (low + high) / 2;
+}

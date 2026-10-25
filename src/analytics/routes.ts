@@ -45,7 +45,7 @@ import {
   type SellFeeDefaults
 } from "./positionQueries.js";
 import { latestScore, recentLaunches, recentSignals, trackedWallets } from "./activityQueries.js";
-import { loadLabOverview } from "./labQueries.js";
+import { loadLabOverview, loadRecentPromotion, type LearnedInEffect } from "./labQueries.js";
 import type { LiveHub, LiveStatus, OpenValue } from "./liveHub.js";
 import type { SeriesPoint } from "./liveSeries.js";
 import { isHeliusKey, type RpcKeyControls, type RpcKeyStatus } from "./rpcKey.js";
@@ -80,6 +80,7 @@ export interface AnalyticsSettings {
   entryRules: EntryRules | null;
   dayResetUtcHour: number;
   tips: TipSettings;
+  learned: LearnedInEffect | null;
 }
 
 export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
@@ -97,10 +98,12 @@ export const DEFAULT_ANALYTICS_SETTINGS: AnalyticsSettings = {
   sellFees: sellFeeDefaultsOf(defaultStrategyConfig().execution),
   entryRules: null,
   dayResetUtcHour: defaultStrategyConfig().risk.dayResetUtcHour,
-  tips: tipSettingsOf(defaultStrategyConfig())
+  tips: tipSettingsOf(defaultStrategyConfig()),
+  learned: null
 };
 
 const log = moduleLogger("analytics");
+const RECENT_PROMOTION_MS = 24 * 3_600_000;
 
 export type ScoreLookup = (mint: Pubkey) => LaunchScore | null;
 export type ExtraHealth = () => Record<string, unknown>;
@@ -360,7 +363,8 @@ async function positionsRoute(ctx: AnalyticsContext, request: ApiRequest): Promi
     : emptyPositionsSnapshot(nowMs, dayResetUtcHour);
   const sparks = ctx.live ? ctx.live.sparklines(snapshot.open.map((position) => position.id)) : new Map<string, SeriesPoint[]>();
   const open = snapshot.open.map((position) => ({ ...position, spark: sparks.get(position.id) ?? null }));
-  return { filter: { runId, mode }, ...snapshot, open, entryRules: ctx.settings.entryRules };
+  const recentPromotion = await loadRecentPromotion(ctx.db, nowMs - RECENT_PROMOTION_MS);
+  return { filter: { runId, mode }, ...snapshot, open, entryRules: ctx.settings.entryRules, recentPromotion };
 }
 
 async function walletsRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
@@ -430,7 +434,8 @@ function liveStreamRoute(ctx: AnalyticsContext, _request: ApiRequest, req: Incom
 }
 
 async function labRoute(ctx: AnalyticsContext, request: ApiRequest): Promise<unknown> {
-  return loadLabOverview(ctx.db, { historyLimit: parseInteger(request.params, "history", { min: 1, max: 200 }) ?? undefined });
+  const overview = await loadLabOverview(ctx.db, { historyLimit: parseInteger(request.params, "history", { min: 1, max: 200 }) ?? undefined });
+  return { ...overview, learning: { ...overview.learning, inEffect: ctx.settings.learned } };
 }
 
 function scorerDatasetRoute(ctx: AnalyticsContext, request: ApiRequest): CsvStream {

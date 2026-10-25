@@ -1,3 +1,5 @@
+import { shortHash } from "./identity.js";
+import { betsText, levelText, pctText, type LearnerReport, type VariantVerdict, type WeightsCandidate } from "./learner.js";
 import type { LabPruneResult } from "./store.js";
 import type { LabResult, LabVariantResult } from "./runner.js";
 
@@ -140,6 +142,74 @@ function runtimeLines(result: LabResult): string[] {
   return [`runtime  ${parts.join(", ")}; total ${durationText(result.runtimeMs)}`];
 }
 
+function verdictLine(variant: VariantVerdict, report: LearnerReport): string {
+  const stats = variant.stats;
+  const fewest = stats ? Math.min(stats.variantTrades, stats.baselineTrades) : 0;
+  const trades = `${fewest}/${report.rule.minTrades}`;
+  const windows = `${stats?.windows ?? 0}/${report.rule.minWindows}`;
+  const gain = stats ? `${betsText(stats.gain)} (low ${betsText(stats.gainLow)})` : "n/a";
+  const why = variant.reasons.length > 0 ? `: ${variant.reasons.join("; ")}` : "";
+  return `  ${variant.name.padEnd(26)} trades ${trades.padStart(7)}  windows ${windows.padStart(5)}  gain/window ${gain.padEnd(24)} ${variant.verdict}${why}`;
+}
+
+function weightsText(candidate: WeightsCandidate): string {
+  const gains = [candidate.latest.gain, candidate.previous?.gain ?? null].map((gain) => (gain === null ? "n/a" : `${gain >= 0 ? "+" : ""}${gain.toFixed(3)}`));
+  return `${candidate.label}@${candidate.checkpointSec}s ${candidate.verdict} (AUC gain ${gains.join(" then ")})`;
+}
+
+function paperLine(report: LearnerReport): string {
+  const paper = report.paper;
+  if (paper.status === "no_run" || paper.status === "other_settings") {
+    return `  paper      ${paper.status}`;
+  }
+  const coverage = paper.coverage === null ? "n/a" : `${Math.round(paper.coverage * 100)}%`;
+  return `  paper      ${paper.status}: ${paper.matched} matched trades (${coverage} of the coins), replay minus paper ${pctText(paper.bias)}/trade [${pctText(paper.biasLow)}, ${pctText(paper.biasHigh)}] over ${paper.windows} windows`;
+}
+
+function stageLines(report: LearnerReport): string[] {
+  const lines: string[] = [];
+  const confirmation = report.confirmation;
+  if (confirmation) {
+    const result = confirmation.stats ? `; gain ${betsText(confirmation.stats.gain)} bets/window (low ${betsText(confirmation.stats.gainLow)})` : "";
+    lines.push(
+      `  confirming #${confirmation.promotionId} ${confirmation.name}: ${confirmation.collected}/${confirmation.needed} fresh windows, ${confirmation.variantTrades} trades, tested once at ${levelText(confirmation.confidence)}${result}`
+    );
+  }
+  const probation = report.probation;
+  if (probation) {
+    const result = probation.stats ? `; old settings ${betsText(probation.stats.gain)} bets/window vs the change` : "";
+    lines.push(`  probation  #${probation.promotionId} ${probation.name}: ${probation.collected}/${probation.needed} fresh windows against ${probation.undoName}${result}`);
+  }
+  return lines;
+}
+
+function learnerLines(result: LabResult): string[] {
+  if (result.learnerError) {
+    return [`learning failed: ${result.learnerError}`];
+  }
+  const report = result.learner;
+  if (!report) {
+    return [];
+  }
+  const rule = report.rule;
+  const lines = [
+    `learning (settings ${shortHash(report.identity.settingsHash)}, replay code ${report.identity.engineVersion ?? "unknown"}, ${report.windows.length} non-overlapping windows, baseline ${report.baseline.trades} trades ${betsText(report.baseline.perWindow)} bets/window${report.canPromote ? "" : "; report only"})`,
+    `  rule       nominate at ${rule.minTrades}+ trades in ${rule.minWindows}+ windows with the gain per window above zero at ${levelText(rule.discoveryConfidence)} (${rule.comparisons} candidates); then confirm once on ${rule.confirmWindows}+ fresh windows at ${levelText(rule.nextConfirmConfidence)} for the next nominee`
+  ];
+  for (const variant of report.variants) {
+    lines.push(verdictLine(variant, report));
+  }
+  lines.push(...stageLines(report));
+  lines.push(`  decision   ${report.decision.kind}: ${report.decision.reason}`);
+  if (report.promotion) {
+    lines.push(`  promotion  #${report.promotion.id} ${report.promotion.status} (${report.promotion.name})${report.enabled ? "" : "; lab.autoLearn.enabled is off, so the service will not apply it"}`);
+  }
+  lines.push(paperLine(report));
+  const weights = report.weights.candidates.map(weightsText);
+  lines.push(`  weights    report only${weights.length > 0 ? `; ${weights.join(", ")}` : "; nothing trained"}`);
+  return lines;
+}
+
 export function pruneText(pruned: LabPruneResult): string {
   return `pruned   ${pruned.strategyRuns} lab strategy runs (${pruned.positions} positions, ${pruned.fills} fills, ${pruned.signals} signals) and ${pruned.weights} inactive lab weights; kept the latest ${pruned.kept} lab runs`;
 }
@@ -157,6 +227,10 @@ export function formatLabReport(result: LabResult): string {
   const exits = exitLines(result);
   if (exits.length > 0) {
     lines.push("", ...exits);
+  }
+  const learning = learnerLines(result);
+  if (learning.length > 0) {
+    lines.push("", ...learning);
   }
   lines.push("", ...weightsLines(result), ...runtimeLines(result));
   if (result.pruned) {

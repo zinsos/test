@@ -76,6 +76,13 @@ export const OVERVIEW_SCRIPT = String.raw`
     }
     return null;
   }
+  function learningNote(data) {
+    var p = data.recentPromotion;
+    if (!p || !isNum(p.appliedAtMs)) { return null; }
+    var what = p.kind === "revert" ? "Auto-learn undid the last learned change (" + sentence(readable(p.name)) + ")" : "Auto-learn switched the paper settings to " + sentence(readable(p.name));
+    var gain = p.kind !== "revert" && isNum(p.gain) ? ": " + (p.gain > 0 ? "+" : "") + minus(p.gain.toFixed(2)) + " bets per window over the old settings on fresh replays" : "";
+    return banner("good", "lab", el("span", { class: "learn-note", text: what + " " + fmtAgo(p.appliedAtMs) + gain + ". A new paper run continues the same bankroll; the evidence is in Lab." }));
+  }
   function traderFigure(data, key, fallback) {
     var w = wallet.data;
     return viewingTraderRun(data) && w && isNum(w[key]) ? w[key] : fallback;
@@ -437,6 +444,7 @@ export const OVERVIEW_SCRIPT = String.raw`
       return [
         runHead(data),
         statusBanner(data),
+        learningNote(data),
         kpiRow(data),
         el("div", { class: "ov-grid" },
           el("div", { class: "ov-col" }, openCard(data), closedCard(data)),

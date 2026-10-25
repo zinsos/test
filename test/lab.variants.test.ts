@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { summarizeTrades } from "../src/analytics/metrics.js";
 import { parseArgv, UsageError } from "../src/app/args.js";
-import { parseLabLabels, progressText } from "../src/app/commands/lab.js";
+import { parseLabLabels, progressText, promotionBlockers } from "../src/app/commands/lab.js";
 import { defaultStrategyConfig, loadStrategyConfig } from "../src/config/strategy.js";
 import type { ClosedTrade } from "../src/core/types.js";
 import {
@@ -25,6 +25,11 @@ import {
   type LabVariantResult
 } from "../src/lab/index.js";
 import type { FeatureReport } from "../src/scorer/tune.js";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { computeEngineVersion, REPLAY_ENGINE_DIRS, replayEngineVersion } from "../src/lab/engine.js";
+import { plannedArms, undoVariantOf } from "../src/lab/runner.js";
 
 const SOL = 1_000_000_000n;
 const T = Date.UTC(2026, 9, 20, 12);
@@ -115,7 +120,7 @@ describe("lab variants", () => {
     }
     const mixed = applyOverrides(baseline, { scorer: { deepIntel: { maxWalletsPerLaunch: 5 } }, signals: { scoreMomentum: { maxRiskScore: 20 } } });
     expect(inertReason(mixed, changedSettings(baseline, mixed))).toBe(
-      "only changes settings of score_momentum, which signals.enabled does not include and settings a replay does not use (scorer.deepIntel.maxWalletsPerLaunch; the recorder, wallet intel, wallet ranking and sweeper run only live)"
+      "only changes settings of score_momentum, which signals.enabled does not include and settings a replay does not use (scorer.deepIntel.maxWalletsPerLaunch; the recorder, wallet intel, wallet ranking and sweeper run only live, and lab settings only steer the lab)"
     );
     const effective = [
       { recorder: { memory: { evictInactiveMinutes: 20 } } },
@@ -135,6 +140,7 @@ describe("lab variants", () => {
     const good = parseLabVariants([{ name: "a-1", description: "first", overrides: { exits: { maxHoldSec: 600 } } }]);
     expect(good).toEqual([{ name: "a-1", description: "first", overrides: { exits: { maxHoldSec: 600 } } }]);
     expect(() => parseLabVariants([{ name: "baseline", description: "x", overrides: {} }])).toThrow(/reserved/);
+    expect(() => parseLabVariants([{ name: "undo-7", description: "x", overrides: {} }])).toThrow(/reserved for the undo arm/);
     expect(() =>
       parseLabVariants([
         { name: "dup", description: "x", overrides: {} },
@@ -312,6 +318,9 @@ describe("lab summaries and report", () => {
           checkpointSec: 30,
           rows: 500,
           positives: 120,
+          validationRows: 150,
+          validationFromMs: T - 4 * 3_600_000,
+          validationToMs: T - 3_600_000,
           validationAuc: 0.71,
           baselineAuc: 0.65,
           features: [{ name: "bundle_share", auc: 0.7, direction: "higher_riskier", coverage: 1, weight: 10 }],
@@ -324,7 +333,13 @@ describe("lab summaries and report", () => {
       skippedVariants: ["extra"],
       scorerRuntimeMs: 2_000,
       runtimeMs: 65_000,
-      pruned: { kept: 20, strategyRuns: 3, positions: 9, fills: 20, signals: 4, weights: 8 }
+      pruned: { kept: 20, strategyRuns: 3, positions: 9, fills: 20, signals: 4, weights: 8 },
+      baselineHash: "a".repeat(64),
+      engineVersion: "0123456789abcdef",
+      canPromote: true,
+      undoArm: null,
+      learner: null,
+      learnerError: null
     };
     const text = formatLabReport(result);
     expect(text).toContain("== lab run 7 (done) ==");
@@ -369,5 +384,61 @@ describe("lab command line", () => {
         progress: { virtualNowMs: 0, fromMs: 0, toMs: 1, events: 0, openPositions: 0, closedTrades: 0 }
       })
     ).toBeNull();
+  });
+});
+
+describe("learning plumbing in the lab", () => {
+  it("versions the replay code from the trading and replay sources only", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "snypra-engine-"));
+    try {
+      mkdirSync(path.join(root, "exits"));
+      mkdirSync(path.join(root, "analytics"));
+      writeFileSync(path.join(root, "exits", "rules.ts"), "export const a = 1;");
+      writeFileSync(path.join(root, "analytics", "page.ts"), "export const b = 1;");
+      const first = computeEngineVersion(root, ".ts");
+      expect(first).toMatch(/^[0-9a-f]{16}$/);
+      writeFileSync(path.join(root, "analytics", "page.ts"), "export const b = 2;");
+      expect(computeEngineVersion(root, ".ts")).toBe(first);
+      writeFileSync(path.join(root, "exits", "rules.d.ts"), "export declare const a: number;");
+      writeFileSync(path.join(root, "exits", "rules.ts.map"), "{}");
+      expect(computeEngineVersion(root, ".ts")).toBe(first);
+      writeFileSync(path.join(root, "exits", "rules.ts"), "export const a = 2;");
+      expect(computeEngineVersion(root, ".ts")).not.toBe(first);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(REPLAY_ENGINE_DIRS).toEqual(expect.arrayContaining(["backtest", "exits", "execution", "risk", "trader", "scorer", "tracker", "market"]));
+    expect(REPLAY_ENGINE_DIRS).not.toContain("lab");
+    expect(REPLAY_ENGINE_DIRS).not.toContain("analytics");
+    expect(replayEngineVersion()).toBe(replayEngineVersion());
+  });
+
+  it("plans the undo arm of a change on probation after the variant limit and describes every arm for the learner", () => {
+    const baseline = defaultStrategyConfig();
+    const undo = undoVariantOf({ id: 7, name: "momentum-strict", undo: { signals: { scoreMomentum: { maxRiskScore: 35 } } } });
+    expect(undo).toMatchObject({ name: "undo-7", overrides: { signals: { scoreMomentum: { maxRiskScore: 35 } } } });
+    expect(undoVariantOf({ id: 8, name: "x", undo: null })).toBeNull();
+    const variants = [
+      { name: "a", description: "a", overrides: { exits: { maxHoldSec: 600 } } },
+      { name: "b", description: "b", overrides: { exits: { maxHoldSec: 900 } } }
+    ];
+    const { planned, skipped } = planVariants(baseline, variants, 1, "service config", undo ? [undo] : []);
+    expect(planned.map((plan) => plan.variant.name)).toEqual(["baseline", "a", "undo-7"]);
+    expect(skipped).toEqual(["b"]);
+    const arms = plannedArms(baseline, planned);
+    expect(arms.map((arm) => [arm.name, arm.holdMs, arm.ownerOnly])).toEqual([
+      ["a", 600_000, []],
+      ["undo-7", baseline.exits.maxHoldSec * 1000, []]
+    ]);
+  });
+
+  it("makes manual lab runs report-only so only the scheduled run can nominate or confirm", () => {
+    expect(promotionBlockers({ hours: 3, windowHours: 3, maxVariants: null, variantsFile: undefined })).toEqual([]);
+    expect(promotionBlockers({ hours: 3, windowHours: 3, maxVariants: null, variantsFile: "config/lab-variants.json" })).toEqual([]);
+    expect(promotionBlockers({ hours: 6, windowHours: 3, maxVariants: 1, variantsFile: "one.json" })).toEqual([
+      "--hours 6 differs from lab.autoLearn.windowHours 3",
+      "--max-variants is set",
+      "--variants points at another variants file"
+    ]);
   });
 });

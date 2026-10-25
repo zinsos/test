@@ -121,4 +121,4 @@ export {
 } from "./liveHub.js";
 export { thresholdsOf, type LiveEvent, type LiveKind, type LiveThresholds } from "./liveEvents.js";
 export { exitLevels, livePositionView, positionSeries, type ExitLevels, type LivePositionView, type PositionSeries } from "./liveSeries.js";
-export { LAB_LABEL_PREFIX, labTakeaway, loadLabOverview, type LabOverview, type LabVariantRow } from "./labQueries.js";
+export { changeList, LAB_LABEL_PREFIX, labTakeaway, loadLabOverview, type LabOverview, type LabVariantRow, type LearnedInEffect } from "./labQueries.js";

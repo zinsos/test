@@ -6,6 +6,7 @@ import { loadStrategyConfig, type StrategyConfig } from "../src/config/strategy.
 import { VirtualClock } from "../src/core/clock.js";
 import {
   acquireLabLock,
+  formatLabReport,
   LabBusyError,
   loadLabVariants,
   pruneLabRuns,
@@ -13,13 +14,28 @@ import {
   type LabResult,
   type LabVariant
 } from "../src/lab/index.js";
+import { replayEngineVersion } from "../src/lab/engine.js";
+import { overridesHash, strategyHash } from "../src/lab/identity.js";
 import { DEFAULT_WEIGHTS, saveWeights } from "../src/scorer/weights.js";
 import { createTestDatabase, hasTestDatabase, type TestDatabase } from "./helpers/db.js";
 import { buildScenario, type Scenario } from "./e2e.market.js";
 import { recordScenario } from "./e2e.recording.js";
 
 const HOUR_MS = 3_600_000;
-const SCORER_KEYS = ["baselineAuc", "calibration", "checkpointSec", "features", "label", "positives", "rows", "validationAuc", "weightsVersion"];
+const SCORER_KEYS = [
+  "baselineAuc",
+  "calibration",
+  "checkpointSec",
+  "features",
+  "label",
+  "positives",
+  "rows",
+  "validationAuc",
+  "validationFromMs",
+  "validationRows",
+  "validationToMs",
+  "weightsVersion"
+];
 const SUMMARY_KEYS = [
   "avgHoldSec",
   "ciHighSol",
@@ -94,11 +110,20 @@ describe.skipIf(!hasTestDatabase)("lab end to end on a recorded synthetic market
   const labVariants = async (labRunId: number): Promise<LabVariantRow[]> =>
     (await database.db.query<LabVariantRow>("SELECT * FROM lab_variants WHERE lab_run_id = $1 ORDER BY id", [labRunId])).rows;
 
+  const windowHours = (): number => (scenario.windowEndMs - scenario.windowStartMs) / HOUR_MS;
+
+  const learningBaseline = (): StrategyConfig => {
+    const config = labBaseline(base);
+    config.lab.autoLearn.windowHours = windowHours();
+    config.lab.autoLearn.bootstrapIterations = 1000;
+    return config;
+  };
+
   const options = (overrides: Partial<Parameters<typeof runLab>[1]> = {}): Parameters<typeof runLab>[1] => ({
-    config: labBaseline(base),
+    config: learningBaseline(),
     variants,
     nowMs: scenario.windowEndMs,
-    hours: (scenario.windowEndMs - scenario.windowStartMs) / HOUR_MS,
+    hours: windowHours(),
     minTrainRows: 40,
     minClassRows: 4,
     clock: new VirtualClock(scenario.windowEndMs + HOUR_MS),
@@ -181,6 +206,10 @@ describe.skipIf(!hasTestDatabase)("lab end to end on a recorded synthetic market
       expect(calibration).toHaveLength(10);
       expect(Object.keys(calibration[0] ?? {}).sort()).toEqual(["bucket", "n", "positiveRate"]);
       expect(typeof entry.validationAuc).toBe("number");
+      expect(Number(entry.validationRows)).toBeGreaterThan(0);
+      expect(Number(entry.validationRows)).toBeLessThan(Number(entry.rows));
+      expect(Number(entry.validationFromMs)).toBeLessThanOrEqual(Number(entry.validationToMs));
+      expect(Number(entry.validationToMs)).toBeLessThanOrEqual(scenario.windowEndMs);
     }
     const rugged = scorer.find((entry) => entry.label === "rugged_1h" && entry.checkpointSec === 60);
     expect(Number(rugged?.validationAuc)).toBeGreaterThan(0.5);
@@ -189,6 +218,53 @@ describe.skipIf(!hasTestDatabase)("lab end to end on a recorded synthetic market
       expect.objectContaining({ label: "migrated", checkpointSec: 30, reason: expect.stringMatching(/matured rows/) }),
       expect.objectContaining({ label: "migrated", checkpointSec: 60 })
     ]);
+  });
+
+  it("stores the settings hash, the replay code version, per-trade evidence and a learner report that keeps collecting on a single window", async () => {
+    const run = await database.db.query<{ baseline_hash: string; engine_version: string; learner: Record<string, unknown> }>(
+      "SELECT baseline_hash, engine_version, learner FROM lab_runs WHERE id = $1",
+      [first.labRunId]
+    );
+    expect(run.rows[0]?.baseline_hash).toBe(strategyHash(labBaseline(base)));
+    expect(first.baselineHash).toBe(run.rows[0]?.baseline_hash);
+    expect(run.rows[0]?.engine_version).toBe(replayEngineVersion());
+    expect(first.engineVersion).toMatch(/^[0-9a-f]{16}$/);
+    expect(first.canPromote).toBe(true);
+    const rows = await database.db.query<{ name: string; trades: unknown; summary: { trades: number } | null }>(
+      "SELECT name, trades, summary FROM lab_variants WHERE lab_run_id = $1 AND summary IS NOT NULL ORDER BY id",
+      [first.labRunId]
+    );
+    let stored = 0;
+    for (const row of rows.rows) {
+      const trades = row.trades as Array<Record<string, unknown>>;
+      expect(Array.isArray(trades)).toBe(true);
+      expect(trades.length).toBe(row.summary?.trades);
+      for (const trade of trades) {
+        expect(Object.keys(trade).sort()).toEqual(["closedAtMs", "exitReason", "mint", "openedAtMs", "r", "sol"]);
+        stored += 1;
+      }
+    }
+    expect(stored).toBeGreaterThan(0);
+    const report = run.rows[0]?.learner as {
+      identity: { engineVersion: string };
+      windows: unknown[];
+      decision: { kind: string };
+      variants: Array<{ name: string; verdict: string }>;
+      weights: { mode: string };
+    };
+    expect(first.learner?.labRunId).toBe(first.labRunId);
+    expect(first.learnerError).toBeNull();
+    expect(report.identity.engineVersion).toBe(first.engineVersion);
+    expect(report.windows).toHaveLength(1);
+    expect(report.decision.kind).toBe("hold");
+    expect(report.weights.mode).toBe("report_only");
+    expect(report.variants.every((variant) => ["collecting", "not_run", "owner_only"].includes(variant.verdict))).toBe(true);
+    expect(report.variants.find((variant) => variant.name === "trade-blocked-event-exits")?.verdict).toBe("owner_only");
+    expect((await database.db.query("SELECT 1 FROM promotions")).rowCount).toBe(0);
+    const text = formatLabReport(first);
+    expect(text).toMatch(/^learning \(settings [0-9a-f]{8}, replay code [0-9a-f]{16}, 1 non-overlapping windows, baseline \d+ trades/m);
+    expect(text).toContain("  decision   hold: no variant meets the discovery rule yet");
+    expect(text).toContain("  weights    report only;");
   });
 
   it("saves the trained weights inactive and never activates anything", async () => {
@@ -351,4 +427,40 @@ describe.skipIf(!hasTestDatabase)("lab end to end on a recorded synthetic market
     expect(prune.code).toBe(0);
     expect(prune.out.join("\n")).toMatch(/^pruned {3}\d+ lab strategy runs/);
   }, 120_000);
+
+  it("replays the settings from before a change as an undo arm while that change is on probation", async () => {
+    const config = learningBaseline();
+    const before = structuredClone(config);
+    before.exits.timeStop.afterSec = 240;
+    const undo = { exits: { timeStop: { afterSec: 240 } } };
+    const inserted = await database.db.query<{ id: string }>(
+      `INSERT INTO promotions (kind, name, overrides, overrides_hash, baseline_hash, status, root_hash, overlay, applied_hash, undo, confirm_windows, created_at, updated_at, applied_at)
+       VALUES ('variant', 'shorter-time-stop', $1, $2, $3, 'applied', $3, $1, $4, $5, 24, $6, $6, $6) RETURNING id::text AS id`,
+      [
+        JSON.stringify({ exits: { timeStop: { afterSec: config.exits.timeStop.afterSec } } }),
+        overridesHash({ exits: { timeStop: { afterSec: config.exits.timeStop.afterSec } } }),
+        strategyHash(before),
+        strategyHash(config),
+        JSON.stringify(undo),
+        new Date(scenario.windowStartMs - HOUR_MS)
+      ]
+    );
+    const id = Number(inserted.rows[0]?.id);
+    try {
+      const result = await runLab(database.db, options({ variants: [], pruneKeep: null }));
+      expect(result.undoArm).toBe(`undo-${id}`);
+      const arm = result.variants.find((variant) => variant.name === `undo-${id}`);
+      expect(arm).toMatchObject({ isBaseline: false, error: null, changed: ["exits.timeStop.afterSec"] });
+      const stored = await database.db.query<{ overrides: unknown; trades: unknown }>("SELECT overrides, trades FROM lab_variants WHERE lab_run_id = $1 AND name = $2", [
+        result.labRunId,
+        `undo-${id}`
+      ]);
+      expect(stored.rows[0]?.overrides).toEqual(undo);
+      expect(Array.isArray(stored.rows[0]?.trades)).toBe(true);
+      expect(result.learner?.probation).toMatchObject({ promotionId: id, undoName: `undo-${id}`, needed: 24, complete: false });
+      expect(result.learner?.variants.map((variant) => variant.name)).toEqual([]);
+    } finally {
+      await database.db.query("DELETE FROM promotions");
+    }
+  });
 });

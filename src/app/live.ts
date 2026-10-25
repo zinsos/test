@@ -1,4 +1,5 @@
 import {
+  changeList,
   entryRulesOf,
   latestSkipReason,
   LiveHub,
@@ -10,6 +11,8 @@ import {
   type TradingControls,
   type WalletSnapshot
 } from "../analytics/index.js";
+import { AUTO_LEARN_RESTART_DELAY_MS, AutoLearnApplier, autoLearnRepeater, type AutoLearnTrading } from "./autoLearn.js";
+import { fileSettings, loadLearnedSettings, usesLearnedSettings, type LearnedSettings } from "../lab/learned.js";
 import { createRpcKeyControls } from "./rpcKey.js";
 import type { RpcClient } from "../chain/rpc.js";
 import type { Env, ModuleName } from "../config/env.js";
@@ -112,10 +115,16 @@ export interface LiveAppOptions {
   databaseWaitMs?: number;
   allowOpenDashboard?: boolean;
   abort?: () => boolean;
+  strategyPath?: string | null;
+  autoLearnIntervalMs?: number;
+  restart?: () => void;
 }
 
 export interface LiveApp {
   readonly modules: ReadonlySet<ModuleName>;
+  readonly autoLearn: AutoLearnApplier | null;
+  readonly learned: LearnedSettings;
+  restartRequested(): boolean;
   readonly bus: Bus;
   readonly market: MarketState;
   readonly ingest: IngestModule | null;
@@ -191,11 +200,12 @@ interface Components {
 
 function createComponents(
   options: LiveAppOptions,
-  shared: { db: Db; bus: Bus; market: MarketState; clock: Clock; rpc: RpcClient | null },
+  shared: { db: Db; bus: Bus; market: MarketState; clock: Clock; rpc: RpcClient | null; tradingConfig: StrategyConfig },
   modules: ReadonlySet<ModuleName>,
   onRejected: (signal: Signal, reason: string) => void
 ): Components {
   const { env, config } = options;
+  const tradingConfig = shared.tradingConfig;
   const { db, bus, market, clock, rpc } = shared;
   const trading = modules.has("trader");
   const recorder = modules.has("recorder") ? createRecorderModule({ db, rpc, bus, market, clock, config, env }) : null;
@@ -217,7 +227,7 @@ function createComponents(
     return { recorder, scorer, tracker: null, ownRegistry: null };
   }
   if (modules.has("tracker")) {
-    const tracker = createTrackerModule({ db, rpc, bus, market, clock, config, scores: scorer.service, mode: "live", onRejected });
+    const tracker = createTrackerModule({ db, rpc, bus, market, clock, config: tradingConfig, scores: scorer.service, mode: "live", onRejected });
     return { recorder, scorer, tracker, ownRegistry: null };
   }
   if (!trading) {
@@ -230,13 +240,49 @@ function createComponents(
     bus,
     market,
     clock,
-    config,
+    config: tradingConfig,
     scores: scorer.service,
     mode: "live",
     registry: ownRegistry,
     onRejected
   });
   return { recorder, scorer, tracker, ownRegistry };
+}
+
+export function restartBySignal(clock: Clock, delayMs: number, onRequest: () => void = () => undefined): () => void {
+  return () => {
+    onRequest();
+    clock.schedule(clock.nowMs() + delayMs, () => {
+      process.kill(process.pid, "SIGTERM");
+    });
+  };
+}
+
+export function autoLearnFor(
+  options: Pick<LiveAppOptions, "strategyPath" | "restart">,
+  parts: AutoLearnTrading,
+  shared: { db: Db; clock: Clock; config: StrategyConfig; learned: LearnedSettings; restart?: () => void }
+): AutoLearnApplier | null {
+  if (!shared.config.lab.autoLearn.enabled) {
+    return null;
+  }
+  if (parts.mode !== "paper") {
+    log.warn("lab.autoLearn.enabled is on but TRADING_MODE is live: learned settings are never used and nothing is changed automatically in live mode");
+    return null;
+  }
+  log.info(
+    { settings: shared.learned.settingsHash.slice(0, 8), learnedChanges: shared.learned.changes, promotionId: shared.learned.eventId },
+    "auto-learn is on: confirmed lab promotions are applied to this paper trader"
+  );
+  return new AutoLearnApplier({
+    db: shared.db,
+    clock: shared.clock,
+    config: shared.config,
+    learned: shared.learned,
+    strategyPath: options.strategyPath ?? null,
+    trading: parts,
+    restart: options.restart ?? shared.restart ?? restartBySignal(shared.clock, AUTO_LEARN_RESTART_DELAY_MS)
+  });
 }
 
 export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
@@ -255,6 +301,10 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
   const stop = (reason = "stop"): Promise<void> => {
     stopping ??= shutdown(stoppables, reason, ownsDb ? db : null);
     return stopping;
+  };
+  let restartRequested = false;
+  const markRestart = (): void => {
+    restartRequested = true;
   };
   try {
     const allowOpenDashboard = options.allowOpenDashboard ?? env.DASHBOARD_ALLOW_OPEN;
@@ -276,6 +326,8 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
         log.info({ applied }, "migrations applied");
       }
     }
+    const learned = modules.has("trader") ? await loadLearnedSettings(db, config, tradingModeOf(env)) : fileSettings(config);
+    const tradingConfig = learned.config;
     const bus = new Bus();
     const market = createMarket(config, modules.has("recorder") ? null : config.signals.quoteMints);
     const rpc = options.rpc !== undefined ? options.rpc : createRpc(env);
@@ -294,7 +346,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
         observer?.record(signal, reason);
       }
     };
-    const { recorder, scorer, tracker, ownRegistry } = createComponents(options, { db, bus, market, clock, rpc }, modules, onRejected);
+    const { recorder, scorer, tracker, ownRegistry } = createComponents(options, { db, bus, market, clock, rpc, tradingConfig }, modules, onRejected);
     const streaming = recorder !== null || scorer !== null || tracker !== null;
     const ingest = streaming ? createIngestModule({ env, clock, market, bus, poolLookup: recorder?.poolLookup, source: options.source }) : null;
     const statsSnapshot = (): Record<string, unknown> => {
@@ -329,8 +381,8 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           bus,
           clock,
           market,
-          config: { exits: config.exits, execution: config.execution },
-          thresholds: thresholdsOf(config),
+          config: { exits: tradingConfig.exits, execution: tradingConfig.execution },
+          thresholds: thresholdsOf(tradingConfig),
           positions: () => tradingParts?.trader.openPositions() ?? [],
           tradingActive: () => tradingParts?.trader.isRunning() ?? false,
           skipReason: (signal) =>
@@ -350,12 +402,22 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           scoreLookup: scorer ? (mint) => scorer.service.latest(mint) : null,
           extraHealth: () => statsSnapshot(),
           settings: {
-            maxRisk: config.scorer.maxRisk,
+            maxRisk: tradingConfig.scorer.maxRisk,
             labelHorizonHours: config.recorder.outcome.finalizeAfterHours,
-            sellFees: sellFeeDefaultsOf(config.execution),
-            entryRules: entryRulesOf(config),
-            dayResetUtcHour: config.risk.dayResetUtcHour,
-            tips: tipSettingsOf(config)
+            sellFees: sellFeeDefaultsOf(tradingConfig.execution),
+            entryRules: entryRulesOf(tradingConfig),
+            dayResetUtcHour: tradingConfig.risk.dayResetUtcHour,
+            tips: tipSettingsOf(tradingConfig),
+            learned: modules.has("trader")
+              ? {
+                  autoLearn: usesLearnedSettings(config, tradingModeOf(env)),
+                  promotionId: learned.eventId,
+                  name: learned.eventName,
+                  appliedAtMs: learned.appliedAtMs,
+                  changes: changeList(learned.overlay),
+                  problem: learned.problem
+                }
+              : null
           },
           live: liveHub,
           price: new SolPriceFeed({ clock }),
@@ -376,11 +438,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
           rpcKey: createRpcKeyControls({
             envFile: env.ENV_FILE ?? null,
             currentHttpUrl: env.RPC_HTTP_URL,
-            restart: () => {
-              clock.schedule(clock.nowMs() + RPC_KEY_RESTART_DELAY_MS, () => {
-                process.kill(process.pid, "SIGTERM");
-              });
-            }
+            restart: restartBySignal(clock, RPC_KEY_RESTART_DELAY_MS, markRestart)
           })
         })
       : await startHealthServer({
@@ -414,7 +472,7 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
       if (!(await lock.acquire(() => stopping !== null || (options.abort?.() ?? false)))) {
         throw new Error("stopped before the trading lock was acquired");
       }
-      tradingParts = await createTrading(env, config, { db, bus, market, clock, tracker });
+      tradingParts = await createTrading(env, tradingConfig, { db, bus, market, clock, tracker });
       const store = tradingParts.store;
       stoppables.push({ name: "trading-store", stop: () => store.stop() });
     } else if (tracker) {
@@ -469,12 +527,17 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
         }
       })
     ];
+    let autoLearn: AutoLearnApplier | null = null;
     if (tradingParts) {
       const parts = tradingParts;
       parts.trader.start();
       stoppables.push({ name: "trader", stop: () => parts.trader.stop() });
       repeaters.push(...(await tradingRepeaters(parts, db, clock, options)));
-      const sweeper = createSweeper(env, config, parts, db, clock);
+      autoLearn = autoLearnFor(options, parts, { db, clock, config, learned, restart: restartBySignal(clock, AUTO_LEARN_RESTART_DELAY_MS, markRestart) });
+      if (autoLearn) {
+        repeaters.push(autoLearnRepeater(autoLearn, clock, options.autoLearnIntervalMs));
+      }
+      const sweeper = createSweeper(env, tradingConfig, parts, db, clock);
       if (sweeper) {
         sweeper.start();
         stoppables.push({ name: "sweeper", stop: () => sweeper.stop() });
@@ -491,6 +554,9 @@ export async function startLiveApp(options: LiveAppOptions): Promise<LiveApp> {
     log.info({ modules: [...modules], port: http.port, tradingMode: tradingParts?.mode ?? null, runId: tradingParts?.runId ?? null }, "snypra-edge started");
     return {
       modules,
+      autoLearn,
+      learned,
+      restartRequested: () => restartRequested,
       bus,
       market,
       ingest,

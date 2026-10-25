@@ -395,6 +395,8 @@ input::placeholder { color: var(--muted); }
 .banner.warn .icon { color: var(--warn-ink); }
 .banner.bad { border-color: rgba(242, 92, 92, 0.45); background: var(--bad-wash); }
 .banner.bad .icon { color: var(--bad-ink); }
+.banner.good { border-color: rgba(52, 209, 127, 0.4); background: var(--good-wash); }
+.banner.good .icon { color: var(--good-ink); }
 .card .banner { margin: var(--s3) 0 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: var(--s2) 0; }
 .chip { font: 500 var(--fs-sm) var(--mono); padding: 3px 9px; border-radius: 999px; background: var(--surface-3); color: var(--ink); overflow-wrap: anywhere; }

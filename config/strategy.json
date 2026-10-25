@@ -225,5 +225,24 @@
     "hotTargetSol": 5,
     "reserveSol": 0.1,
     "minSweepSol": 0.25
+  },
+  "lab": {
+    "autoLearn": {
+      "enabled": false,
+      "windowHours": 3,
+      "minTrades": 100,
+      "minWindows": 10,
+      "maxWindows": 40,
+      "confirmWindows": 24,
+      "familyConfidence": 0.95,
+      "bootstrapIterations": 10000,
+      "seed": "snypra-edge-learner",
+      "minPaperTrades": 20,
+      "minHoursBetweenPromotions": 24,
+      "weights": {
+        "minAucGain": 0.03,
+        "minValidationRows": 1000
+      }
+    }
   }
 }

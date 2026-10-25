@@ -19,6 +19,7 @@ export interface CommandContext {
 export const EXIT_OK = 0;
 export const EXIT_FAILURE = 1;
 export const EXIT_USAGE = 2;
+export const EXIT_RESTART = 75;
 
 export async function withDatabase<T>(ctx: CommandContext, name: string, work: (db: Db) => Promise<T>): Promise<T> {
   const db = openDatabase(ctx.env, `snypra-edge:${name}`);

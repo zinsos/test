@@ -20,6 +20,11 @@ import {
   type LabPruneResult,
   type LabStatus
 } from "./store.js";
+import { replayEngineVersion } from "./engine.js";
+import { strategyHash } from "./identity.js";
+import { storedTradesOf, type LearnerReport, type PlannedArm } from "./learner.js";
+import { plannedArm, runLearner } from "./learnerStore.js";
+import { isUndefinedTable, loadProbationPromotion, undoName, type Promotion } from "./promotions.js";
 import { labSummaryOf, type LabVariantSummary } from "./summary.js";
 import {
   applyOverrides,
@@ -68,6 +73,8 @@ export interface RunLabOptions {
   clock?: Clock;
   timer?: () => number;
   onProgress?: ((progress: LabProgress) => void) | null;
+  canPromote?: boolean;
+  engineVersion?: string;
 }
 
 export interface LabVariantResult {
@@ -98,6 +105,12 @@ export interface LabResult {
   scorerRuntimeMs: number;
   runtimeMs: number;
   pruned: LabPruneResult | null;
+  baselineHash: string;
+  engineVersion: string;
+  canPromote: boolean;
+  undoArm: string | null;
+  learner: LearnerReport | null;
+  learnerError: string | null;
 }
 
 interface PlannedVariant {
@@ -140,11 +153,39 @@ function releaseMemory(): void {
   (globalThis as { gc?: () => void }).gc?.();
 }
 
+export function undoVariantOf(promotion: Pick<Promotion, "id" | "name" | "undo">): LabVariant | null {
+  if (promotion.undo === null) {
+    return null;
+  }
+  return {
+    name: undoName(promotion.id),
+    description: `The settings from before promotion #${promotion.id} (${promotion.name}), replayed while that change is on probation.`,
+    overrides: promotion.undo
+  };
+}
+
+async function probationVariant(db: Db, settingsHash: string): Promise<LabVariant | null> {
+  try {
+    const row = await loadProbationPromotion(db, settingsHash);
+    return row ? undoVariantOf(row) : null;
+  } catch (error) {
+    if (isUndefinedTable(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export function plannedArms(baseline: StrategyConfig, planned: readonly PlannedVariant[]): PlannedArm[] {
+  return planned.filter((plan) => !plan.isBaseline).map((plan) => plannedArm(baseline, plan.variant, plan.config ?? baseline));
+}
+
 export function planVariants(
   baseline: StrategyConfig,
   variants: readonly LabVariant[],
   maxVariants: number | null,
-  baselineDescription: string
+  baselineDescription: string,
+  extra: readonly LabVariant[] = []
 ): { planned: PlannedVariant[]; skipped: string[] } {
   const limit = maxVariants === null ? variants.length : Math.max(0, Math.floor(maxVariants));
   const planned: PlannedVariant[] = [
@@ -156,7 +197,7 @@ export function planVariants(
       error: null
     }
   ];
-  for (const variant of variants.slice(0, limit)) {
+  for (const variant of [...variants.slice(0, limit), ...extra]) {
     try {
       const merged = applyOverrides(baseline, variant.overrides);
       const changed = changedSettings(baseline, merged);
@@ -214,7 +255,7 @@ async function runVariant(ctx: VariantContext, plan: PlannedVariant, variantId: 
         : null
     });
     const summary = labSummaryOf(result.closedTrades, result.summary.trades);
-    await updateLabVariant(ctx.db, variantId, { strategyRunId: result.runId, summary, error: null });
+    await updateLabVariant(ctx.db, variantId, { strategyRunId: result.runId, summary, error: null, trades: storedTradesOf(result.closedTrades) });
     return {
       ...base,
       strategyRunId: result.runId,
@@ -248,6 +289,15 @@ export function variantNotes(results: readonly LabVariantResult[]): JsonObject {
   return notes;
 }
 
+async function learnFrom(db: Db, input: Parameters<typeof runLearner>[1]): Promise<{ report: LearnerReport | null; error: string | null }> {
+  try {
+    return { report: await runLearner(db, input), error: null };
+  } catch (error) {
+    log.error({ err: error, labRunId: input.labRunId }, "lab learner failed");
+    return { report: null, error: messageOf(error) };
+  }
+}
+
 export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult> {
   const clock = options.clock ?? new SystemClock();
   const emit = progressEmitter(options.onProgress);
@@ -261,18 +311,23 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
   const checkpoints = options.checkpoints ?? DEFAULT_LAB_CHECKPOINTS;
   const dataToMs = nowMs;
   const dataFromMs = nowMs - Math.round(hours * HOUR_MS);
-  const { planned, skipped } = planVariants(
-    options.config,
-    options.variants,
-    options.maxVariants ?? null,
-    options.baselineDescription ?? "the strategy config the service runs"
-  );
+  const baselineHash = strategyHash(options.config);
+  const engineVersion = options.engineVersion ?? replayEngineVersion();
+  const canPromote = options.canPromote ?? true;
   const lock = await acquireLabLock(db);
   if (!lock) {
     throw new LabBusyError();
   }
   const startedAt = timer();
   try {
+    const undo = await probationVariant(db, baselineHash);
+    const { planned, skipped } = planVariants(
+      options.config,
+      options.variants,
+      options.maxVariants ?? null,
+      options.baselineDescription ?? "the strategy config the service runs",
+      undo ? [undo] : []
+    );
     await failInterruptedLabRuns(db, clock.nowMs());
     const notes: JsonObject = {
       hours,
@@ -280,9 +335,12 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
       checkpoints: [...checkpoints],
       trainHours: options.trainHours ?? DEFAULT_TRAIN_HOURS,
       maxTrainRows: options.maxTrainRows ?? DEFAULT_MAX_TRAIN_ROWS,
-      skippedVariants: skipped
+      skippedVariants: skipped,
+      engineVersion,
+      canPromote,
+      undoArm: undo?.name ?? null
     };
-    const labRunId = await createLabRun(db, { startedAtMs: clock.nowMs(), dataFromMs, dataToMs, notes });
+    const labRunId = await createLabRun(db, { startedAtMs: clock.nowMs(), dataFromMs, dataToMs, notes, baselineHash, engineVersion });
     const result: LabResult = {
       labRunId,
       status: "done",
@@ -295,8 +353,15 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
       skippedVariants: skipped,
       scorerRuntimeMs: 0,
       runtimeMs: 0,
-      pruned: null
+      pruned: null,
+      baselineHash,
+      engineVersion,
+      canPromote,
+      undoArm: undo?.name ?? null,
+      learner: null,
+      learnerError: null
     };
+    let activeWeightsVersion: string | null = null;
     try {
       const variantIds: number[] = [];
       for (const plan of planned) {
@@ -314,6 +379,7 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
       emit({ phase: "start", labRunId, dataFromMs, dataToMs, variants: planned.length });
       const scorerStartedAt = timer();
       const current = await loadScoringModel({ db, filePath: options.config.scorer.weightsFile });
+      activeWeightsVersion = current.model.version;
       const stored: LabScorerEntry[] = [];
       const scorer = await runScorerLab({
         db,
@@ -362,6 +428,21 @@ export async function runLab(db: Db, options: RunLabOptions): Promise<LabResult>
       if (baseline?.error) {
         result.status = "failed";
         result.error = `baseline backtest failed: ${baseline.error}`;
+      } else {
+        const learned = await learnFrom(db, {
+          labRunId,
+          nowMs: clock.nowMs(),
+          config: options.config,
+          identity: { settingsHash: baselineHash, engineVersion, weightsVersion: baseline?.weightsVersion ?? null },
+          activeWeightsVersion,
+          variants: plannedArms(options.config, planned),
+          canPromote
+        });
+        result.learner = learned.report;
+        result.learnerError = learned.error;
+        notes.learner = learned.report
+          ? { decision: learned.report.decision.kind, name: learned.report.decision.name, windows: learned.report.windows.length }
+          : { error: learned.error };
       }
     } catch (error) {
       result.status = "failed";

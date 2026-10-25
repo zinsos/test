@@ -33,6 +33,9 @@ export interface LabScorerResult {
   checkpointSec: number;
   rows: number;
   positives: number;
+  validationRows: number | null;
+  validationFromMs: number | null;
+  validationToMs: number | null;
   validationAuc: number | null;
   baselineAuc: number | null;
   features: LabFeature[];
@@ -53,6 +56,9 @@ export interface LabScorerSkipEntry {
   checkpointSec: number;
   rows: number;
   positives: number;
+  validationRows: null;
+  validationFromMs: null;
+  validationToMs: null;
   validationAuc: null;
   baselineAuc: null;
   features: LabFeature[];
@@ -69,6 +75,9 @@ export function skippedEntry(skip: LabScorerSkip): LabScorerSkipEntry {
     checkpointSec: skip.checkpointSec,
     rows: skip.rows,
     positives: skip.positives,
+    validationRows: null,
+    validationFromMs: null,
+    validationToMs: null,
     validationAuc: null,
     baselineAuc: null,
     features: [],
@@ -160,12 +169,20 @@ export function positiveCalibration(buckets: readonly CalibrationBucket[], label
   }));
 }
 
-export function labScorerResult(result: TuneResult, checkpointSec: number, positives: number): LabScorerResult {
+export function labScorerResult(
+  result: TuneResult,
+  checkpointSec: number,
+  positives: number,
+  validationWindow: { fromMs: number | null; toMs: number | null } = { fromMs: result.splitAtMs, toMs: null }
+): LabScorerResult {
   return {
     label: result.label,
     checkpointSec,
     rows: result.rows,
     positives,
+    validationRows: result.validationRows,
+    validationFromMs: result.validationRows > 0 ? validationWindow.fromMs : null,
+    validationToMs: result.validationRows > 0 ? validationWindow.toMs : null,
     validationAuc: result.validation.suggestedScoreAuc,
     baselineAuc: result.validation.currentScoreAuc,
     features: topFeatures(result.features),
@@ -218,7 +235,7 @@ async function trainOne(options: ScorerLabOptions, label: DatasetLabelName, chec
     },
     activate: false
   });
-  return labScorerResult(result, checkpointSec, counts.positives);
+  return labScorerResult(result, checkpointSec, counts.positives, { fromMs: result.splitAtMs, toMs: rows[rows.length - 1]?.createdAtMs ?? window.toMs });
 }
 
 function isSkip(value: LabScorerResult | LabScorerSkip): value is LabScorerSkip {
